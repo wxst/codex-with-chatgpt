@@ -4,13 +4,14 @@ on:
   push:
     branches:
       - hardening/v1
+    paths:
+      - scripts/apply-hardening-v2.py
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: github.event.head_commit.message == 'chore: run hardening patcher'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -29,7 +30,7 @@ jobs:
         run: corepack enable
 
       - name: Apply deterministic patches
-        run: python3 scripts/apply-hardening-patches.py
+        run: python3 scripts/apply-hardening-v2.py
 
       - name: Refresh lockfile
         run: pnpm install --lockfile-only
