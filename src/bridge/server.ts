@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
 import { createOAuthRouter } from "../auth/oauth.js";
-import { bearerAuth } from "../auth/middleware.js";
+import { bearerAuth, openAITunnelAuth } from "../auth/middleware.js";
 import { PairingManager } from "../pairing/manager.js";
 import { createMcpServer } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
@@ -12,6 +12,7 @@ import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import { CloudflaredNamedTunnel } from "../tunnel/cloudflared-named.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
 import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
+import { ensureOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
@@ -35,6 +36,10 @@ export interface BridgeOptions {
   host?: string;
   logger?: Logger;
   tunnelProvider?: TunnelProvider;
+  /** Transport is explicit in production; direct library callers retain the legacy default. */
+  transportMode?: TransportMode;
+  /** Test/embedding override. Production reads a mode-0600 per-workspace token file. */
+  openAITunnelToken?: string;
   /** Persist runtime state file (disable in tests). */
   persistRuntime?: boolean;
   authStoreFile?: string;
@@ -50,6 +55,7 @@ export interface Bridge {
   authStore: AuthStore;
   pairing: PairingManager;
   tunnel: TunnelProvider;
+  transportMode: TransportMode;
   getPublicBaseUrl(): string | null;
   localBaseUrl(): string;
   close(): Promise<void>;
@@ -87,6 +93,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
   }
 
+  const transportMode = opts.transportMode ?? "cloudflare";
+  const openAITunnelToken =
+    transportMode === "openai" ? opts.openAITunnelToken ?? ensureOpenAITunnelToken(workspace.id) : null;
   const authStore = new AuthStore(workspace.id, { file: opts.authStoreFile });
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
   const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
@@ -105,13 +114,15 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     return `${proto}://${hostHeader}`;
   };
 
-  // ---- Health (public but minimal) ---------------------------------------
+  // ---- Health (public but minimal; listener itself is loopback-only) --------
 
   app.get("/health", (_req, res) => {
     res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok" });
   });
 
   // ---- OAuth + discovery ---------------------------------------------------
+  // Retained for the explicit Cloudflare fallback. In OpenAI mode the MCP
+  // endpoint uses a private per-workspace tunnel token instead.
 
   app.use(
     createOAuthRouter({
@@ -123,13 +134,17 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     })
   );
 
-  // ---- MCP endpoint (bearer-protected) --------------------------------------
+  // ---- MCP endpoint ---------------------------------------------------------
 
   const mcpHandler = createMcpHttpHandler(() => createMcpServer({ workspace, logger }), logger);
+  const mcpAuth =
+    transportMode === "openai"
+      ? openAITunnelAuth({ expectedToken: openAITunnelToken!, logger })
+      : bearerAuth({ store: authStore, workspaceId: workspace.id, getBaseUrl, logger });
   app.all(
     "/mcp",
     express.json({ limit: "8mb" }),
-    bearerAuth({ store: authStore, workspaceId: workspace.id, getBaseUrl, logger }),
+    mcpAuth,
     (req: Request, res: Response) => {
       void mcpHandler(req, res);
     }
@@ -141,7 +156,12 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     // Defense in depth: reject anything that arrived through a proxy/tunnel.
     const remote = req.socket.remoteAddress ?? "";
     const isLoopback = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
-    const viaProxy = Boolean(req.headers["cf-connecting-ip"] || req.headers["x-forwarded-for"]);
+    const viaProxy = Boolean(
+      req.headers["cf-connecting-ip"] ||
+      req.headers["forwarded"] ||
+      req.headers["x-forwarded-for"] ||
+      req.headers["x-real-ip"]
+    );
     const header = req.headers.authorization ?? "";
     const token = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
     if (!isLoopback || viaProxy || token !== adminToken) {
@@ -165,6 +185,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       workspaceName: workspace.name,
       workspaceRoot: workspace.root,
       port,
+      transportMode,
       publicUrl: publicBaseUrl,
       tunnel: tunnel.status(),
       tokenCount: authStore.tokenCount(),
@@ -175,6 +196,13 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   app.post("/admin/tunnel/start", adminGuard, (_req, res) => {
+    if (transportMode !== "cloudflare") {
+      res.status(409).json({
+        error: "transport_mode_mismatch",
+        message: "Public Cloudflare tunnels are disabled while OpenAI Secure MCP Tunnel mode is selected.",
+      });
+      return;
+    }
     tunnel
       .start(port)
       .then((url) => {
@@ -249,6 +277,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     authStore,
     pairing,
     tunnel,
+    transportMode,
     getPublicBaseUrl: () => publicBaseUrl,
     localBaseUrl: () => `http://${host}:${port}`,
     close: shutdown,
