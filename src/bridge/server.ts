@@ -15,6 +15,12 @@ import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { ensureOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
+import {
+  isWorkspaceLifecycleLockHeldBy,
+  LIFECYCLE_LOCK_NONCE_ENV,
+  LIFECYCLE_LOCK_WORKSPACE_ENV,
+  withWorkspaceLifecycleLock,
+} from "../process/workspace-lock.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { writeRuntimeState, type RuntimeState } from "./runtime.js";
 
@@ -85,9 +91,30 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
   });
 }
 
+/**
+ * The bridge startup boundary itself participates in the workspace lifecycle
+ * lock. A daemon child spawned by ensureBridge may inherit the parent's opaque
+ * nonce and proceed under that already-held lock. Direct callers acquire their
+ * own lock, so no startup route can overlap `unpair` merely by bypassing the
+ * daemon helper.
+ */
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
-  const logger = opts.logger ?? nullLogger;
   const workspace = new Workspace(opts.workspaceRoot);
+  const inheritedNonce = process.env[LIFECYCLE_LOCK_NONCE_ENV] ?? "";
+  const inheritedWorkspaceId = process.env[LIFECYCLE_LOCK_WORKSPACE_ENV] ?? "";
+  const inheritedLockIsValid =
+    inheritedWorkspaceId === workspace.id &&
+    isWorkspaceLifecycleLockHeldBy(workspace.id, inheritedNonce);
+
+  if (inheritedLockIsValid) {
+    return startBridgeUnlocked(opts, workspace);
+  }
+
+  return withWorkspaceLifecycleLock(workspace.id, () => startBridgeUnlocked(opts, workspace));
+}
+
+async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): Promise<Bridge> {
+  const logger = opts.logger ?? nullLogger;
   const host = opts.host ?? DEFAULT_HOST;
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
