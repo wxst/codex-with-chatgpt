@@ -132,11 +132,11 @@ describe("daemon source-mode fallback", () => {
     expect(source).toContain('"src", "cli", "index.ts"');
   });
 
-  it("passes an inherited lifecycle nonce to the child and validates it in serve mode", () => {
+  it("passes an inherited lifecycle nonce to the child and validates it at the bridge startup boundary", () => {
     const daemonSource = fs.readFileSync(path.resolve("src/process/daemon.ts"), "utf8");
-    const cliSource = fs.readFileSync(path.resolve("src/cli/index.ts"), "utf8");
+    const bridgeSource = fs.readFileSync(path.resolve("src/bridge/server.ts"), "utf8");
     expect(daemonSource).toContain("C2C_LIFECYCLE_LOCK_NONCE");
-    expect(cliSource).toContain("isWorkspaceLifecycleLockHeldBy");
-    expect(cliSource).toContain("C2C_LIFECYCLE_LOCK_NONCE");
+    expect(bridgeSource).toContain("isWorkspaceLifecycleLockHeldBy");
+    expect(bridgeSource).toContain("C2C_LIFECYCLE_LOCK_NONCE");
   });
 });
