@@ -22,10 +22,24 @@ function makeWorkspace(name: string): Workspace {
   return new Workspace(root);
 }
 
-function liveThenDown() {
-  const fakeRuntime = { port: 48765, adminToken: "test" } as never;
+function fakeRuntime(workspace: Workspace) {
+  return {
+    service: "codex-with-chatgpt",
+    version: "0.1.0",
+    workspaceId: workspace.id,
+    workspaceRoot: workspace.root,
+    pid: 424242,
+    port: 48765,
+    adminToken: "test",
+    publicUrl: null,
+    startedAt: new Date().toISOString(),
+  };
+}
+
+function liveThenDown(workspace: Workspace) {
+  const runtime = fakeRuntime(workspace);
   let calls = 0;
-  return async () => (++calls === 1 ? fakeRuntime : null);
+  return async () => (++calls === 1 ? runtime : null);
 }
 
 afterEach(() => {
@@ -54,7 +68,7 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
     let stopped = false;
 
     const result = await revokeWorkspaceAccess(workspace.root, {
-      findLiveBridge: liveThenDown(),
+      findLiveBridge: liveThenDown(workspace),
       adminFetch: async () => {
         revokedLegacy = true;
         return { revoked: 1 };
@@ -100,7 +114,7 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
     let stopped = false;
 
     const result = await revokeWorkspaceAccess(workspace.root, {
-      findLiveBridge: liveThenDown(),
+      findLiveBridge: liveThenDown(workspace),
       adminFetch: async () => ({ revoked: 0 }),
       stopBridge: async () => {
         stopped = true;
@@ -123,7 +137,7 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
 
     await expect(
       revokeWorkspaceAccess(workspace.root, {
-        findLiveBridge: liveThenDown(),
+        findLiveBridge: liveThenDown(workspace),
         adminFetch: async () => {
           throw new Error("admin timeout");
         },
@@ -138,6 +152,33 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
     expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
   });
 
+  it("falls back to persisted OAuth revocation after live admin revocation fails", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("unpair-oauth-persisted-fallback");
+    writeTransportMode(workspace.id, "openai");
+    ensureOpenAITunnelToken(workspace.id);
+    let persistedRevoked = false;
+
+    await expect(
+      revokeWorkspaceAccess(workspace.root, {
+        findLiveBridge: liveThenDown(workspace),
+        adminFetch: async () => {
+          throw new Error("admin timeout");
+        },
+        authStoreFactory: () => ({
+          revokeAll: () => {
+            persistedRevoked = true;
+            return 2;
+          },
+        }),
+        stopBridge: async () => true,
+      })
+    ).rejects.toThrow(/Failed to fully revoke/);
+
+    expect(persistedRevoked).toBe(true);
+    expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
+  });
+
   it("still stops the bridge when tunnel credential deletion fails", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("unpair-token-delete-failure");
@@ -146,7 +187,7 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
 
     await expect(
       revokeWorkspaceAccess(workspace.root, {
-        findLiveBridge: liveThenDown(),
+        findLiveBridge: liveThenDown(workspace),
         adminFetch: async () => ({ revoked: 0 }),
         revokeTunnelToken: () => {
           throw new Error("unlink denied");
@@ -169,13 +210,47 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
 
     await expect(
       revokeWorkspaceAccess(workspace.root, {
-        findLiveBridge: liveThenDown(),
+        findLiveBridge: liveThenDown(workspace),
         adminFetch: async () => ({ revoked: 0 }),
         stopBridge: async () => false,
       })
     ).rejects.toThrow(/Failed to fully revoke/);
 
     expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
+  });
+
+  it("uses persisted runtime/PID state instead of health to find and confirm a bridge", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("unpair-process-state");
+    writeTransportMode(workspace.id, "openai");
+    ensureOpenAITunnelToken(workspace.id);
+    const runtime = fakeRuntime(workspace);
+    let stopped = false;
+    let pidChecks = 0;
+
+    const result = await revokeWorkspaceAccess(
+      workspace.root,
+      {
+        // A health-based discovery path says the bridge is unavailable.
+        findLiveBridge: async () => null,
+        stopBridge: async () => {
+          stopped = true;
+          return true;
+        },
+        authStoreFactory: () => ({ revokeAll: () => 0 }),
+        // Future hardened path: the runtime file still identifies the process.
+        readRuntimeState: () => runtime,
+        isProcessAlive: () => {
+          pidChecks += 1;
+          return pidChecks < 2;
+        },
+        sleep: async () => undefined,
+      } as never
+    );
+
+    expect(stopped).toBe(true);
+    expect(pidChecks).toBeGreaterThanOrEqual(2);
+    expect(result.bridgeStopped).toBe(true);
   });
 
   it("wires the CLI unpair command through the hardened revocation path", () => {
