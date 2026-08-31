@@ -1,13 +1,23 @@
 import { AuthStore } from "./store.js";
-import { probeBridge, readRuntimeState, type HealthPayload, type RuntimeState } from "../bridge/runtime.js";
+import {
+  listRuntimeStates,
+  probeBridge,
+  readRuntimeState,
+  removeRuntimeStateGeneration,
+  runtimeIdentity,
+  type HealthPayload,
+  type RuntimeState,
+} from "../bridge/runtime.js";
 import { adminFetch, stopBridgeRuntime } from "../process/daemon.js";
 import { processGenerationMatches } from "../process/process-identity.js";
 import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
+import { cancelPendingStarts, listPendingStarts } from "../process/startup-registry.js";
 import { readTransportMode, revokeOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
 import { Workspace } from "../workspace/manager.js";
 import { SERVICE_NAME } from "../version.js";
 
 type ReadRuntimeState = (workspaceId: string) => RuntimeState | null;
+type ListRuntimeStates = (workspaceId: string) => RuntimeState[];
 type AdminFetch = <T = unknown>(
   runtime: RuntimeState,
   method: "GET" | "POST",
@@ -29,18 +39,24 @@ interface RuntimeIdentityPayload {
   processGeneration?: string | null;
 }
 
+type RuntimeLiveness = "exact-live" | "unknown-live" | "dead";
+
 export interface RevokeWorkspaceAccessDeps {
+  /** Legacy test/compatibility single-slot reader. Production uses listRuntimeStates. */
   readRuntimeState?: ReadRuntimeState;
+  listRuntimeStates?: ListRuntimeStates;
+  removeRuntimeStateGeneration?: (runtime: RuntimeState) => void;
   adminFetch?: AdminFetch;
   stopBridge?: StopBridgeRuntime;
   revokeTunnelToken?: RevokeTunnelToken;
   /** Test/compatibility override. Production uses process-generation identity. */
   isProcessAlive?: IsProcessAlive;
-  /** Test override for the conservative same-workspace health fallback. */
   probeBridge?: ProbeBridge;
-  /** Retained for compatibility with older callers; runtime files are no longer deleted during revocation. */
+  /** Retained for compatibility with older callers; revocation never calls it. */
   clearRuntimeState?: (workspaceId: string) => void;
   authStoreFactory?: (workspaceId: string) => RevocableAuthStore;
+  cancelPendingStarts?: (workspaceId: string) => number;
+  listPendingStarts?: (workspaceId: string) => unknown[];
   sleep?: (ms: number) => Promise<void>;
   stopTimeoutMs?: number;
   maxRuntimeGenerations?: number;
@@ -51,17 +67,6 @@ export interface RevokeWorkspaceAccessResult {
   legacyTokensRevoked: number;
   tunnelCredentialRevoked: boolean;
   bridgeStopped: boolean;
-}
-
-function runtimeIdentity(runtime: RuntimeState): string {
-  return [
-    runtime.workspaceId,
-    runtime.pid,
-    runtime.processGeneration ?? "",
-    runtime.port,
-    runtime.startedAt,
-    runtime.adminToken,
-  ].join("\u0000");
 }
 
 function authenticatedRuntimeMatches(runtime: RuntimeState, info: RuntimeIdentityPayload): boolean {
@@ -77,6 +82,18 @@ function authenticatedRuntimeMatches(runtime: RuntimeState, info: RuntimeIdentit
   );
 }
 
+function dedupeRuntimes(states: RuntimeState[]): RuntimeState[] {
+  const seen = new Set<string>();
+  const unique: RuntimeState[] = [];
+  for (const state of states) {
+    const key = runtimeIdentity(state);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(state);
+  }
+  return unique;
+}
+
 export async function revokeWorkspaceAccess(
   workspaceRoot: string,
   deps: RevokeWorkspaceAccessDeps = {}
@@ -90,48 +107,89 @@ async function revokeWorkspaceAccessLocked(
   deps: RevokeWorkspaceAccessDeps
 ): Promise<RevokeWorkspaceAccessResult> {
   const transportMode = readTransportMode(workspace.id);
-  const readRuntime = deps.readRuntimeState ?? readRuntimeState;
   const requestAdmin = deps.adminFetch ?? adminFetch;
   const stopExact = deps.stopBridge ?? stopBridgeRuntime;
   const healthProbe = deps.probeBridge ?? probeBridge;
   const revokeTunnel = deps.revokeTunnelToken ?? revokeOpenAITunnelToken;
   const makeStore = deps.authStoreFactory ?? ((workspaceId: string) => new AuthStore(workspaceId));
+  const cancelStarts = deps.cancelPendingStarts ?? cancelPendingStarts;
+  const pendingStarts = deps.listPendingStarts ?? listPendingStarts;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const stopTimeoutMs = deps.stopTimeoutMs ?? 5_000;
-  const maxRuntimeGenerations = deps.maxRuntimeGenerations ?? 4;
+  const maxRounds = deps.maxRuntimeGenerations ?? 8;
   const failures: Error[] = [];
-  const processed = new Set<string>();
 
-  const runtimeIsLive = async (runtime: RuntimeState): Promise<boolean> => {
-    if (deps.isProcessAlive) return deps.isProcessAlive(runtime.pid);
+  const listRuntimes = (): RuntimeState[] => {
+    try {
+      if (deps.listRuntimeStates) return dedupeRuntimes(deps.listRuntimeStates(workspace.id));
+      if (deps.readRuntimeState) {
+        const legacy = deps.readRuntimeState(workspace.id);
+        return legacy ? [legacy] : [];
+      }
+      return dedupeRuntimes(listRuntimeStates(workspace.id));
+    } catch (error) {
+      failures.push(new Error(`Failed to read bridge runtime registry: ${(error as Error).message}`, { cause: error }));
+      return [];
+    }
+  };
+
+  const removeRuntime = (runtime: RuntimeState): void => {
+    try {
+      if (deps.removeRuntimeStateGeneration) deps.removeRuntimeStateGeneration(runtime);
+      else if (!deps.readRuntimeState && !deps.listRuntimeStates) removeRuntimeStateGeneration(runtime);
+    } catch (error) {
+      failures.push(new Error(`Failed to remove stale runtime generation ${runtime.pid}: ${(error as Error).message}`, { cause: error }));
+    }
+  };
+
+  const cancelAllPending = (label: string): void => {
+    try {
+      cancelStarts(workspace.id);
+    } catch (error) {
+      failures.push(new Error(`${label}: ${(error as Error).message}`, { cause: error }));
+    }
+  };
+
+  const pendingCount = (): number => {
+    try {
+      return pendingStarts(workspace.id).length;
+    } catch (error) {
+      failures.push(new Error(`Failed to inspect pending bridge starts: ${(error as Error).message}`, { cause: error }));
+      return 1;
+    }
+  };
+
+  const runtimeLiveness = async (runtime: RuntimeState): Promise<RuntimeLiveness> => {
+    if (deps.isProcessAlive) return deps.isProcessAlive(runtime.pid) ? "exact-live" : "dead";
 
     if (runtime.processGeneration && processGenerationMatches(runtime.pid, runtime.processGeneration)) {
-      return true;
+      return "exact-live";
     }
 
-    // An authenticated exact application identity proves the recorded runtime.
-    // If it does not authenticate, do not immediately declare quiescence: a
-    // stale runtime file can have been restored over a newer bridge whose admin
-    // token/generation differs. Public loopback health intentionally exposes the
-    // service+workspace identity needed for this conservative split-brain check.
     try {
       const info = await requestAdmin<RuntimeIdentityPayload>(runtime, "GET", "/admin/info", 1500);
-      if (authenticatedRuntimeMatches(runtime, info)) return true;
+      if (authenticatedRuntimeMatches(runtime, info)) return "exact-live";
     } catch {
-      // Continue to conservative health detection below.
+      // Continue to conservative endpoint detection.
     }
 
     try {
       const health = await healthProbe(runtime.port, 1000);
-      return Boolean(
+      if (
         health &&
         health.service === SERVICE_NAME &&
         health.workspaceId === runtime.workspaceId &&
         health.status === "ok"
-      );
+      ) {
+        // Something for this workspace is still live at this tracked port, but
+        // the recorded generation cannot authenticate it. Do not claim success.
+        return "unknown-live";
+      }
     } catch {
-      return false;
+      // Treat an unreachable stale snapshot as dead unless its exact process or
+      // authenticated application identity proved otherwise above.
     }
+    return "dead";
   };
 
   let legacyTokensRevoked = 0;
@@ -154,59 +212,39 @@ async function revokeWorkspaceAccessLocked(
     }
   };
 
-  const readRuntimeSafely = (): RuntimeState | null => {
-    try {
-      return readRuntime(workspace.id);
-    } catch (error) {
-      failures.push(new Error(`Failed to read bridge runtime state: ${(error as Error).message}`, { cause: error }));
-      return null;
-    }
-  };
-
+  // We hold the lifecycle lock. Any parent that already spawned a delayed child
+  // has published a pending intent; cancelling all of them fences those children
+  // before credentials are scrubbed. No new ensureBridge parent can publish an
+  // intent until this lock is released.
+  cancelAllPending("Failed to cancel pending bridge starts");
   scrubPersistedOAuth("Failed to revoke persisted OAuth credentials");
   removeTunnelCredential("Failed to remove OpenAI tunnel credential");
 
-  let candidate = readRuntimeSafely();
   let quiescent = false;
+  let lastUnknown: RuntimeState[] = [];
 
-  for (let generation = 0; generation < maxRuntimeGenerations; generation++) {
-    if (!candidate) {
-      await sleep(50);
-      candidate = readRuntimeSafely();
-      if (!candidate) {
-        quiescent = true;
-        break;
-      }
-    }
+  for (let round = 0; round < maxRounds; round++) {
+    cancelAllPending("Failed to cancel pending bridge starts during revocation");
+    const runtimes = listRuntimes();
+    lastUnknown = [];
 
-    const current = candidate;
-    const key = runtimeIdentity(current);
-    const aliveAtStart = await runtimeIsLive(current);
-
-    if (processed.has(key)) {
-      if (aliveAtStart) {
-        failures.push(new Error(`Workspace bridge runtime ${current.pid} remained live after a revocation attempt`));
-      } else {
-        await sleep(50);
-        const confirm = readRuntimeSafely();
-        if (!confirm || (runtimeIdentity(confirm) === key && !(await runtimeIsLive(confirm)))) {
-          quiescent = true;
-          break;
-        }
-        candidate = confirm;
+    for (const runtime of runtimes) {
+      const status = await runtimeLiveness(runtime);
+      if (status === "dead") {
+        removeRuntime(runtime);
         continue;
       }
-      break;
-    }
-    processed.add(key);
+      if (status === "unknown-live") {
+        lastUnknown.push(runtime);
+        continue;
+      }
 
-    if (aliveAtStart) {
       try {
-        const result = await requestAdmin<{ revoked?: number }>(current, "POST", "/admin/revoke-all");
+        const result = await requestAdmin<{ revoked?: number }>(runtime, "POST", "/admin/revoke-all");
         legacyTokensRevoked += result.revoked ?? 0;
       } catch (error) {
         failures.push(
-          new Error(`Failed to revoke OAuth credentials through bridge ${current.pid}: ${(error as Error).message}`, {
+          new Error(`Failed to revoke OAuth credentials through bridge ${runtime.pid}: ${(error as Error).message}`, {
             cause: error,
           })
         );
@@ -214,13 +252,13 @@ async function revokeWorkspaceAccessLocked(
       }
 
       try {
-        const shutdownRequested = await stopExact(workspace.root, current);
-        if (!shutdownRequested) {
-          failures.push(new Error(`Failed to authenticate and request shutdown for workspace bridge ${current.pid}`));
+        const stopped = await stopExact(workspace.root, runtime);
+        if (!stopped) {
+          failures.push(new Error(`Failed to stop exact workspace bridge generation ${runtime.pid}`));
         }
       } catch (error) {
         failures.push(
-          new Error(`Failed to request workspace bridge ${current.pid} shutdown: ${(error as Error).message}`, {
+          new Error(`Failed to request workspace bridge ${runtime.pid} shutdown: ${(error as Error).message}`, {
             cause: error,
           })
         );
@@ -228,61 +266,79 @@ async function revokeWorkspaceAccessLocked(
 
       const deadline = Date.now() + stopTimeoutMs;
       while (Date.now() < deadline) {
-        if (!(await runtimeIsLive(current))) {
+        const nextStatus = await runtimeLiveness(runtime);
+        if (nextStatus !== "exact-live") {
           bridgeStopped = true;
           break;
         }
         await sleep(50);
       }
-      if (await runtimeIsLive(current)) {
-        failures.push(new Error(`Workspace bridge process ${current.pid} did not exit before the revocation deadline`));
+      if ((await runtimeLiveness(runtime)) === "exact-live") {
+        failures.push(new Error(`Workspace bridge process ${runtime.pid} did not exit before the revocation deadline`));
+      } else {
+        removeRuntime(runtime);
       }
+
+      scrubPersistedOAuth("Failed post-stop persisted OAuth credential scrub");
+      removeTunnelCredential("Failed post-stop OpenAI tunnel credential scrub");
     }
 
-    scrubPersistedOAuth("Failed final persisted OAuth credential scrub");
-    removeTunnelCredential("Failed final OpenAI tunnel credential scrub");
-
+    scrubPersistedOAuth("Failed round-final persisted OAuth credential scrub");
+    removeTunnelCredential("Failed round-final OpenAI tunnel credential scrub");
+    cancelAllPending("Failed to re-cancel pending bridge starts");
     await sleep(50);
-    const next = readRuntimeSafely();
-    if (!next) {
+
+    const confirmRuntimes = listRuntimes();
+    let confirmedLive = 0;
+    let confirmedUnknown = 0;
+    for (const runtime of confirmRuntimes) {
+      const status = await runtimeLiveness(runtime);
+      if (status === "dead") {
+        removeRuntime(runtime);
+      } else if (status === "exact-live") {
+        confirmedLive += 1;
+      } else {
+        confirmedUnknown += 1;
+      }
+    }
+
+    if (confirmedLive === 0 && confirmedUnknown === 0 && pendingCount() === 0) {
+      // Require two empty/dead observations while still holding the lifecycle
+      // lock. This closes publication/cleanup timing windows inside a generation.
       await sleep(50);
-      const confirm = readRuntimeSafely();
-      if (!confirm) {
+      cancelAllPending("Failed to cancel pending starts during final confirmation");
+      const second = listRuntimes();
+      let secondLive = 0;
+      for (const runtime of second) {
+        const status = await runtimeLiveness(runtime);
+        if (status === "dead") removeRuntime(runtime);
+        else secondLive += 1;
+      }
+      if (secondLive === 0 && pendingCount() === 0) {
         quiescent = true;
         break;
       }
-      candidate = confirm;
-      continue;
     }
-
-    const nextKey = runtimeIdentity(next);
-    if (nextKey !== key) {
-      candidate = next;
-      continue;
-    }
-
-    if (!(await runtimeIsLive(next))) {
-      await sleep(50);
-      const confirm = readRuntimeSafely();
-      if (!confirm || (runtimeIdentity(confirm) === nextKey && !(await runtimeIsLive(confirm)))) {
-        quiescent = true;
-        break;
-      }
-      candidate = confirm;
-      continue;
-    }
-
-    candidate = next;
   }
 
   if (!quiescent) {
-    failures.push(
-      new Error(`Workspace did not reach a quiescent state after ${maxRuntimeGenerations} runtime generation(s)`)
-    );
+    if (lastUnknown.length > 0) {
+      failures.push(
+        new Error(
+          `Detected ${lastUnknown.length} live same-workspace bridge endpoint(s) whose exact runtime identity could not be authenticated`
+        )
+      );
+    }
+    failures.push(new Error(`Workspace did not reach a quiescent state after ${maxRounds} runtime-registry round(s)`));
   }
 
   scrubPersistedOAuth("Failed final persisted OAuth credential scrub after quiescence check");
   removeTunnelCredential("Failed final OpenAI tunnel credential scrub after quiescence check");
+  cancelAllPending("Failed final pending-start cancellation");
+
+  if (pendingCount() !== 0) {
+    failures.push(new Error("One or more pending bridge starts remained after revocation"));
+  }
 
   if (failures.length > 0) {
     throw new AggregateError(failures, "Failed to fully revoke ChatGPT access to this workspace");
