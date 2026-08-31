@@ -84,6 +84,43 @@ function atomicPrivateWrite(file: string, payload: string): void {
   }
 }
 
+function isRuntimeState(value: unknown, workspaceId: string): value is RuntimeState {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<RuntimeState>;
+  return (
+    state.service === SERVICE_NAME &&
+    typeof state.version === "string" &&
+    state.workspaceId === workspaceId &&
+    typeof state.workspaceRoot === "string" &&
+    typeof state.pid === "number" &&
+    Number.isSafeInteger(state.pid) &&
+    state.pid > 0 &&
+    (state.processGeneration === undefined || state.processGeneration === null || typeof state.processGeneration === "string") &&
+    typeof state.port === "number" &&
+    Number.isSafeInteger(state.port) &&
+    state.port > 0 &&
+    state.port <= 65535 &&
+    typeof state.adminToken === "string" &&
+    state.adminToken.length > 0 &&
+    (state.publicUrl === null || typeof state.publicUrl === "string") &&
+    typeof state.startedAt === "string" &&
+    Number.isFinite(Date.parse(state.startedAt))
+  );
+}
+
+function readRuntimeStrict(file: string, workspaceId: string): RuntimeState {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    throw new Error(`Runtime state exists but cannot be read: ${file}`, { cause: error });
+  }
+  if (!isRuntimeState(parsed, workspaceId)) {
+    throw new Error(`Runtime state is malformed or belongs to another workspace: ${file}`);
+  }
+  return parsed;
+}
+
 /**
  * Publish one exact runtime generation first, then refresh the legacy canonical
  * mirror. The per-generation file is authoritative, so a crash or restored
@@ -94,8 +131,16 @@ export function writeRuntimeState(state: RuntimeState): void {
   const normalized: RuntimeState = { ...state, processGeneration };
   const payload = JSON.stringify(normalized, null, 2);
 
+  // The authoritative generation write must succeed or startup fails closed.
   atomicPrivateWrite(runtimeGenerationFile(normalized), payload);
-  atomicPrivateWrite(runtimeFile(normalized.workspaceId), payload);
+  // The canonical file is a compatibility mirror only. A mirror update failure
+  // cannot make the already-published authoritative generation disappear.
+  try {
+    atomicPrivateWrite(runtimeFile(normalized.workspaceId), payload);
+  } catch {
+    // Keep the authoritative generation; later readers include any older mirror
+    // as an additional stale candidate rather than letting it hide this state.
+  }
 }
 
 /** Legacy compatibility read. Security-sensitive callers should use listRuntimeStates(). */
@@ -104,35 +149,32 @@ export function readRuntimeState(workspaceId: string): RuntimeState | null {
 }
 
 /**
- * Return every tracked generation. Once a workspace has a generation registry
- * directory, the legacy canonical mirror is deliberately ignored even if the
- * directory is temporarily empty; this prevents an old restored mirror from
- * becoming authoritative again.
+ * Return every tracked generation plus the legacy mirror as an additional
+ * compatibility candidate. No single canonical snapshot can replace or hide a
+ * registry generation. Existing-but-unreadable/malformed state fails closed.
  */
 export function listRuntimeStates(workspaceId: string): RuntimeState[] {
-  const dir = runtimeRegistryDir(workspaceId, false);
-  if (!fs.existsSync(dir)) {
-    const legacy = readRuntimeState(workspaceId);
-    return legacy ? [legacy] : [];
-  }
-
-  let names: string[];
-  try {
-    names = fs.readdirSync(dir);
-  } catch {
-    return [];
-  }
-
   const states: RuntimeState[] = [];
   const seen = new Set<string>();
-  for (const name of names) {
-    if (!name.endsWith(".json")) continue;
-    const state = readJsonIfExists<RuntimeState>(path.join(dir, name));
-    if (!state || state.workspaceId !== workspaceId) continue;
+  const add = (state: RuntimeState): void => {
     const key = runtimeIdentity(state);
-    if (seen.has(key)) continue;
+    if (seen.has(key)) return;
     seen.add(key);
     states.push(state);
+  };
+
+  const dir = runtimeRegistryDir(workspaceId, false);
+  if (fs.existsSync(dir)) {
+    const names = fs.readdirSync(dir);
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      add(readRuntimeStrict(path.join(dir, name), workspaceId));
+    }
+  }
+
+  const canonical = runtimeFile(workspaceId);
+  if (fs.existsSync(canonical)) {
+    add(readRuntimeStrict(canonical, workspaceId));
   }
 
   states.sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt));
