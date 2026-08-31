@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { acquireWorkspaceLifecycleLock } from "../src/process/workspace-lock.js";
+import {
+  acquireWorkspaceLifecycleLock,
+  isWorkspaceLifecycleLockHeldBy,
+} from "../src/process/workspace-lock.js";
 import { ensureBridge, stopBridge } from "../src/process/daemon.js";
 import { revokeWorkspaceAccess } from "../src/auth/revoke.js";
+import { stateSubdir } from "../src/config/paths.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
@@ -28,6 +32,8 @@ describe("workspace lifecycle serialization", () => {
     const held = await acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 });
     let enteredRevocation = false;
 
+    expect(isWorkspaceLifecycleLockHeldBy(workspace.id, held.nonce)).toBe(true);
+
     const pending = revokeWorkspaceAccess(workspace.root, {
       readRuntimeState: () => {
         enteredRevocation = true;
@@ -44,6 +50,58 @@ describe("workspace lifecycle serialization", () => {
     held.release();
     await pending;
     expect(enteredRevocation).toBe(true);
+  });
+
+  it("does not immediately reclaim a dead-owner lock during the bridge startup grace window", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-dead-owner-grace");
+    const lockDir = path.join(stateSubdir("locks"), `${workspace.id}.lifecycle.lock`);
+    fs.mkdirSync(lockDir, { mode: 0o700 });
+    fs.writeFileSync(
+      path.join(lockDir, "owner.json"),
+      JSON.stringify({
+        pid: 2_147_483_647,
+        nonce: "dead-owner-nonce",
+        acquiredAt: new Date().toISOString(),
+      }),
+      { mode: 0o600 }
+    );
+
+    await expect(
+      acquireWorkspaceLifecycleLock(workspace.id, {
+        timeoutMs: 30,
+        pollMs: 5,
+        orphanGraceMs: 500,
+      })
+    ).rejects.toThrow(/Timed out waiting/);
+    expect(fs.existsSync(lockDir)).toBe(true);
+  });
+
+  it("reclaims a dead-owner lock after the startup grace window expires", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-dead-owner-expired");
+    const lockDir = path.join(stateSubdir("locks"), `${workspace.id}.lifecycle.lock`);
+    fs.mkdirSync(lockDir, { mode: 0o700 });
+    fs.writeFileSync(
+      path.join(lockDir, "owner.json"),
+      JSON.stringify({
+        pid: 2_147_483_647,
+        nonce: "expired-owner-nonce",
+        acquiredAt: new Date(Date.now() - 10_000).toISOString(),
+      }),
+      { mode: 0o600 }
+    );
+
+    const lock = await acquireWorkspaceLifecycleLock(workspace.id, {
+      timeoutMs: 500,
+      pollMs: 5,
+      orphanGraceMs: 100,
+    });
+    try {
+      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, lock.nonce)).toBe(true);
+    } finally {
+      lock.release();
+    }
   });
 
   it("serializes concurrent ensureBridge calls so only one startup path wins", async () => {
@@ -72,5 +130,13 @@ describe("daemon source-mode fallback", () => {
     expect(source).toContain("fs.existsSync(distEntry)");
     expect(source).toContain('"--import", "tsx/esm"');
     expect(source).toContain('"src", "cli", "index.ts"');
+  });
+
+  it("passes an inherited lifecycle nonce to the child and validates it in serve mode", () => {
+    const daemonSource = fs.readFileSync(path.resolve("src/process/daemon.ts"), "utf8");
+    const cliSource = fs.readFileSync(path.resolve("src/cli/index.ts"), "utf8");
+    expect(daemonSource).toContain("C2C_LIFECYCLE_LOCK_NONCE");
+    expect(cliSource).toContain("isWorkspaceLifecycleLockHeldBy");
+    expect(cliSource).toContain("C2C_LIFECYCLE_LOCK_NONCE");
   });
 });
