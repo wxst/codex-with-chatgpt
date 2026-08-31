@@ -234,11 +234,19 @@ export function isWorkspaceLifecycleLockHeldBy(
   if (!own || !own.ticket || !own.ticket.acquired || own.ticket.choosing) return false;
   if (!ticketIsFresh(own, orphanGraceMs)) return false;
 
+  // This is the post-publication fence immediately before the critical section.
+  // It must be at least as strict as the main wait loop: a contender that became
+  // visible after our prior scan can still be choosing, or can have selected an
+  // earlier ticket without having set acquired=true yet. Ignoring either state
+  // allows two candidates to pass their final checks concurrently.
   for (const entry of listTickets(workspaceId)) {
-    if (!ticketIsFresh(entry, orphanGraceMs) || !entry.ticket) continue;
+    if (!ticketIsFresh(entry, orphanGraceMs)) continue;
+    if (!entry.ticket) return false;
+
     const ticket = entry.ticket;
-    if (ticket.nonce === nonce || ticket.choosing || ticket.number <= 0) continue;
-    if (ticket.acquired && compareTickets(ticket, own.ticket) < 0) return false;
+    if (ticket.nonce === nonce) continue;
+    if (ticket.choosing || ticket.number <= 0) return false;
+    if (compareTickets(ticket, own.ticket) < 0) return false;
   }
   return true;
 }
