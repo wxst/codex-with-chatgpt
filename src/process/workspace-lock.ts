@@ -4,9 +4,6 @@ import path from "node:path";
 import { stateSubdir } from "../config/paths.js";
 import { getProcessGeneration, processGenerationMatches } from "./process-identity.js";
 
-export const LIFECYCLE_LOCK_NONCE_ENV = "C2C_LIFECYCLE_LOCK_NONCE";
-export const LIFECYCLE_LOCK_WORKSPACE_ENV = "C2C_LIFECYCLE_LOCK_WORKSPACE";
-
 interface LifecycleTicket {
   pid: number;
   processGeneration: string | null;
@@ -30,7 +27,6 @@ export interface WorkspaceLifecycleLockOptions {
 }
 
 export interface WorkspaceLifecycleLock {
-  /** Opaque proof passed only to a child startup process spawned under this lock. */
   nonce: string;
   release(): void;
 }
@@ -94,8 +90,6 @@ function parseTicket(content: string): LifecycleTicket | null {
       processGeneration,
       nonce,
       number: ticketNumber,
-      // Older/manual fixtures with a positive ticket number represent a fully
-      // chosen ticket. Production always writes these fields explicitly.
       choosing: value.choosing ?? ticketNumber === 0,
       acquired: value.acquired ?? ticketNumber > 0,
       createdAt,
@@ -105,13 +99,6 @@ function parseTicket(content: string): LifecycleTicket | null {
   }
 }
 
-/**
- * A ticket owned by the exact same OS process generation never expires merely
- * because its event loop or the whole machine was paused. This prevents an old
- * critical section from resuming concurrently with a successor. Once that
- * process generation is gone, the mtime lease supplies the bounded startup
- * grace window (important when a parent dies just after spawning a child).
- */
 function ticketIsFresh(entry: TicketEntry, graceMs: number): boolean {
   const ticket = entry.ticket;
   if (ticket?.processGeneration && processGenerationMatches(ticket.pid, ticket.processGeneration)) {
@@ -143,22 +130,49 @@ function listTickets(workspaceId: string): TicketEntry[] {
         ticket: parseTicket(fs.readFileSync(file, "utf8")),
       });
     } catch {
-      // A ticket can disappear only when its own owner releases it. Ignore the
-      // raced-away entry and rescan on the next acquisition iteration.
+      // The owner can release its unique ticket while another contender scans.
     }
   }
   return entries;
 }
 
+/**
+ * Publish a complete ticket generation with one same-directory atomic rename.
+ * Readers therefore observe either the previous complete JSON object or the new
+ * complete object, never a truncate/write intermediate state. Temporary files
+ * deliberately do not end in TICKET_SUFFIX and are ignored by contenders.
+ */
 function writeTicket(file: string, ticket: LifecycleTicket): void {
-  fs.writeFileSync(file, JSON.stringify(ticket), { mode: 0o600 });
-  if (process.platform !== "win32") {
-    fs.chmodSync(file, 0o600);
-  } else {
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(temp, "wx", 0o600);
+    fs.writeFileSync(fd, JSON.stringify(ticket), "utf8");
+    if (process.platform !== "win32") {
+      fs.fchmodSync(fd, 0o600);
+    } else {
+      try {
+        fs.fchmodSync(fd, 0o600);
+      } catch {
+        // Windows ACL semantics do not reliably map to POSIX mode bits.
+      }
+    }
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(temp, file);
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // preserve the original write failure
+      }
+    }
     try {
-      fs.chmodSync(file, 0o600);
+      fs.rmSync(temp, { force: true });
     } catch {
-      // Windows ACL semantics do not reliably map to POSIX mode bits.
+      // A successful rename already moved the temp path away.
     }
   }
 }
@@ -210,28 +224,16 @@ function ownTicketEntry(workspaceId: string, nonce: string): TicketEntry | null 
   }
 }
 
-/**
- * Verify inherited startup proof against a unique, acquired, active ticket.
- * No shared pathname is reclaimed or deleted, so a stale generation cannot be
- * confused with a successor generation at the same path.
- */
 export function isWorkspaceLifecycleLockHeldBy(
   workspaceId: string,
   nonce: string,
   orphanGraceMs = DEFAULT_ORPHAN_GRACE_MS
 ): boolean {
   if (!nonce) return false;
-  let own: TicketEntry | null;
-  try {
-    own = ownTicketEntry(workspaceId, nonce);
-  } catch {
-    return false;
-  }
+  const own = ownTicketEntry(workspaceId, nonce);
   if (!own || !own.ticket || !own.ticket.acquired || own.ticket.choosing) return false;
   if (!ticketIsFresh(own, orphanGraceMs)) return false;
 
-  // Defensive split-brain detection: an acquired ticket must remain the first
-  // active finalized ticket in the total order.
   for (const entry of listTickets(workspaceId)) {
     if (!ticketIsFresh(entry, orphanGraceMs) || !entry.ticket) continue;
     const ticket = entry.ticket;
@@ -268,12 +270,10 @@ export async function acquireWorkspaceLifecycleLock(
   };
 
   try {
-    fs.writeFileSync(file, JSON.stringify(ticket), { mode: 0o600, flag: "wx" });
-    if (process.platform !== "win32") fs.chmodSync(file, 0o600);
+    // The final ticket path is invisible until the first complete JSON document
+    // is atomically renamed into place.
+    writeTicket(file, ticket);
 
-    // Heartbeat starts before number selection so a live waiter cannot age out
-    // while queued behind a long-running holder. Process-generation identity is
-    // the stronger fence when timers are paused for longer than the lease.
     heartbeat = setInterval(() => {
       if (!refreshTicket(file, nonce, orphanGraceMs) && heartbeat) {
         clearInterval(heartbeat);
@@ -307,8 +307,8 @@ export async function acquireWorkspaceLifecycleLock(
       for (const entry of listTickets(workspaceId)) {
         if (!ticketIsFresh(entry, orphanGraceMs)) continue;
         if (!entry.ticket) {
-          // A fresh truncated/partial ticket may belong to a process between
-          // create and write. Wait for it to become valid or naturally expire.
+          // A malformed *fresh* legacy/manual ticket is conservatively blocking;
+          // atomic production updates never expose a partial JSON document.
           blocked = true;
           break;
         }
@@ -327,6 +327,14 @@ export async function acquireWorkspaceLifecycleLock(
       if (!blocked) {
         ticket = { ...ticket, acquired: true };
         writeTicket(file, ticket);
+        // Re-scan after publishing acquired=true. This catches a contender that
+        // completed a lower-priority ticket between our last scan and publish.
+        if (!isWorkspaceLifecycleLockHeldBy(workspaceId, nonce, orphanGraceMs)) {
+          ticket = { ...ticket, acquired: false };
+          writeTicket(file, ticket);
+          await new Promise((resolve) => setTimeout(resolve, pollMs));
+          continue;
+        }
         break;
       }
       await new Promise((resolve) => setTimeout(resolve, pollMs));
