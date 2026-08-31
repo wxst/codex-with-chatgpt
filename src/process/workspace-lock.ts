@@ -2,12 +2,14 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { stateSubdir } from "../config/paths.js";
+import { getProcessGeneration, processGenerationMatches } from "./process-identity.js";
 
 export const LIFECYCLE_LOCK_NONCE_ENV = "C2C_LIFECYCLE_LOCK_NONCE";
 export const LIFECYCLE_LOCK_WORKSPACE_ENV = "C2C_LIFECYCLE_LOCK_WORKSPACE";
 
 interface LifecycleTicket {
   pid: number;
+  processGeneration: string | null;
   nonce: string;
   number: number;
   choosing: boolean;
@@ -82,8 +84,14 @@ function parseTicket(content: string): LifecycleTicket | null {
       return null;
     }
 
+    const processGeneration =
+      typeof value.processGeneration === "string" && value.processGeneration.length > 0
+        ? value.processGeneration
+        : null;
+
     return {
       pid,
+      processGeneration,
       nonce,
       number: ticketNumber,
       // Older/manual fixtures with a positive ticket number represent a fully
@@ -97,7 +105,18 @@ function parseTicket(content: string): LifecycleTicket | null {
   }
 }
 
+/**
+ * A ticket owned by the exact same OS process generation never expires merely
+ * because its event loop or the whole machine was paused. This prevents an old
+ * critical section from resuming concurrently with a successor. Once that
+ * process generation is gone, the mtime lease supplies the bounded startup
+ * grace window (important when a parent dies just after spawning a child).
+ */
 function ticketIsFresh(entry: TicketEntry, graceMs: number): boolean {
+  const ticket = entry.ticket;
+  if (ticket?.processGeneration && processGenerationMatches(ticket.pid, ticket.processGeneration)) {
+    return true;
+  }
   return entry.mtimeMs > 0 && Date.now() - entry.mtimeMs < graceMs;
 }
 
@@ -155,10 +174,9 @@ function refreshTicket(file: string, nonce: string, graceMs: number): boolean {
     const ticket = parseTicket(fs.readFileSync(file, "utf8"));
     if (!ticket || ticket.nonce !== nonce) return false;
 
-    // A lease that has already expired must never be resurrected by a delayed
-    // timer after a long event-loop/system pause. Once expired, this generation
-    // is fenced and future contenders may ignore it.
-    if (Date.now() - stat.mtimeMs >= graceMs) return false;
+    const sameGeneration =
+      Boolean(ticket.processGeneration) && processGenerationMatches(ticket.pid, ticket.processGeneration!);
+    if (!sameGeneration && Date.now() - stat.mtimeMs >= graceMs) return false;
 
     const now = new Date();
     fs.utimesSync(file, now, now);
@@ -193,7 +211,7 @@ function ownTicketEntry(workspaceId: string, nonce: string): TicketEntry | null 
 }
 
 /**
- * Verify inherited startup proof against a unique, acquired, fresh ticket.
+ * Verify inherited startup proof against a unique, acquired, active ticket.
  * No shared pathname is reclaimed or deleted, so a stale generation cannot be
  * confused with a successor generation at the same path.
  */
@@ -213,7 +231,7 @@ export function isWorkspaceLifecycleLockHeldBy(
   if (!ticketIsFresh(own, orphanGraceMs)) return false;
 
   // Defensive split-brain detection: an acquired ticket must remain the first
-  // fresh finalized ticket in the total order.
+  // active finalized ticket in the total order.
   for (const entry of listTickets(workspaceId)) {
     if (!ticketIsFresh(entry, orphanGraceMs) || !entry.ticket) continue;
     const ticket = entry.ticket;
@@ -241,6 +259,7 @@ export async function acquireWorkspaceLifecycleLock(
   const createdAt = new Date().toISOString();
   let ticket: LifecycleTicket = {
     pid: process.pid,
+    processGeneration: getProcessGeneration(process.pid),
     nonce,
     number: 0,
     choosing: true,
@@ -253,7 +272,8 @@ export async function acquireWorkspaceLifecycleLock(
     if (process.platform !== "win32") fs.chmodSync(file, 0o600);
 
     // Heartbeat starts before number selection so a live waiter cannot age out
-    // while queued behind a long-running holder.
+    // while queued behind a long-running holder. Process-generation identity is
+    // the stronger fence when timers are paused for longer than the lease.
     heartbeat = setInterval(() => {
       if (!refreshTicket(file, nonce, orphanGraceMs) && heartbeat) {
         clearInterval(heartbeat);
