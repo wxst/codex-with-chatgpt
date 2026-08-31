@@ -31,6 +31,7 @@ import {
 } from "./runtime.js";
 
 const activePersistedBridges = new Set<string>();
+const PENDING_START_ENV = "C2C_PENDING_START_ID";
 
 interface RuntimeIdentityPayload {
   service?: string;
@@ -163,16 +164,15 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
  */
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const workspace = new Workspace(opts.workspaceRoot);
+  const pendingStartId = opts.pendingStartId ?? process.env[PENDING_START_ENV];
   return withWorkspaceLifecycleLock(workspace.id, async () => {
-    if (opts.pendingStartId) requirePendingStart(workspace.id, opts.pendingStartId);
+    if (pendingStartId) requirePendingStart(workspace.id, pendingStartId);
     try {
       const bridge = await startBridgeUnlocked(opts, workspace);
-      // startBridgeUnlocked publishes the generation runtime before returning.
-      // Only then may the one-shot pending intent disappear.
-      if (opts.pendingStartId) completePendingStart(workspace.id, opts.pendingStartId);
+      if (pendingStartId) completePendingStart(workspace.id, pendingStartId);
       return bridge;
     } catch (error) {
-      if (opts.pendingStartId) cancelPendingStart(workspace.id, opts.pendingStartId);
+      if (pendingStartId) cancelPendingStart(workspace.id, pendingStartId);
       throw error;
     }
   });
