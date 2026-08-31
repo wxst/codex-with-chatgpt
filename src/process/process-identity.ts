@@ -13,8 +13,6 @@ function linuxGeneration(pid: number): string | null {
     const closeParen = stat.lastIndexOf(")");
     if (closeParen < 0) return null;
 
-    // Field 22 is process starttime in clock ticks since boot. Include the
-    // procfs inode and boot_id as additional generation discriminators.
     const fieldsFromThree = stat.slice(closeParen + 1).trim().split(/\s+/);
     const startTicks = fieldsFromThree[19];
     if (!startTicks || !/^\d+$/.test(startTicks)) return null;
@@ -65,12 +63,6 @@ function windowsGeneration(pid: number): string | null {
   }
 }
 
-/**
- * Return an OS-derived identity for one exact process generation.
- * Numeric PIDs are intentionally insufficient because operating systems reuse
- * them. `null` means the generation cannot be proven and security-sensitive
- * callers must fail closed.
- */
 export function getProcessGeneration(pid: number): string | null {
   if (!validPid(pid)) return null;
   if (process.platform === "linux") return linuxGeneration(pid);
@@ -92,6 +84,57 @@ export function requireCurrentProcessGeneration(): string {
     throw new Error(`Unable to determine process generation on ${process.platform}`);
   }
   return generation;
+}
+
+const LINUX_PIDFD_CAPABILITY_SCRIPT = String.raw`
+import os, signal, sys
+ok = (
+    sys.version_info >= (3, 9)
+    and hasattr(os, "pidfd_open")
+    and hasattr(signal, "pidfd_send_signal")
+)
+sys.exit(0 if ok else 20)
+`;
+
+let cachedLinuxPidfdPython: string | null | undefined;
+
+function detectLinuxPidfdPython(): string | null {
+  if (cachedLinuxPidfdPython !== undefined) return cachedLinuxPidfdPython;
+  for (const executable of [process.env.C2C_PYTHON, "python3", "python"]) {
+    if (!executable) continue;
+    try {
+      const result = spawnSync(executable, ["-c", LINUX_PIDFD_CAPABILITY_SCRIPT], {
+        encoding: "utf8",
+        timeout: 2500,
+        windowsHide: true,
+      });
+      if (result.error && (result.error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      if (result.status === 0) {
+        cachedLinuxPidfdPython = executable;
+        return executable;
+      }
+    } catch {
+      // Try the next declared interpreter name.
+    }
+  }
+  cachedLinuxPidfdPython = null;
+  return null;
+}
+
+/**
+ * Validate process-safety prerequisites before a Bridge can load credentials.
+ * Linux requires Python 3.9+ exposing pidfd_open/pidfd_send_signal so an
+ * unresponsive Bridge can be terminated through a generation-bound kernel
+ * process handle instead of an unsafe reusable numeric PID.
+ */
+export function requireProcessSafetyRuntime(): void {
+  if (process.platform !== "linux") return;
+  if (!detectLinuxPidfdPython()) {
+    throw new Error(
+      "Linux requires Python 3.9+ with os.pidfd_open and signal.pidfd_send_signal for safe Bridge lifecycle management. " +
+        "Install a suitable Python runtime or set C2C_PYTHON to its executable."
+    );
+  }
 }
 
 const LINUX_PIDFD_SIGNAL_SCRIPT = String.raw`
@@ -135,23 +178,18 @@ finally:
 `;
 
 function signalLinuxPidfd(pid: number, expectedGeneration: string, signalName: NodeJS.Signals): boolean {
-  // Python exposes pidfd_open/pidfd_send_signal directly on modern Linux. The
-  // helper opens pidfd first; even if the numeric PID is subsequently recycled,
-  // the signal remains bound to that original process object. No shell is used.
-  for (const executable of ["python3", "python"]) {
-    try {
-      const result = spawnSync(
-        executable,
-        ["-c", LINUX_PIDFD_SIGNAL_SCRIPT, String(pid), expectedGeneration, signalName],
-        { encoding: "utf8", timeout: 3000, windowsHide: true }
-      );
-      if (result.error && (result.error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      return result.status === 0;
-    } catch {
-      return false;
-    }
+  const executable = detectLinuxPidfdPython();
+  if (!executable) return false;
+  try {
+    const result = spawnSync(
+      executable,
+      ["-c", LINUX_PIDFD_SIGNAL_SCRIPT, String(pid), expectedGeneration, signalName],
+      { encoding: "utf8", timeout: 3000, windowsHide: true }
+    );
+    return result.status === 0;
+  } catch {
+    return false;
   }
-  return false;
 }
 
 function signalWindowsProcessHandle(pid: number, expectedGeneration: string): boolean {
@@ -164,7 +202,6 @@ function signalWindowsProcessHandle(pid: number, expectedGeneration: string): bo
       `$p=Get-Process -Id ${pid}`,
       "$actual='win32:'+$p.StartTime.ToUniversalTime().ToString('o')",
       `if ($actual -ne '${escapedExpected}') { exit 22 }`,
-      // Kill on this Process object, not a second lookup by numeric PID.
       "$p.Kill()",
       "exit 0",
     ].join("; ");
@@ -179,15 +216,6 @@ function signalWindowsProcessHandle(pid: number, expectedGeneration: string): bo
   }
 }
 
-/**
- * Signal only the exact process generation represented by `expectedGeneration`.
- *
- * Linux uses pidfd so validation and signaling stay bound to one kernel process
- * object instead of a reusable numeric PID. Windows validates StartTime and
- * invokes Kill on the same Process object/handle. Platforms without a supported
- * atomic process handle deliberately return false rather than risking a signal
- * to a recycled PID.
- */
 export function signalExactProcessGeneration(
   pid: number,
   expectedGeneration: string,
