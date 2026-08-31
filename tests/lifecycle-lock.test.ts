@@ -189,7 +189,7 @@ describe("stale-lock takeover", () => {
     expect(source).toContain("RECLAIM_FILE");
     expect(source).toContain('flag: "wx"');
     expect(source).toContain("expectedNonce");
-    expect(source).toContain("current.nonce !== observed.nonce");
+    expect(source).toContain("current.nonce !== observed.owner.nonce");
   });
 });
 
