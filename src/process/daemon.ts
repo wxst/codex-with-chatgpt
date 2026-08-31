@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import { Workspace } from "../workspace/manager.js";
 import { stateSubdir } from "../config/paths.js";
 import { findLiveBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
+import { processGenerationMatches } from "./process-identity.js";
 import { acquireWorkspaceLifecycleLock } from "./workspace-lock.js";
+import { SERVICE_NAME } from "../version.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -25,12 +27,6 @@ function daemonLogFile(workspaceId: string): string {
   return path.join(stateSubdir("logs"), `bridge-${workspaceId}.out.log`);
 }
 
-/**
- * Open a daemon log for append while repairing permissions on reused files.
- * Existing files do not honor the mode argument to open(2), so POSIX systems
- * explicitly fchmod and verify the descriptor before any bridge output is
- * handed to it.
- */
 export function openPrivateAppendFile(file: string): number {
   const fd = fs.openSync(file, "a", 0o600);
   try {
@@ -59,13 +55,8 @@ export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: Ru
   const workspace = new Workspace(workspaceRoot);
   const lock = await acquireWorkspaceLifecycleLock(workspace.id);
   let child: ChildProcess | null = null;
-  let logFile = daemonLogFile(workspace.id);
+  const logFile = daemonLogFile(workspace.id);
 
-  // The parent lock protects only check-and-spawn. The detached child does not
-  // inherit or bypass this ticket: `startBridge()` acquires its own ticket,
-  // bound to the child's OS process generation, before loading any credential.
-  // Releasing here avoids a parent-owned lease after spawn and makes parent
-  // death/pause irrelevant to the child's startup critical section.
   try {
     const existing = await findLiveBridge(workspace.id);
     if (existing) return { runtime: existing, spawned: false };
@@ -125,47 +116,74 @@ export async function adminFetch<T = unknown>(
 }
 
 interface AdminRuntimeIdentity {
+  service?: string;
   workspaceId?: string;
   workspaceRoot?: string;
   port?: number;
   pid?: number;
+  processGeneration?: string | null;
   startedAt?: string;
 }
 
 function runtimeIdentityMatches(expected: RuntimeState, actual: AdminRuntimeIdentity): boolean {
   return (
+    actual.service === SERVICE_NAME &&
     actual.workspaceId === expected.workspaceId &&
+    typeof actual.workspaceRoot === "string" &&
+    path.resolve(actual.workspaceRoot) === path.resolve(expected.workspaceRoot) &&
     actual.pid === expected.pid &&
     actual.port === expected.port &&
-    actual.startedAt === expected.startedAt
+    actual.startedAt === expected.startedAt &&
+    (!expected.processGeneration || actual.processGeneration === expected.processGeneration)
   );
 }
 
 /**
- * Stop one exact bridge runtime generation.
- *
- * The runtime file can be stale and its PID can be reused by an unrelated
- * process. Destructive process signaling is therefore intentionally avoided.
- * We only request shutdown after the runtime's secret admin token authenticates
- * to the endpoint and `/admin/info` proves pid/start-time/port identity.
+ * Signal only a cryptographically/state-file-bound OS process generation. The
+ * generation is re-read immediately before SIGTERM, so a stale numeric PID can
+ * never authorize signaling a replacement process.
+ */
+function signalExactGeneration(runtime: RuntimeState, fallbackGeneration?: string | null): boolean {
+  const generation = runtime.processGeneration ?? fallbackGeneration ?? null;
+  if (!generation || !processGenerationMatches(runtime.pid, generation)) return false;
+  try {
+    process.kill(runtime.pid, "SIGTERM");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stop one exact bridge runtime generation. Prefer authenticated graceful
+ * shutdown. If the admin endpoint is paused/hung, safely escalate only when the
+ * persisted/authenticated OS process generation still matches immediately
+ * before SIGTERM.
  */
 export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeState): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
   if (runtime.workspaceId !== workspace.id || path.resolve(runtime.workspaceRoot) !== workspace.root) return false;
 
-  let info: AdminRuntimeIdentity;
+  let info: AdminRuntimeIdentity | null = null;
   try {
     info = await adminFetch<AdminRuntimeIdentity>(runtime, "GET", "/admin/info", 2000);
   } catch {
-    return false;
+    // No application-level response, but a modern runtime snapshot still gives
+    // us a safe process-generation proof for termination.
+    return signalExactGeneration(runtime);
   }
-  if (!runtimeIdentityMatches(runtime, info)) return false;
+
+  if (!runtimeIdentityMatches(runtime, info)) {
+    // If the endpoint identity drifted, only the persisted exact process
+    // generation can authorize terminating the old recorded bridge.
+    return signalExactGeneration(runtime);
+  }
 
   try {
     await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
     return true;
   } catch {
-    return false;
+    return signalExactGeneration(runtime, info.processGeneration);
   }
 }
 
