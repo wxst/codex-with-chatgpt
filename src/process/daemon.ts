@@ -4,12 +4,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Workspace } from "../workspace/manager.js";
 import { stateSubdir } from "../config/paths.js";
-import { findLiveBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
+import { findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import {
   processGenerationMatches,
   signalExactProcessGeneration,
 } from "./process-identity.js";
 import { acquireWorkspaceLifecycleLock } from "./workspace-lock.js";
+import { cancelPendingStart, createPendingStart } from "./startup-registry.js";
 import { SERVICE_NAME } from "../version.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -67,14 +68,26 @@ export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: Ru
     const existing = await findLiveBridge(workspace.id);
     if (existing) return { runtime: existing, spawned: false };
 
+    // Publish a durable one-shot start intent before spawning. The child must
+    // present this exact ID after acquiring its own lifecycle ticket and before
+    // reading credentials. `unpair` can therefore cancel the intent during the
+    // parent→child gap and permanently fence a delayed child from resuming.
+    const pending = createPendingStart(workspace.id);
     const logFd = openPrivateAppendFile(logFile);
     const entry = cliEntry();
     try {
-      child = spawn(entry.cmd, [...entry.args, "serve", "--workspace", workspace.root], {
-        detached: true,
-        stdio: ["ignore", logFd, logFd],
-        env: { ...process.env },
-      });
+      child = spawn(
+        entry.cmd,
+        [...entry.args, "serve", "--workspace", workspace.root, "--start-id", pending.startId],
+        {
+          detached: true,
+          stdio: ["ignore", logFd, logFd],
+          env: { ...process.env },
+        }
+      );
+    } catch (error) {
+      cancelPendingStart(workspace.id, pending.startId);
+      throw error;
     } finally {
       fs.closeSync(logFd);
     }
@@ -165,12 +178,6 @@ async function waitForExactGenerationExit(
   return !processGenerationMatches(runtime.pid, generation);
 }
 
-/**
- * Signal through an OS handle bound to one process generation. There is no
- * check-then-kill-by-PID gap here: Linux uses pidfd and Windows uses the same
- * Process object that was generation-validated. Unsupported platforms return
- * false rather than risk signaling a recycled numeric PID.
- */
 function signalExactGeneration(
   runtime: RuntimeState,
   generation: string | null,
@@ -230,7 +237,7 @@ export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeS
 
 export async function stopBridge(workspaceRoot: string): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
-  const runtime = readRuntimeState(workspace.id);
+  const runtime = await findLiveBridge(workspace.id);
   if (!runtime) return false;
   return stopBridgeRuntime(workspace.root, runtime);
 }
