@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { getProcessGeneration } from "../process/process-identity.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 
 /**
@@ -27,7 +28,11 @@ export function runtimeFile(workspaceId: string): string {
 }
 
 export function writeRuntimeState(state: RuntimeState): void {
-  writeSecureJson(runtimeFile(state.workspaceId), state);
+  // Centralize generation stamping so every runtime write path—including later
+  // tunnel URL updates—retains the same PID-generation proof. Callers may pass
+  // an explicit value for tests/migrations; production derives it from state.pid.
+  const processGeneration = state.processGeneration ?? getProcessGeneration(state.pid);
+  writeSecureJson(runtimeFile(state.workspaceId), { ...state, processGeneration });
 }
 
 export function readRuntimeState(workspaceId: string): RuntimeState | null {
