@@ -6,6 +6,7 @@ import {
   isWorkspaceLifecycleLockHeldBy,
 } from "../src/process/workspace-lock.js";
 import { ensureBridge, stopBridge } from "../src/process/daemon.js";
+import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { revokeWorkspaceAccess } from "../src/auth/revoke.js";
 import { stateSubdir } from "../src/config/paths.js";
 import { Workspace } from "../src/workspace/manager.js";
@@ -122,6 +123,30 @@ describe("workspace lifecycle serialization", () => {
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
   }, 30_000);
+
+  it("rejects a second persisted bridge startup for the same workspace", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("single-persisted-bridge");
+    let first: Bridge | null = null;
+    let second: Bridge | null = null;
+    let secondError: unknown = null;
+
+    try {
+      first = await startBridge({ workspaceRoot: workspace.root, port: 0, persistRuntime: true });
+      try {
+        second = await startBridge({ workspaceRoot: workspace.root, port: 0, persistRuntime: true });
+      } catch (error) {
+        secondError = error;
+      }
+
+      expect(second).toBeNull();
+      expect(secondError).toBeInstanceOf(Error);
+      expect(String((secondError as Error).message)).toMatch(/already running|runtime/i);
+    } finally {
+      if (second) await second.close();
+      if (first) await first.close();
+    }
+  });
 });
 
 describe("daemon source-mode fallback", () => {
