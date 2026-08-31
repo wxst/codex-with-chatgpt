@@ -135,8 +135,10 @@ describe("daemon source-mode fallback", () => {
   it("passes an inherited lifecycle nonce to the child and validates it at the bridge startup boundary", () => {
     const daemonSource = fs.readFileSync(path.resolve("src/process/daemon.ts"), "utf8");
     const bridgeSource = fs.readFileSync(path.resolve("src/bridge/server.ts"), "utf8");
-    expect(daemonSource).toContain("C2C_LIFECYCLE_LOCK_NONCE");
+    expect(daemonSource).toContain("LIFECYCLE_LOCK_NONCE_ENV");
+    expect(daemonSource).toContain("LIFECYCLE_LOCK_WORKSPACE_ENV");
     expect(bridgeSource).toContain("isWorkspaceLifecycleLockHeldBy");
-    expect(bridgeSource).toContain("C2C_LIFECYCLE_LOCK_NONCE");
+    expect(bridgeSource).toContain("LIFECYCLE_LOCK_NONCE_ENV");
+    expect(bridgeSource).toContain("LIFECYCLE_LOCK_WORKSPACE_ENV");
   });
 });
