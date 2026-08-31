@@ -16,7 +16,7 @@ import { ensureOpenAITunnelToken, type TransportMode } from "../tunnel/transport
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
-import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import { writeRuntimeState, type RuntimeState } from "./runtime.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
@@ -227,7 +227,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   app.post("/admin/revoke-all", adminGuard, (_req, res) => {
     const count = authStore.revokeAll();
     pairing.invalidateAll();
-    logger.info(`Revoked all tokens (${count})`);
+    logger.info("Revoked all tokens", { count });
     res.json({ revoked: count });
   });
 
@@ -265,7 +265,11 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     closed = true;
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
+    // Do not unlink the workspace runtime file here. A replacement bridge may
+    // already have overwritten it; deleting by workspace id would erase that
+    // newer generation's identity. Stale runtime files are harmless because
+    // destructive operations authenticate an exact runtime snapshot first,
+    // and the next bridge startup overwrites the file.
     logger.info("Bridge stopped");
   };
 
