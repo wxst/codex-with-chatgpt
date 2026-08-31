@@ -25,8 +25,11 @@ Agent（Codex），然后去倒杯咖啡：
 请帮我完整安装并配置 Codex with ChatGPT，全程自动，我是不懂技术的小白，
 所有事情你自己做：
 
-1. 环境自检：需要 git 和 Node.js ≥ 20，缺什么就自动安装
-  （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
+1. 环境自检：需要 git 和 Node.js ≥ 20；Linux 还必须有 Python ≥ 3.9，
+   并确认该 Python 提供 os.pidfd_open 和 signal.pidfd_send_signal。
+   如果系统有多个 Python，可设置 C2C_PYTHON 指向合适的解释器。
+   缺什么就自动安装（macOS 用 Homebrew，Windows 用 winget，Linux 用系统包管理器），
+   同时安装 cloudflared。
 2. 下载：把 https://github.com/XiaoDuoYa/codex-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已存在就 git pull 更新）。
 3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
@@ -41,6 +44,13 @@ Agent（Codex），然后去倒杯咖啡：
 7. 完成后给我看 ✓ 清单，并确认文件读取测试通过。我不懂 MCP、OAuth、
    Tunnel、端口这些词，不要向我解释；出了问题先自己修。
 ```
+
+> [!IMPORTANT]
+> **Linux 安全运行依赖**：Bridge 在读取或创建任何 OAuth / Tunnel 凭证之前，
+> 会强制检查 Python 3.9+ 的 `os.pidfd_open` 和 `signal.pidfd_send_signal`。
+> 这是安全终止卡死 Bridge、避免 PID 复用误杀的必需条件，不是可选工具。
+> 检查失败时 Bridge 会直接拒绝启动。可用 `C2C_PYTHON=/path/to/python3`
+> 指定解释器。
 
 **更新**：Skill 每天自动检查一次 GitHub，有新版本会自动更新并继续任务，
 无需任何操作；也可以随时对 Codex 说"更新 Codex with ChatGPT"。
@@ -137,8 +147,10 @@ c2c sandbox-allow   # 把本地设置目录加入 Codex 沙箱白名单（macOS 
 c2c status / doctor / pair / unpair / logs / stop
 ```
 
-环境要求：Node.js >= 20、git；公网连接需要 `cloudflared`
-（自动检测，Skill 会替你安装）。
+环境要求：Node.js >= 20、git；公网连接需要 `cloudflared`（自动检测，Skill 会替你安装）。
+**Linux 额外要求 Python >= 3.9，且必须提供 `os.pidfd_open` 与
+`signal.pidfd_send_signal`；可用 `C2C_PYTHON` 指定解释器。** Bridge 会在读取
+任何凭证前执行该安全能力检查，失败则拒绝启动。
 
 文档：[架构](docs/architecture.md) · [协议](docs/protocol.md) ·
 [安全](docs/security.md) · [故障排查](docs/troubleshooting.md)
