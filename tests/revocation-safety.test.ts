@@ -44,7 +44,7 @@ async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   await Promise.race([
     once(child, "exit").then(() => undefined),
-    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("child did not exit")), 3000)),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("child did not exit")), 4000)),
   ]);
 }
 
@@ -110,6 +110,57 @@ describe("revocation process identity", () => {
       vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("admin endpoint hung"));
       expect(await stopBridgeRuntime(workspace.root, runtime)).toBe(true);
       await waitForExit(child);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+  });
+
+  it("SIGKILLs an exact generation when graceful shutdown is acknowledged but never exits", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("wedged-graceful-shutdown");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+
+    try {
+      if (!child.pid) throw new Error("child pid unavailable");
+      const generation = getProcessGeneration(child.pid);
+      expect(generation).toBeTruthy();
+      const runtime: RuntimeState = {
+        ...runtimeFor(workspace),
+        pid: child.pid,
+        processGeneration: generation,
+        port: 49091,
+      };
+      const kill = vi.spyOn(process, "kill");
+
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+        const url = String(input);
+        if (url.endsWith("/admin/info")) {
+          return new Response(
+            JSON.stringify({
+              service: SERVICE_NAME,
+              workspaceId: workspace.id,
+              workspaceRoot: workspace.root,
+              pid: child.pid,
+              processGeneration: generation,
+              port: runtime.port,
+              startedAt: runtime.startedAt,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } }
+          );
+        }
+        if (url.endsWith("/admin/shutdown")) {
+          return new Response(JSON.stringify({ shuttingDown: true }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        throw new Error(`unexpected admin request: ${url}`);
+      });
+
+      expect(await stopBridgeRuntime(workspace.root, runtime)).toBe(true);
+      await waitForExit(child);
+      expect(kill).toHaveBeenCalledWith(child.pid, "SIGKILL");
+      expect(child.signalCode).toBe("SIGKILL");
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }
