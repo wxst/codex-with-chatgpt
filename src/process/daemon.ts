@@ -5,9 +5,11 @@ import { fileURLToPath } from "node:url";
 import { Workspace } from "../workspace/manager.js";
 import { stateSubdir } from "../config/paths.js";
 import { findLiveBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
-import { withWorkspaceLifecycleLock } from "./workspace-lock.js";
+import { acquireWorkspaceLifecycleLock } from "./workspace-lock.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+export const LIFECYCLE_LOCK_NONCE_ENV = "C2C_LIFECYCLE_LOCK_NONCE";
+export const LIFECYCLE_LOCK_WORKSPACE_ENV = "C2C_LIFECYCLE_LOCK_WORKSPACE";
 
 /** Resolve the CLI entry for both built installs and source-mode development. */
 function cliEntry(): { cmd: string; args: string[] } {
@@ -57,24 +59,30 @@ export function openPrivateAppendFile(file: string): number {
 
 export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: RuntimeState; spawned: boolean }> {
   const workspace = new Workspace(workspaceRoot);
+  const lock = await acquireWorkspaceLifecycleLock(workspace.id);
 
-  // This cross-process lock is the correctness boundary for check-and-spawn.
-  // A second CLI invocation, or an overlapping `unpair`, must not pass the
-  // live-bridge check while another lifecycle operation is still in flight.
-  return withWorkspaceLifecycleLock(workspace.id, async () => {
+  try {
     const existing = await findLiveBridge(workspace.id);
     if (existing) return { runtime: existing, spawned: false };
 
     const logFile = daemonLogFile(workspace.id);
     const logFd = openPrivateAppendFile(logFile);
     const entry = cliEntry();
-    const child = spawn(entry.cmd, [...entry.args, "serve", "--workspace", workspace.root], {
-      detached: true,
-      stdio: ["ignore", logFd, logFd],
-      env: process.env,
-    });
+    let child;
+    try {
+      child = spawn(entry.cmd, [...entry.args, "serve", "--workspace", workspace.root], {
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+        env: {
+          ...process.env,
+          [LIFECYCLE_LOCK_NONCE_ENV]: lock.nonce,
+          [LIFECYCLE_LOCK_WORKSPACE_ENV]: workspace.id,
+        },
+      });
+    } finally {
+      fs.closeSync(logFd);
+    }
     child.unref();
-    fs.closeSync(logFd);
 
     const deadline = Date.now() + 20_000;
     while (Date.now() < deadline) {
@@ -86,7 +94,9 @@ export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: Ru
       }
     }
     throw new Error(`Bridge did not become healthy within 20s. See ${logFile}`);
-  });
+  } finally {
+    lock.release();
+  }
 }
 
 export async function adminFetch<T = unknown>(
