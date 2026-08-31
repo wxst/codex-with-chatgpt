@@ -127,7 +127,7 @@ jobs:
             git status --short
             exit 1
           fi
-          git diff --check
+          git diff --cached --check
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
