@@ -19,6 +19,8 @@ export interface RuntimeState {
   startedAt: string;
 }
 
+const LEGACY_SERVICE_NAME = "codex-with-chatgpt";
+
 /** Legacy/canonical compatibility mirror. New code never relies on it as a sole registry. */
 export function runtimeFile(workspaceId: string): string {
   return path.join(ensureDir(path.join(getStateDir(), "runtime")), `${workspaceId}.json`);
@@ -87,8 +89,9 @@ function atomicPrivateWrite(file: string, payload: string): void {
 function isRuntimeState(value: unknown, workspaceId: string): value is RuntimeState {
   if (!value || typeof value !== "object") return false;
   const state = value as Partial<RuntimeState>;
+  const knownService = state.service === SERVICE_NAME || state.service === LEGACY_SERVICE_NAME;
   return (
-    state.service === SERVICE_NAME &&
+    knownService &&
     typeof state.version === "string" &&
     state.workspaceId === workspaceId &&
     typeof state.workspaceRoot === "string" &&
@@ -123,23 +126,20 @@ function readRuntimeStrict(file: string, workspaceId: string): RuntimeState {
 
 /**
  * Publish one exact runtime generation first, then refresh the legacy canonical
- * mirror. The per-generation file is authoritative, so a crash or restored
- * canonical snapshot cannot hide a different live Bridge generation/port.
+ * mirror. New writes always stamp the current service name even when a caller
+ * passed a legacy fixture/state object.
  */
 export function writeRuntimeState(state: RuntimeState): void {
   const processGeneration = state.processGeneration ?? getProcessGeneration(state.pid);
-  const normalized: RuntimeState = { ...state, processGeneration };
+  const normalized: RuntimeState = { ...state, service: SERVICE_NAME, version: state.version || VERSION, processGeneration };
   const payload = JSON.stringify(normalized, null, 2);
 
-  // The authoritative generation write must succeed or startup fails closed.
   atomicPrivateWrite(runtimeGenerationFile(normalized), payload);
-  // The canonical file is a compatibility mirror only. A mirror update failure
-  // cannot make the already-published authoritative generation disappear.
   try {
     atomicPrivateWrite(runtimeFile(normalized.workspaceId), payload);
   } catch {
-    // Keep the authoritative generation; later readers include any older mirror
-    // as an additional stale candidate rather than letting it hide this state.
+    // The authoritative generation remains discoverable. A stale canonical
+    // mirror is included only as an extra candidate and can never hide it.
   }
 }
 
@@ -173,22 +173,37 @@ export function listRuntimeStates(workspaceId: string): RuntimeState[] {
   }
 
   const canonical = runtimeFile(workspaceId);
-  if (fs.existsSync(canonical)) {
-    add(readRuntimeStrict(canonical, workspaceId));
-  }
+  if (fs.existsSync(canonical)) add(readRuntimeStrict(canonical, workspaceId));
 
   states.sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt));
   return states;
 }
 
-/** Remove only one unique generation path; another Bridge's state cannot be deleted. */
+/**
+ * Remove only one exact generation. The canonical mirror is compare-and-deleted
+ * only when it still names the same generation, so a replacement generation's
+ * state can never be erased by cleanup of an older Bridge.
+ */
 export function removeRuntimeStateGeneration(state: RuntimeState): void {
   const dir = runtimeRegistryDir(state.workspaceId, false);
-  if (!fs.existsSync(dir)) return;
+  if (fs.existsSync(dir)) {
+    try {
+      fs.rmSync(path.join(dir, `${runtimeGenerationKey(state)}.json`), { force: true });
+    } catch {
+      // Callers re-list and fail closed if the generation remains.
+    }
+  }
+
+  const canonical = runtimeFile(state.workspaceId);
+  if (!fs.existsSync(canonical)) return;
   try {
-    fs.rmSync(path.join(dir, `${runtimeGenerationKey(state)}.json`), { force: true });
+    const current = readRuntimeStrict(canonical, state.workspaceId);
+    if (runtimeIdentity(current) === runtimeIdentity(state)) {
+      fs.rmSync(canonical, { force: true });
+    }
   } catch {
-    // Callers re-list the registry and fail closed if state remains.
+    // Preserve malformed/unreadable state so the next security-sensitive list
+    // fails closed instead of silently deleting evidence we cannot identify.
   }
 }
 
