@@ -15,7 +15,7 @@ import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { ensureOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
-import { requireCurrentProcessGeneration } from "../process/process-identity.js";
+import { requireCurrentProcessGeneration, requireProcessSafetyRuntime } from "../process/process-identity.js";
 import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
 import {
   cancelPendingStart,
@@ -174,6 +174,11 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 }
 
 async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): Promise<Bridge> {
+  // On Linux, verify the declared pidfd helper runtime before reading or
+  // creating any OAuth/tunnel credential. A host that cannot safely terminate
+  // a wedged Bridge is not allowed to start one.
+  requireProcessSafetyRuntime();
+
   const persistRuntimeEnabled = opts.persistRuntime !== false;
   if (persistRuntimeEnabled) await assertNoActivePersistedBridge(workspace);
 
@@ -344,9 +349,6 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
   try {
     persistRuntime();
   } catch (error) {
-    // A listener that cannot publish its authoritative generation must never
-    // remain alive as an untracked Bridge. Roll back while the lifecycle lock is
-    // still held, then let the pending-start wrapper fail closed.
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (persistRuntimeEnabled) removeRuntimeStateGeneration(runtimeState());
