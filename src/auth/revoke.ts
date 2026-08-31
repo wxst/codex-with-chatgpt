@@ -154,6 +154,17 @@ export async function revokeWorkspaceAccess(
     }
   }
 
+  // A live process can race a persisted-store fallback by writing token state
+  // again just before it exits. After process death, scrub the on-disk store a
+  // final time so no access/refresh token can be resurrected on a later start.
+  if (runtime && runtimeAlive && bridgeStopped) {
+    try {
+      legacyTokensRevoked += makeStore(workspace.id).revokeAll();
+    } catch (error) {
+      failures.push(new Error(`Failed final persisted OAuth credential scrub: ${(error as Error).message}`, { cause: error }));
+    }
+  }
+
   if (failures.length > 0) {
     throw new AggregateError(failures, "Failed to fully revoke ChatGPT access to this workspace");
   }
