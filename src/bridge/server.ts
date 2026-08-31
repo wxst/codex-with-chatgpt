@@ -15,10 +15,20 @@ import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { ensureOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
-import { getProcessGeneration } from "../process/process-identity.js";
+import { requireCurrentProcessGeneration } from "../process/process-identity.js";
 import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
+import {
+  cancelPendingStart,
+  completePendingStart,
+  requirePendingStart,
+} from "../process/startup-registry.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
-import { readRuntimeState, writeRuntimeState, type RuntimeState } from "./runtime.js";
+import {
+  listRuntimeStates,
+  removeRuntimeStateGeneration,
+  writeRuntimeState,
+  type RuntimeState,
+} from "./runtime.js";
 
 const activePersistedBridges = new Set<string>();
 
@@ -67,10 +77,6 @@ async function persistedRuntimeIsLiveBridge(runtime: RuntimeState): Promise<bool
   });
   if (info && exactRuntimeIdentityMatches(runtime, info)) return true;
 
-  // A runtime file can be stale while another real C2C bridge for the same
-  // workspace is listening on the recorded port. In that case fail closed and
-  // avoid creating an untracked duplicate, even if the stale admin token no
-  // longer authenticates to the replacement generation.
   const health = await fetchLocalJson<{ service?: string; workspaceId?: string }>(`${base}/health`, 1000);
   return health?.service === SERVICE_NAME && health.workspaceId === runtime.workspaceId;
 }
@@ -80,11 +86,10 @@ async function assertNoActivePersistedBridge(workspace: Workspace): Promise<void
     throw new Error(`A persisted bridge is already running for workspace ${workspace.id}`);
   }
 
-  const existing = readRuntimeState(workspace.id);
-  if (!existing) return;
-
-  if (await persistedRuntimeIsLiveBridge(existing)) {
-    throw new Error(`A persisted bridge runtime is already active for workspace ${workspace.id}`);
+  for (const existing of listRuntimeStates(workspace.id)) {
+    if (await persistedRuntimeIsLiveBridge(existing)) {
+      throw new Error(`A persisted bridge runtime is already active for workspace ${workspace.id}`);
+    }
   }
 }
 
@@ -106,15 +111,14 @@ export interface BridgeOptions {
   host?: string;
   logger?: Logger;
   tunnelProvider?: TunnelProvider;
-  /** Transport is explicit in production; direct library callers retain the legacy default. */
   transportMode?: TransportMode;
-  /** Test/embedding override. Production reads a mode-0600 per-workspace token file. */
   openAITunnelToken?: string;
-  /** Persist runtime state file (disable in tests). */
   persistRuntime?: boolean;
   authStoreFile?: string;
   pairingTtlMs?: number;
   accessTokenTtlMs?: number;
+  /** Parent-created one-shot start intent for detached daemon launches. */
+  pendingStartId?: string;
 }
 
 export interface Bridge {
@@ -153,15 +157,25 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
 }
 
 /**
- * Every bridge process owns its own startup critical section. No parent ticket
- * is inherited or trusted. This means a detached child cannot resume using a
- * dead parent's stale authority: it must acquire a ticket bound to its own OS
- * process generation before reading tunnel/OAuth credentials or opening a
- * listener. The ticket is released once runtime state has been published.
+ * Detached children never inherit lifecycle authority. They acquire their own
+ * ticket and, when spawned by ensureBridge, must also present a durable pending
+ * start intent that `unpair` can cancel during the parent→child handoff gap.
  */
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const workspace = new Workspace(opts.workspaceRoot);
-  return withWorkspaceLifecycleLock(workspace.id, () => startBridgeUnlocked(opts, workspace));
+  return withWorkspaceLifecycleLock(workspace.id, async () => {
+    if (opts.pendingStartId) requirePendingStart(workspace.id, opts.pendingStartId);
+    try {
+      const bridge = await startBridgeUnlocked(opts, workspace);
+      // startBridgeUnlocked publishes the generation runtime before returning.
+      // Only then may the one-shot pending intent disappear.
+      if (opts.pendingStartId) completePendingStart(workspace.id, opts.pendingStartId);
+      return bridge;
+    } catch (error) {
+      if (opts.pendingStartId) cancelPendingStart(workspace.id, opts.pendingStartId);
+      throw error;
+    }
+  });
 }
 
 async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): Promise<Bridge> {
@@ -181,7 +195,7 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
   const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
-  const processGeneration = getProcessGeneration(process.pid);
+  const processGeneration = requireCurrentProcessGeneration();
 
   let publicBaseUrl: string | null = null;
 
@@ -314,21 +328,22 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
   const startedAt = new Date().toISOString();
   logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
+  const runtimeState = (): RuntimeState => ({
+    service: SERVICE_NAME,
+    version: VERSION,
+    workspaceId: workspace.id,
+    workspaceRoot: workspace.root,
+    pid: process.pid,
+    processGeneration,
+    port,
+    adminToken,
+    publicUrl: publicBaseUrl,
+    startedAt,
+  });
+
   const persistRuntime = (): void => {
     if (!persistRuntimeEnabled) return;
-    const state: RuntimeState = {
-      service: SERVICE_NAME,
-      version: VERSION,
-      workspaceId: workspace.id,
-      workspaceRoot: workspace.root,
-      pid: process.pid,
-      processGeneration,
-      port,
-      adminToken,
-      publicUrl: publicBaseUrl,
-      startedAt,
-    };
-    writeRuntimeState(state);
+    writeRuntimeState(runtimeState());
   };
   persistRuntime();
   if (persistRuntimeEnabled) activePersistedBridges.add(workspace.id);
@@ -340,6 +355,7 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
     if (persistRuntimeEnabled) activePersistedBridges.delete(workspace.id);
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (persistRuntimeEnabled) removeRuntimeStateGeneration(runtimeState());
     logger.info("Bridge stopped");
   };
 
