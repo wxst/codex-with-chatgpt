@@ -2,60 +2,32 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { ensureDir, getStateDir } from "../config/paths.js";
-import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 import { Workspace } from "../workspace/manager.js";
+import { Logger } from "../logger/index.js";
+import { stateSubdir } from "../config/paths.js";
+import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+const cliEntry = path.resolve(moduleDir, "../cli/index.js");
 
-/** Path to the CLI entry, works from dist/ and from tsx dev runs. */
-function cliEntry(): { cmd: string; args: string[] } {
-  const distEntry = path.resolve(__dirname, "..", "cli", "index.js");
-  if (fs.existsSync(distEntry)) {
-    return { cmd: process.execPath, args: [distEntry] };
-  }
-  // dev fallback: run TypeScript sources through the tsx ESM loader
-  const projectRoot = path.resolve(__dirname, "..", "..");
-  const tsEntry = path.join(projectRoot, "src", "cli", "index.ts");
-  return { cmd: process.execPath, args: ["--import", "tsx/esm", tsEntry] };
+function daemonLogFile(workspaceId: string): string {
+  return path.join(stateSubdir("logs"), `bridge-${workspaceId}.out.log`);
 }
 
-export interface EnsureBridgeResult {
-  runtime: RuntimeState;
-  spawned: boolean;
-}
-
-/**
- * Ensure a bridge is running for the workspace. Reuses a live instance,
- * otherwise spawns a detached daemon and waits for it to become healthy.
- */
-export async function ensureBridge(workspaceRoot: string, opts: { port?: number } = {}): Promise<EnsureBridgeResult> {
+export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: RuntimeState; spawned: boolean }> {
   const workspace = new Workspace(workspaceRoot);
-  const live = await findLiveBridge(workspace.id);
-  if (live) return { runtime: live, spawned: false };
+  const existing = await findLiveBridge(workspace.id);
+  if (existing) return { runtime: existing, spawned: false };
 
-  const logDir = ensureDir(path.join(getStateDir(), "logs"));
-  const logFile = path.join(logDir, `bridge-${workspace.id}.out.log`);
-  const out = fs.openSync(logFile, "a", 0o600);
-  try {
-    // Existing files may have been created with a permissive umask. Keep the
-    // daemon's inherited stdout/stderr log owner-readable only.
-    fs.chmodSync(logFile, 0o600);
-  } catch {
-    // Windows / filesystems without chmod semantics
-  }
-  const { cmd, args } = cliEntry();
-  const child = spawn(
-    cmd,
-    [...args, "serve", "--workspace", workspace.root, ...(opts.port ? ["--port", String(opts.port)] : [])],
-    {
-      detached: true,
-      stdio: ["ignore", out, out],
-      env: { ...process.env },
-    }
-  );
+  const logFile = daemonLogFile(workspace.id);
+  const logFd = fs.openSync(logFile, "a", 0o600);
+  const child = spawn(process.execPath, [cliEntry, "serve", "--workspace", workspace.root], {
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+    env: process.env,
+  });
   child.unref();
-  fs.closeSync(out);
+  fs.closeSync(logFd);
 
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
@@ -97,15 +69,32 @@ export async function stopBridge(workspaceRoot: string): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
   const runtime = readRuntimeState(workspace.id);
   if (!runtime) return false;
+
+  // A persisted PID can be stale and later reused by an unrelated process.
+  // Never send a signal until this runtime has been positively identified as
+  // the bridge for the requested workspace.
   const healthy = await probeBridge(runtime.port);
-  if (healthy && healthy.workspaceId === workspace.id) {
+  let identityConfirmed = Boolean(healthy && healthy.workspaceId === workspace.id);
+
+  if (!identityConfirmed) {
     try {
-      await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
-      return true;
+      const info = await adminFetch<{ workspaceId?: string }>(runtime, "GET", "/admin/info", 2000);
+      identityConfirmed = info.workspaceId === workspace.id;
     } catch {
-      // fall through to kill
+      identityConfirmed = false;
     }
   }
+
+  if (!identityConfirmed) return false;
+
+  try {
+    await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
+    return true;
+  } catch {
+    // Identity was confirmed above, so a PID-level fallback cannot target an
+    // arbitrary stale/reused process merely because the runtime file survived.
+  }
+
   try {
     process.kill(runtime.pid, "SIGTERM");
     return true;
