@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - hardening/**
+      - fix/**
   pull_request:
     branches:
       - main
