@@ -3,6 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { stateSubdir } from "../config/paths.js";
 
+export const LIFECYCLE_LOCK_NONCE_ENV = "C2C_LIFECYCLE_LOCK_NONCE";
+export const LIFECYCLE_LOCK_WORKSPACE_ENV = "C2C_LIFECYCLE_LOCK_WORKSPACE";
+
 interface LockOwner {
   pid: number;
   nonce: string;
