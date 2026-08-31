@@ -22,7 +22,40 @@ import {
   withWorkspaceLifecycleLock,
 } from "../process/workspace-lock.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
-import { writeRuntimeState, type RuntimeState } from "./runtime.js";
+import { readRuntimeState, writeRuntimeState, type RuntimeState } from "./runtime.js";
+
+const activePersistedBridges = new Set<string>();
+
+function processExists(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function assertNoActivePersistedBridge(workspace: Workspace): void {
+  if (activePersistedBridges.has(workspace.id)) {
+    throw new Error(`A persisted bridge is already running for workspace ${workspace.id}`);
+  }
+
+  const existing = readRuntimeState(workspace.id);
+  if (!existing) return;
+
+  // A direct library caller can close and restart a persisted bridge within the
+  // same Node process. In that case the runtime file is intentionally stale,
+  // but the in-process set above proves whether this module still owns a live
+  // bridge for the workspace. For another PID, fail closed while that process
+  // exists rather than risk creating an untracked second bridge.
+  if (existing.pid === process.pid) return;
+  if (processExists(existing.pid)) {
+    throw new Error(
+      `A persisted bridge runtime is already active for workspace ${workspace.id} (pid ${existing.pid})`
+    );
+  }
+}
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
@@ -114,6 +147,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 }
 
 async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): Promise<Bridge> {
+  const persistRuntimeEnabled = opts.persistRuntime !== false;
+  if (persistRuntimeEnabled) assertNoActivePersistedBridge(workspace);
+
   const logger = opts.logger ?? nullLogger;
   const host = opts.host ?? DEFAULT_HOST;
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
@@ -270,7 +306,7 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
   logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
   const persistRuntime = (): void => {
-    if (opts.persistRuntime === false) return;
+    if (!persistRuntimeEnabled) return;
     const state: RuntimeState = {
       service: SERVICE_NAME,
       version: VERSION,
@@ -285,11 +321,13 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
     writeRuntimeState(state);
   };
   persistRuntime();
+  if (persistRuntimeEnabled) activePersistedBridges.add(workspace.id);
 
   let closed = false;
   const shutdown = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    if (persistRuntimeEnabled) activePersistedBridges.delete(workspace.id);
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     // Do not unlink the workspace runtime file here. A replacement bridge may
