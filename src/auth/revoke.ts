@@ -12,6 +12,7 @@ type AdminFetch = <T = unknown>(
   timeoutMs?: number
 ) => Promise<T>;
 type StopBridge = (workspaceRoot: string) => Promise<boolean>;
+type RevokeTunnelToken = (workspaceId: string) => boolean;
 
 type RevocableAuthStore = Pick<AuthStore, "revokeAll">;
 
@@ -19,6 +20,7 @@ export interface RevokeWorkspaceAccessDeps {
   findLiveBridge?: FindLiveBridge;
   adminFetch?: AdminFetch;
   stopBridge?: StopBridge;
+  revokeTunnelToken?: RevokeTunnelToken;
   authStoreFactory?: (workspaceId: string) => RevocableAuthStore;
   sleep?: (ms: number) => Promise<void>;
   stopTimeoutMs?: number;
@@ -34,12 +36,11 @@ export interface RevokeWorkspaceAccessResult {
 /**
  * Revoke every ChatGPT credential for one workspace.
  *
- * OAuth credentials are revoked in every mode. Any persisted OpenAI tunnel
- * credential is removed before process shutdown so even a failed stop cannot
- * preserve it for a later restart. Finally, any live bridge is stopped and
- * confirmed down. Stopping regardless of the persisted transport state avoids
- * relying on state that may briefly disagree with a process started before a
- * transport switch.
+ * Revocation is fail-safe rather than fail-fast: every independent revocation
+ * action is attempted even when an earlier one fails. This matters because a
+ * stale live process and an on-disk tunnel credential are separate access
+ * paths. Only after OAuth revocation, token deletion, and bridge shutdown have
+ * all been attempted do we surface an aggregated error to the caller.
  */
 export async function revokeWorkspaceAccess(
   workspaceRoot: string,
@@ -50,41 +51,70 @@ export async function revokeWorkspaceAccess(
   const findLive = deps.findLiveBridge ?? findLiveBridge;
   const requestAdmin = deps.adminFetch ?? adminFetch;
   const stop = deps.stopBridge ?? stopBridge;
+  const revokeTunnel = deps.revokeTunnelToken ?? revokeOpenAITunnelToken;
   const makeStore = deps.authStoreFactory ?? ((workspaceId: string) => new AuthStore(workspaceId));
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const stopTimeoutMs = deps.stopTimeoutMs ?? 5_000;
+  const failures: Error[] = [];
 
-  const runtime = await findLive(workspace.id);
-  let legacyTokensRevoked = 0;
-  if (runtime) {
-    const result = await requestAdmin<{ revoked?: number }>(runtime, "POST", "/admin/revoke-all");
-    legacyTokensRevoked = result.revoked ?? 0;
-  } else {
-    legacyTokensRevoked = makeStore(workspace.id).revokeAll();
+  let runtime: RuntimeState | null = null;
+  try {
+    runtime = await findLive(workspace.id);
+  } catch (error) {
+    failures.push(new Error(`Failed to inspect bridge state: ${(error as Error).message}`, { cause: error }));
   }
 
-  // Remove dormant credentials before attempting process shutdown. If stopping
-  // the bridge fails, the command reports failure, but the old credential still
-  // cannot become valid again after a later restart.
-  const tunnelCredentialRevoked = revokeOpenAITunnelToken(workspace.id);
+  let legacyTokensRevoked = 0;
+  try {
+    if (runtime) {
+      const result = await requestAdmin<{ revoked?: number }>(runtime, "POST", "/admin/revoke-all");
+      legacyTokensRevoked = result.revoked ?? 0;
+    } else {
+      legacyTokensRevoked = makeStore(workspace.id).revokeAll();
+    }
+  } catch (error) {
+    failures.push(new Error(`Failed to revoke OAuth credentials: ${(error as Error).message}`, { cause: error }));
+  }
+
+  let tunnelCredentialRevoked = false;
+  try {
+    // Do this before process shutdown. Even if shutdown later fails, a stale
+    // credential cannot become valid again after a future restart.
+    tunnelCredentialRevoked = revokeTunnel(workspace.id);
+  } catch (error) {
+    failures.push(new Error(`Failed to remove OpenAI tunnel credential: ${(error as Error).message}`, { cause: error }));
+  }
 
   let bridgeStopped = false;
   if (runtime) {
-    if (!(await stop(workspace.root))) {
-      throw new Error("Failed to stop the workspace bridge during access revocation");
+    let stopRequested = false;
+    try {
+      stopRequested = await stop(workspace.root);
+      if (!stopRequested) failures.push(new Error("Failed to request workspace bridge shutdown"));
+    } catch (error) {
+      failures.push(new Error(`Failed to request workspace bridge shutdown: ${(error as Error).message}`, { cause: error }));
     }
 
+    // Confirm actual process state even if the stop request reported failure;
+    // shutdown may still have raced to completion.
     const deadline = Date.now() + stopTimeoutMs;
     while (Date.now() < deadline) {
-      if (!(await findLive(workspace.id))) {
-        bridgeStopped = true;
+      try {
+        if (!(await findLive(workspace.id))) {
+          bridgeStopped = true;
+          break;
+        }
+      } catch (error) {
+        failures.push(new Error(`Failed to confirm workspace bridge shutdown: ${(error as Error).message}`, { cause: error }));
         break;
       }
       await sleep(50);
     }
-    if (!bridgeStopped) {
-      throw new Error("Workspace bridge did not stop before the revocation deadline");
-    }
+    if (!bridgeStopped) failures.push(new Error("Workspace bridge did not stop before the revocation deadline"));
+  }
+
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Failed to fully revoke ChatGPT access to this workspace");
   }
 
   return {
