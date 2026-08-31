@@ -96,6 +96,52 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
     expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
   });
 
+  it("stops a live bridge even when persisted transport state says Cloudflare", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("unpair-state-drift");
+    writeTransportMode(workspace.id, "openai");
+    ensureOpenAITunnelToken(workspace.id);
+    writeTransportMode(workspace.id, "cloudflare");
+
+    let liveChecks = 0;
+    let stopped = false;
+    const fakeRuntime = { port: 48765, adminToken: "test" } as never;
+    const result = await revokeWorkspaceAccess(workspace.root, {
+      findLiveBridge: async () => {
+        liveChecks += 1;
+        return liveChecks === 1 ? fakeRuntime : null;
+      },
+      adminFetch: async () => ({ revoked: 0 }),
+      stopBridge: async () => {
+        stopped = true;
+        return true;
+      },
+    });
+
+    expect(result.transportMode).toBe("cloudflare");
+    expect(stopped).toBe(true);
+    expect(result.bridgeStopped).toBe(true);
+    expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
+  });
+
+  it("removes the persisted tunnel credential even when bridge shutdown fails", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("unpair-stop-failure");
+    writeTransportMode(workspace.id, "openai");
+    ensureOpenAITunnelToken(workspace.id);
+    const fakeRuntime = { port: 48765, adminToken: "test" } as never;
+
+    await expect(
+      revokeWorkspaceAccess(workspace.root, {
+        findLiveBridge: async () => fakeRuntime,
+        adminFetch: async () => ({ revoked: 0 }),
+        stopBridge: async () => false,
+      })
+    ).rejects.toThrow(/Failed to stop/);
+
+    expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
+  });
+
   it("wires the CLI unpair command through the hardened revocation path", () => {
     const cli = fs.readFileSync(path.join(projectRoot, "src", "cli", "index.ts"), "utf8");
     expect(cli).toContain("await revokeWorkspaceAccess(root)");
