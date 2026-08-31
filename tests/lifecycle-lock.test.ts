@@ -1,14 +1,17 @@
+import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import {
   acquireWorkspaceLifecycleLock,
   isWorkspaceLifecycleLockHeldBy,
+  lifecycleTicketFile,
 } from "../src/process/workspace-lock.js";
 import { ensureBridge, stopBridge } from "../src/process/daemon.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { revokeWorkspaceAccess } from "../src/auth/revoke.js";
 import { stateSubdir } from "../src/config/paths.js";
+import { writeRuntimeState, type RuntimeState } from "../src/bridge/runtime.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
@@ -21,18 +24,35 @@ function makeWorkspace(name: string): Workspace {
   return new Workspace(root);
 }
 
-function writeManualLock(
+function writeManualTicket(
   workspaceId: string,
-  owner: { pid: number; nonce: string; acquiredAt: string },
+  ticket: { pid: number; nonce: string; number: number; createdAt: string },
   mtimeMs = Date.now()
 ): string {
-  const lockDir = path.join(stateSubdir("locks"), `${workspaceId}.lifecycle.lock`);
-  fs.mkdirSync(lockDir, { mode: 0o700 });
-  const file = path.join(lockDir, "owner.json");
-  fs.writeFileSync(file, JSON.stringify(owner), { mode: 0o600 });
+  const file = lifecycleTicketFile(workspaceId, ticket.nonce);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, JSON.stringify(ticket), { mode: 0o600 });
   const date = new Date(mtimeMs);
   fs.utimesSync(file, date, date);
-  return lockDir;
+  return file;
+}
+
+function fakeRuntime(workspace: Workspace, pid: number, port: number): RuntimeState {
+  return {
+    service: "codex-with-chatgpt",
+    version: "0.1.0",
+    workspaceId: workspace.id,
+    workspaceRoot: workspace.root,
+    pid,
+    port,
+    adminToken: "stale-admin-token",
+    publicUrl: null,
+    startedAt: new Date(Date.now() - 60_000).toISOString(),
+  };
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 afterEach(() => {
@@ -59,7 +79,7 @@ describe("workspace lifecycle serialization", () => {
       sleep: async () => undefined,
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await sleep(25);
     expect(enteredRevocation).toBe(false);
 
     held.release();
@@ -67,13 +87,14 @@ describe("workspace lifecycle serialization", () => {
     expect(enteredRevocation).toBe(true);
   });
 
-  it("does not immediately reclaim a dead-owner lock during the bridge startup grace window", async () => {
+  it("keeps a fresh ticket blocking during the startup grace window", async () => {
     isolateStateDir();
-    const workspace = makeWorkspace("lifecycle-dead-owner-grace");
-    const lockDir = writeManualLock(workspace.id, {
+    const workspace = makeWorkspace("lifecycle-fresh-ticket");
+    const ticket = writeManualTicket(workspace.id, {
       pid: 2_147_483_647,
-      nonce: "dead-owner-nonce",
-      acquiredAt: new Date().toISOString(),
+      nonce: "fresh-ticket-owner",
+      number: 1,
+      createdAt: new Date().toISOString(),
     });
 
     await expect(
@@ -83,19 +104,20 @@ describe("workspace lifecycle serialization", () => {
         orphanGraceMs: 500,
       })
     ).rejects.toThrow(/Timed out waiting/);
-    expect(fs.existsSync(lockDir)).toBe(true);
+    expect(fs.existsSync(ticket)).toBe(true);
   });
 
-  it("reclaims an expired owner generation even if its PID has been reused by a live process", async () => {
+  it("ignores an expired ticket even when its PID has been reused by a live process", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("lifecycle-pid-reuse");
     const old = Date.now() - 10_000;
-    writeManualLock(
+    writeManualTicket(
       workspace.id,
       {
         pid: process.pid,
-        nonce: "reused-live-pid-old-generation",
-        acquiredAt: new Date(old).toISOString(),
+        nonce: "reused-live-pid-old-ticket",
+        number: 1,
+        createdAt: new Date(old).toISOString(),
       },
       old
     );
@@ -106,26 +128,21 @@ describe("workspace lifecycle serialization", () => {
       orphanGraceMs: 100,
     });
     try {
-      expect(lock.nonce).not.toBe("reused-live-pid-old-generation");
+      expect(lock.nonce).not.toBe("reused-live-pid-old-ticket");
       expect(isWorkspaceLifecycleLockHeldBy(workspace.id, lock.nonce, 100)).toBe(true);
     } finally {
       lock.release();
     }
   });
 
-  it("reclaims a dead-owner lock after the startup grace window expires", async () => {
+  it("ignores malformed stale tickets without deleting somebody else's pathname", async () => {
     isolateStateDir();
-    const workspace = makeWorkspace("lifecycle-dead-owner-expired");
-    const old = Date.now() - 10_000;
-    writeManualLock(
-      workspace.id,
-      {
-        pid: 2_147_483_647,
-        nonce: "expired-owner-nonce",
-        acquiredAt: new Date(old).toISOString(),
-      },
-      old
-    );
+    const workspace = makeWorkspace("lifecycle-malformed-ticket");
+    const file = lifecycleTicketFile(workspace.id, "malformed-stale-ticket");
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, "{", { mode: 0o600 });
+    const old = new Date(Date.now() - 10_000);
+    fs.utimesSync(file, old, old);
 
     const lock = await acquireWorkspaceLifecycleLock(workspace.id, {
       timeoutMs: 500,
@@ -134,9 +151,54 @@ describe("workspace lifecycle serialization", () => {
     });
     try {
       expect(isWorkspaceLifecycleLockHeldBy(workspace.id, lock.nonce, 100)).toBe(true);
+      expect(fs.existsSync(file)).toBe(true);
     } finally {
       lock.release();
     }
+  });
+
+  it("elects only one winner when multiple waiters bypass the same stale ticket", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-single-winner");
+    const old = Date.now() - 10_000;
+    writeManualTicket(
+      workspace.id,
+      {
+        pid: 2_147_483_647,
+        nonce: "stale-predecessor",
+        number: 1,
+        createdAt: new Date(old).toISOString(),
+      },
+      old
+    );
+
+    let resolved = 0;
+    const a = acquireWorkspaceLifecycleLock(workspace.id, {
+      timeoutMs: 1000,
+      pollMs: 5,
+      orphanGraceMs: 100,
+    }).then((lock) => {
+      resolved += 1;
+      return lock;
+    });
+    const b = acquireWorkspaceLifecycleLock(workspace.id, {
+      timeoutMs: 1000,
+      pollMs: 5,
+      orphanGraceMs: 100,
+    }).then((lock) => {
+      resolved += 1;
+      return lock;
+    });
+
+    const first = await Promise.race([a, b]);
+    await sleep(30);
+    expect(resolved).toBe(1);
+
+    first.release();
+    const [lockA, lockB] = await Promise.all([a, b]);
+    const second = lockA.nonce === first.nonce ? lockB : lockA;
+    expect(second.nonce).not.toBe(first.nonce);
+    second.release();
   });
 
   it("serializes concurrent ensureBridge calls so only one startup path wins", async () => {
@@ -154,7 +216,7 @@ describe("workspace lifecycle serialization", () => {
       expect([a.spawned, b.spawned].filter(Boolean)).toHaveLength(1);
     } finally {
       await stopBridge(workspace.root).catch(() => false);
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await sleep(150);
     }
   }, 30_000);
 
@@ -181,15 +243,34 @@ describe("workspace lifecycle serialization", () => {
       if (first) await first.close();
     }
   });
+
+  it("does not treat an unrelated live process that reused a stale runtime PID as an active bridge", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("stale-runtime-live-pid");
+    const unrelated = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    let bridge: Bridge | null = null;
+
+    try {
+      if (!unrelated.pid) throw new Error("failed to spawn unrelated process");
+      writeRuntimeState(fakeRuntime(workspace, unrelated.pid, 9));
+      bridge = await startBridge({ workspaceRoot: workspace.root, port: 0, persistRuntime: true });
+      expect(bridge.workspace.id).toBe(workspace.id);
+    } finally {
+      if (bridge) await bridge.close();
+      unrelated.kill("SIGTERM");
+    }
+  });
 });
 
-describe("stale-lock takeover", () => {
-  it("uses an exclusive reclaim claim and rechecks the observed owner generation", () => {
+describe("ticket-lock design", () => {
+  it("uses unique ticket paths and never needs a shared reclaim marker", () => {
     const source = fs.readFileSync(path.resolve("src/process/workspace-lock.ts"), "utf8");
-    expect(source).toContain("RECLAIM_FILE");
-    expect(source).toContain('flag: "wx"');
-    expect(source).toContain("expectedNonce");
-    expect(source).toContain("current.nonce !== observed.owner.nonce");
+    expect(source).toContain("lifecycleTicketFile");
+    expect(source).toContain("ticket.number");
+    expect(source).not.toContain("RECLAIM_FILE");
+    expect(source).not.toContain(".reclaim.json");
   });
 });
 
