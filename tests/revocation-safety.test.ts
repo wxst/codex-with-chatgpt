@@ -79,7 +79,7 @@ describe("runtime snapshot publication", () => {
 });
 
 describe("revocation process identity", () => {
-  it("never SIGTERMs a stale/reused PID when bridge identity cannot be proven", async () => {
+  it("never signals a stale/reused PID when bridge identity cannot be proven", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("stale-pid");
     writeRuntimeState(runtimeFor(workspace));
@@ -91,7 +91,7 @@ describe("revocation process identity", () => {
     expect(kill).not.toHaveBeenCalled();
   });
 
-  it("SIGTERMs an unresponsive process only when its exact generation still matches", async () => {
+  it("terminates an unresponsive process only when its exact generation still matches", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("exact-generation-kill");
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
@@ -110,12 +110,13 @@ describe("revocation process identity", () => {
       vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("admin endpoint hung"));
       expect(await stopBridgeRuntime(workspace.root, runtime)).toBe(true);
       await waitForExit(child);
+      expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }
   });
 
-  it("SIGKILLs an exact generation when graceful shutdown is acknowledged but never exits", async () => {
+  it("force-kills an exact generation when graceful shutdown is acknowledged but never exits", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("wedged-graceful-shutdown");
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
@@ -130,7 +131,6 @@ describe("revocation process identity", () => {
         processGeneration: generation,
         port: 49091,
       };
-      const kill = vi.spyOn(process, "kill");
 
       vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
         const url = String(input);
@@ -159,7 +159,6 @@ describe("revocation process identity", () => {
 
       expect(await stopBridgeRuntime(workspace.root, runtime)).toBe(true);
       await waitForExit(child);
-      expect(kill).toHaveBeenCalledWith(child.pid, "SIGKILL");
       expect(child.signalCode).toBe("SIGKILL");
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
