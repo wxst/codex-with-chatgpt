@@ -14,6 +14,7 @@ import { stopBridge, stopBridgeRuntime } from "../src/process/daemon.js";
 import { getProcessGeneration } from "../src/process/process-identity.js";
 import { writeTransportMode } from "../src/tunnel/transport-mode.js";
 import { Workspace } from "../src/workspace/manager.js";
+import { SERVICE_NAME } from "../src/version.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
 const roots: string[] = [];
@@ -27,7 +28,7 @@ function makeWorkspace(name: string): Workspace {
 
 function runtimeFor(workspace: Workspace): RuntimeState {
   return {
-    service: "codex-with-chatgpt",
+    service: SERVICE_NAME,
     version: "0.1.0",
     workspaceId: workspace.id,
     workspaceRoot: workspace.root,
@@ -136,7 +137,7 @@ describe("revocation split-brain detection", () => {
         probeBridge: async () => {
           healthChecks += 1;
           return {
-            service: "codex-with-chatgpt",
+            service: SERVICE_NAME,
             version: "0.1.0",
             workspaceId: workspace.id,
             status: "ok",
