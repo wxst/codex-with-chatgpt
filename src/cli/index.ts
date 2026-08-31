@@ -25,6 +25,13 @@ import {
   readTunnelState,
   TUNNEL_CHOICE_PROMPT,
 } from "../tunnel/state.js";
+import {
+  ensureOpenAITunnelToken,
+  openAITunnelTokenFile,
+  readTransportMode,
+  writeTransportMode,
+  type TransportMode,
+} from "../tunnel/transport-mode.js";
 import { Logger } from "../logger/index.js";
 import { getStateDir } from "../config/paths.js";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
@@ -133,6 +140,7 @@ interface AdminInfo {
   workspaceName: string;
   workspaceRoot: string;
   port: number;
+  transportMode: TransportMode;
   publicUrl: string | null;
   tunnel: { running: boolean; url: string | null; provider: string };
   tokenCount: number;
@@ -145,10 +153,22 @@ async function ensureBridgeAndTunnel(
   workspaceRoot: string,
   opts: { tunnel: boolean }
 ): Promise<{ runtime: RuntimeState; info: AdminInfo; mcpUrl: string | null }> {
-  const { runtime } = await ensureBridge(workspaceRoot);
+  const workspace = new Workspace(workspaceRoot);
+  const desiredMode = readTransportMode(workspace.id);
+  let { runtime } = await ensureBridge(workspaceRoot);
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+
+  // Transport mode is a process-level security boundary. Restart a stale bridge
+  // rather than mutating authentication policy inside a live process.
+  if (info.transportMode !== desiredMode) {
+    await stopBridge(workspaceRoot);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    runtime = (await ensureBridge(workspaceRoot)).runtime;
+    info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+  }
+
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
-  if (opts.tunnel && !info.publicUrl) {
+  if (opts.tunnel && desiredMode === "cloudflare" && !info.publicUrl) {
     const binaries = detectTunnelBinaries();
     if (!binaries.cloudflared) {
       throw new Error(
@@ -178,10 +198,13 @@ program
   .option("--port <port>", "preferred port")
   .action(async (opts: { workspace: string; port?: string }) => {
     const logger = new Logger({ name: "bridge", console: true });
+    const workspaceRoot = resolveWorkspace(opts.workspace);
+    const workspace = new Workspace(workspaceRoot);
     const bridge = await startBridge({
-      workspaceRoot: resolveWorkspace(opts.workspace),
+      workspaceRoot,
       port: opts.port ? parseInt(opts.port, 10) : undefined,
       logger,
+      transportMode: readTransportMode(workspace.id),
     });
     const shutdown = (): void => {
       void bridge.close().then(() => process.exit(0));
@@ -268,8 +291,20 @@ program
             connectorName,
             mcpUrl: mcpUrl ?? `http://127.0.0.1:${runtime.port}/mcp`,
             local: mcpUrl === null,
-            pairingCode: pairingResult.code,
-            pairingExpiresAt: pairingResult.expiresAt,
+            transportMode: info.transportMode,
+            localMcpUrl: `http://127.0.0.1:${runtime.port}/mcp`,
+            openai:
+              info.transportMode === "openai"
+                ? {
+                    headerName: "X-C2C-Tunnel-Token",
+                    tokenFile: openAITunnelTokenFile(info.workspaceId),
+                    runtimeAlias: `c2c-${info.workspaceId}`,
+                    tunnelIdEnv: "CONTROL_PLANE_TUNNEL_ID",
+                    runtimeApiKeyEnv: "CONTROL_PLANE_API_KEY",
+                  }
+                : null,
+            pairingCode: info.transportMode === "cloudflare" ? pairingResult.code : null,
+            pairingExpiresAt: info.transportMode === "cloudflare" ? pairingResult.expiresAt : null,
             sandbox,
             tunnel: {
               mode: isNamedTunnelReady(tunnelState) ? "named" : "quick",
@@ -282,13 +317,79 @@ program
       }
       check(`当前项目已识别（${info.workspaceName}）`);
       check("Workspace Bridge 已启动");
-      if (mcpUrl) check("安全连接已建立");
       say("");
-      say(`连接地址：${mcpUrl ?? `http://127.0.0.1:${runtime.port}/mcp`}`);
-      say(`配对码：${pairingResult.code}（${Math.round((pairingResult.expiresAt - Date.now()) / 60000)} 分钟内有效）`);
-      say("");
-      say("下一步：在 ChatGPT 的连接器设置中添加以上地址（OAuth），并在授权页输入配对码。");
+      if (info.transportMode === "openai") {
+        ensureOpenAITunnelToken(info.workspaceId);
+        check("默认安全模式：OpenAI Secure MCP Tunnel");
+        say(`本机 MCP：http://127.0.0.1:${runtime.port}/mcp`);
+        say(`本机认证文件：${openAITunnelTokenFile(info.workspaceId)}`);
+        say(`运行别名：c2c-${info.workspaceId}`);
+        say("");
+        say("下一步：用 tunnel-client 把这个本机 MCP 连接到你的 OpenAI Tunnel；ChatGPT 连接器选择 Connection: Tunnel。");
+        say("CONTROL_PLANE_API_KEY 只放环境变量，不要粘贴进 ChatGPT 或命令历史。");
+      } else {
+        if (mcpUrl) check("Cloudflare fallback 已建立");
+        say(`连接地址：${mcpUrl ?? `http://127.0.0.1:${runtime.port}/mcp`}`);
+        say(`配对码：${pairingResult.code}（${Math.round((pairingResult.expiresAt - Date.now()) / 60000)} 分钟内有效）`);
+        say("");
+        say("下一步：在 ChatGPT 的连接器设置中添加以上地址（OAuth），并在授权页输入配对码。");
+      }
       say("如果你在使用 Codex Skill，这一步会自动完成。");
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+// ---------------------------------------------------------------- transport
+
+program
+  .command("transport")
+  .description("Show or select the MCP transport (OpenAI Secure Tunnel by default)")
+  .option("-w, --workspace <path>")
+  .option("--mode <mode>", "openai or cloudflare")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; mode?: string; json: boolean }) => {
+    const root = resolveWorkspace(opts.workspace);
+    try {
+      const workspace = new Workspace(root);
+      if (opts.mode) {
+        const requested = opts.mode.trim().toLowerCase();
+        if (requested !== "openai" && requested !== "cloudflare") {
+          throw new Error("mode must be openai or cloudflare");
+        }
+        const next = requested as TransportMode;
+        const previous = readTransportMode(workspace.id);
+        writeTransportMode(workspace.id, next);
+        if (previous !== next && (await findLiveBridge(workspace.id))) {
+          await stopBridge(root);
+        }
+      }
+
+      const mode = readTransportMode(workspace.id);
+      if (mode === "openai") ensureOpenAITunnelToken(workspace.id);
+      const payload = {
+        ok: true,
+        mode,
+        defaultMode: "openai",
+        workspaceId: workspace.id,
+        openai:
+          mode === "openai"
+            ? {
+                headerName: "X-C2C-Tunnel-Token",
+                tokenFile: openAITunnelTokenFile(workspace.id),
+                runtimeAlias: `c2c-${workspace.id}`,
+                tunnelIdEnv: "CONTROL_PLANE_TUNNEL_ID",
+                runtimeApiKeyEnv: "CONTROL_PLANE_API_KEY",
+              }
+            : null,
+      };
+      if (opts.json) say(JSON.stringify(payload));
+      else if (mode === "openai") {
+        check("传输模式：OpenAI Secure MCP Tunnel（默认）");
+        say("公网 MCP 入口：关闭");
+      } else {
+        check("传输模式：Cloudflare fallback（显式启用）");
+      }
     } catch (error) {
       handleCliError(error, opts.json);
     }
@@ -349,9 +450,16 @@ program
     say("");
     check(`Workspace：${info.workspaceName}`);
     check(`Bridge：运行中（端口 ${info.port}）`);
-    if (info.tunnel.running && info.tunnel.url) check(`安全连接：${info.tunnel.url}/mcp`);
-    else say("· 安全连接：未启用（本地模式）");
-    say(`· 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
+    check(`传输模式：${info.transportMode === "openai" ? "OpenAI Secure MCP Tunnel" : "Cloudflare fallback"}`);
+    if (info.transportMode === "openai") {
+      say("· 公网 MCP 入口：关闭");
+      say("· 本机 MCP：仅 loopback + 每工作区随机令牌可访问");
+    } else if (info.tunnel.running && info.tunnel.url) {
+      check(`Cloudflare fallback：${info.tunnel.url}/mcp`);
+      say(`· OAuth 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
+    } else {
+      say("· Cloudflare fallback：未启动");
+    }
   });
 
 // ---------------------------------------------------------------- doctor
@@ -443,8 +551,9 @@ program
           hadEndpointBefore: Boolean(lastEndpoint),
         })
       : "Codex with ChatGPT";
+    const selectedTransport = workspace ? readTransportMode(workspace.id) : "openai";
     const tunnelState = workspace ? readTunnelState(workspace.id) : null;
-    const namedReady = tunnelState ? isNamedTunnelReady(tunnelState) : false;
+    const namedReady = selectedTransport === "cloudflare" && tunnelState ? isNamedTunnelReady(tunnelState) : false;
     let namedRepair: { needed: boolean; userMessage?: string } = { needed: false };
     let chatgptRepair: {
       needed: boolean;
@@ -487,7 +596,7 @@ program
           report.tunnel = { ok: false, detail: (error as Error).message };
         }
       }
-      const expectedPublic = Boolean(lastEndpoint?.publicUrl) || namedReady;
+      const expectedPublic = info.transportMode === "cloudflare" && (Boolean(lastEndpoint?.publicUrl) || namedReady);
       let currentUrl = info.publicUrl ?? info.tunnel.url;
       let healthy = false;
       if (currentUrl) {
@@ -577,7 +686,7 @@ program
     } else if (namedReady) {
       report.tunnel = { ok: false, detail: "NAMED_TUNNEL_DOWN" };
       namedRepair = { needed: true, userMessage: NAMED_REPAIR_MESSAGE };
-    } else if (lastEndpoint?.publicUrl) {
+    } else if (selectedTransport === "cloudflare" && lastEndpoint?.publicUrl) {
       report.tunnel = { ok: false, detail: "安全连接未运行" };
       chatgptRepair = {
         ...chatgptRepair,
@@ -961,6 +1070,7 @@ tunnelCmd
     const root = resolveWorkspace(opts.workspace);
     try {
       const workspace = new Workspace(root);
+      writeTransportMode(workspace.id, "cloudflare");
       const mode = opts.mode.trim().toLowerCase();
       const previous = readTunnelState(workspace.id);
       if (mode === "quick") {

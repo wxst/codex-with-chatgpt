@@ -1,0 +1,178 @@
+name: Review upstream updates
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+    steps:
+      - name: Checkout hardened main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Mirror audited upstream branch
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/XiaoDuoYa/codex-with-chatgpt.git
+          git fetch --no-tags upstream main
+
+          upstream_sha="$(git rev-parse upstream/main)"
+          current_sha="$(git ls-remote origin refs/heads/upstream-main | awk '{print $1}')"
+
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          if [[ "$upstream_sha" == "$current_sha" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "upstream-main is already current"
+            exit 0
+          fi
+
+          if [[ -n "$current_sha" ]]; then
+            git push --force-with-lease="refs/heads/upstream-main:$current_sha" origin \
+              "$upstream_sha:refs/heads/upstream-main"
+          else
+            git push origin "$upstream_sha:refs/heads/upstream-main"
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open or refresh review PR
+        id: pr
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pr_number="$(gh pr list --state open --base main --head upstream-main --json number --jq '.[0].number // empty')"
+
+          cat > /tmp/upstream-pr.md <<EOF
+          Automated upstream mirror update to \`$UPSTREAM_SHA\`.
+
+          This PR is intentionally **never auto-merged**. Review the upstream diff and the automated sandbox validation result before merging into the hardened \`main\` branch.
+
+          Hardened invariants to preserve:
+          - OpenAI Secure MCP Tunnel remains the default transport.
+          - Cloudflare remains explicit fallback only.
+          - ChatGPT-facing MCP remains read-only.
+          - Runtime self-update remains disabled.
+          - Direct dependencies and GitHub Actions remain pinned.
+          - Sensitive-file regression tests remain green.
+          EOF
+
+          if [[ -z "$pr_number" ]]; then
+            url="$(gh pr create \
+              --base main \
+              --head upstream-main \
+              --title 'chore: review upstream updates' \
+              --body-file /tmp/upstream-pr.md)"
+            pr_number="${url##*/}"
+          else
+            gh pr edit "$pr_number" \
+              --title 'chore: review upstream updates' \
+              --body-file /tmp/upstream-pr.md
+          fi
+
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+  validate:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout hardened main without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Test-merge exact upstream revision
+        env:
+          EXPECTED_UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/XiaoDuoYa/codex-with-chatgpt.git
+          git fetch --no-tags upstream main
+          actual_sha="$(git rev-parse upstream/main)"
+          if [[ "$actual_sha" != "$EXPECTED_UPSTREAM_SHA" ]]; then
+            echo "Upstream moved during validation: expected $EXPECTED_UPSTREAM_SHA, got $actual_sha"
+            exit 1
+          fi
+
+          git config user.name "upstream-review-bot"
+          git config user.email "actions@users.noreply.github.com"
+          if ! git merge --no-commit --no-ff "$EXPECTED_UPSTREAM_SHA"; then
+            echo "::error::Upstream update conflicts with hardened main and requires manual resolution."
+            git status --short
+            exit 1
+          fi
+          git diff --check
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install merged dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck merged tree
+        run: pnpm typecheck
+
+      - name: Test merged tree
+        run: pnpm test
+
+      - name: Build merged tree
+        run: pnpm build
+
+  report:
+    needs: [sync, validate]
+    if: always() && needs.sync.outputs.changed == 'true' && needs.sync.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Report validation result on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.sync.outputs.pr_number }}
+          VALIDATION_RESULT: ${{ needs.validate.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$VALIDATION_RESULT" == "success" ]]; then
+            summary="✅ Hardened-main test merge passed install, typecheck, tests, build, and diff checks."
+          else
+            summary="❌ Hardened-main test merge needs review; validation result: $VALIDATION_RESULT."
+          fi
+          gh pr comment "$PR_NUMBER" --body "$summary
+
+          Validation run: $RUN_URL
+
+          This is review evidence only; the workflow never merges the PR."
