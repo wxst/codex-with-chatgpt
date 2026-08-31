@@ -7,7 +7,7 @@ import { startBridge } from "../bridge/server.js";
 import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
-import { AuthStore } from "../auth/store.js";
+import { revokeWorkspaceAccess } from "../auth/revoke.js";
 import { appendExecutionRecord } from "../execution/records.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
 import {
@@ -773,15 +773,16 @@ program
   .option("-w, --workspace <path>")
   .action(async (opts: { workspace?: string }) => {
     const root = resolveWorkspace(opts.workspace);
-    const workspace = new Workspace(root);
-    const runtime = await findLiveBridge(workspace.id);
-    if (runtime) {
-      await adminFetch(runtime, "POST", "/admin/revoke-all");
-    } else {
-      // bridge not running: revoke directly in the persisted store
-      new AuthStore(workspace.id).revokeAll();
+    try {
+      const result = await revokeWorkspaceAccess(root);
+      if (result.transportMode === "openai") {
+        check("已断开 ChatGPT 对当前项目的访问（Tunnel 凭证已撤销，Bridge 已停止）");
+      } else {
+        check("已断开 ChatGPT 对当前项目的访问（OAuth 令牌已吊销）");
+      }
+    } catch (error) {
+      handleCliError(error, false);
     }
-    check("已断开 ChatGPT 对当前项目的访问（所有令牌已吊销）");
   });
 
 // ---------------------------------------------------------------- logs / workspace / record
