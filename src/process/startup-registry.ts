@@ -140,7 +140,8 @@ export function completePendingStart(workspaceId: string, startId: string): void
     if (!pending || pending.workspaceId !== workspaceId || pending.startId !== startId) return;
     fs.rmSync(file, { force: true });
   } catch {
-    // Already cancelled/consumed.
+    // Leaving a completed intent behind is conservative: a later unpair will
+    // insist on cancelling it before reporting quiescence.
   }
 }
 
@@ -156,25 +157,27 @@ export function cancelPendingStart(workspaceId: string, startId: string): boolea
   }
 }
 
+/** Security-sensitive enumeration: existing malformed/unreadable state fails closed. */
 export function listPendingStarts(workspaceId: string): PendingBridgeStart[] {
   const dir = stateSubdir("pending-starts");
   const prefix = pendingPrefix(workspaceId);
-  let names: string[];
-  try {
-    names = fs.readdirSync(dir);
-  } catch {
-    return [];
-  }
-
+  const names = fs.readdirSync(dir);
   const pending: PendingBridgeStart[] = [];
+
   for (const name of names) {
     if (!name.startsWith(prefix) || !name.endsWith(PENDING_SUFFIX)) continue;
+    const file = path.join(dir, name);
+    let content: string;
     try {
-      const value = parsePendingStart(fs.readFileSync(path.join(dir, name), "utf8"));
-      if (value?.workspaceId === workspaceId) pending.push(value);
-    } catch {
-      // Malformed state is cancelled by cancelPendingStarts below.
+      content = fs.readFileSync(file, "utf8");
+    } catch (error) {
+      throw new Error(`Pending bridge start exists but cannot be read: ${file}`, { cause: error });
     }
+    const value = parsePendingStart(content);
+    if (!value || value.workspaceId !== workspaceId) {
+      throw new Error(`Pending bridge start is malformed: ${file}`);
+    }
+    pending.push(value);
   }
   return pending;
 }
@@ -183,21 +186,17 @@ export function listPendingStarts(workspaceId: string): PendingBridgeStart[] {
 export function cancelPendingStarts(workspaceId: string): number {
   const dir = stateSubdir("pending-starts");
   const prefix = pendingPrefix(workspaceId);
-  let names: string[];
-  try {
-    names = fs.readdirSync(dir);
-  } catch {
-    return 0;
-  }
-
+  const names = fs.readdirSync(dir);
   let cancelled = 0;
+
   for (const name of names) {
     if (!name.startsWith(prefix) || !name.endsWith(PENDING_SUFFIX)) continue;
+    const file = path.join(dir, name);
     try {
-      fs.rmSync(path.join(dir, name), { force: true });
+      fs.rmSync(file, { force: true });
       cancelled += 1;
-    } catch {
-      // The final quiescence check will fail if a start intent cannot be removed.
+    } catch (error) {
+      throw new Error(`Failed to cancel pending bridge start: ${file}`, { cause: error });
     }
   }
   return cancelled;
