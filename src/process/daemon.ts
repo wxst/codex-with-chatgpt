@@ -18,6 +18,7 @@ const GRACEFUL_STOP_MS = 750;
 const SIGNAL_STOP_MS = 750;
 const FORCE_STOP_MS = 1500;
 const STOP_POLL_MS = 50;
+const PENDING_START_ENV = "C2C_PENDING_START_ID";
 
 function cliEntry(): { cmd: string; args: string[] } {
   const distEntry = path.resolve(moduleDir, "..", "cli", "index.js");
@@ -68,23 +69,15 @@ export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: Ru
     const existing = await findLiveBridge(workspace.id);
     if (existing) return { runtime: existing, spawned: false };
 
-    // Publish a durable one-shot start intent before spawning. The child must
-    // present this exact ID after acquiring its own lifecycle ticket and before
-    // reading credentials. `unpair` can therefore cancel the intent during the
-    // parent→child gap and permanently fence a delayed child from resuming.
     const pending = createPendingStart(workspace.id);
     const logFd = openPrivateAppendFile(logFile);
     const entry = cliEntry();
     try {
-      child = spawn(
-        entry.cmd,
-        [...entry.args, "serve", "--workspace", workspace.root, "--start-id", pending.startId],
-        {
-          detached: true,
-          stdio: ["ignore", logFd, logFd],
-          env: { ...process.env },
-        }
-      );
+      child = spawn(entry.cmd, [...entry.args, "serve", "--workspace", workspace.root], {
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+        env: { ...process.env, [PENDING_START_ENV]: pending.startId },
+      });
     } catch (error) {
       cancelPendingStart(workspace.id, pending.startId);
       throw error;
