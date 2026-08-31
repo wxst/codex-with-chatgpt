@@ -10,6 +10,10 @@ import { acquireWorkspaceLifecycleLock } from "./workspace-lock.js";
 import { SERVICE_NAME } from "../version.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+const GRACEFUL_STOP_MS = 750;
+const SIGNAL_STOP_MS = 750;
+const FORCE_STOP_MS = 1500;
+const STOP_POLL_MS = 50;
 
 /** Resolve the CLI entry for both built installs and source-mode development. */
 function cliEntry(): { cmd: string; args: string[] } {
@@ -138,16 +142,36 @@ function runtimeIdentityMatches(expected: RuntimeState, actual: AdminRuntimeIden
   );
 }
 
-/**
- * Signal only a cryptographically/state-file-bound OS process generation. The
- * generation is re-read immediately before SIGTERM, so a stale numeric PID can
- * never authorize signaling a replacement process.
- */
-function signalExactGeneration(runtime: RuntimeState, fallbackGeneration?: string | null): boolean {
-  const generation = runtime.processGeneration ?? fallbackGeneration ?? null;
-  if (!generation || !processGenerationMatches(runtime.pid, generation)) return false;
+function exactGeneration(runtime: RuntimeState, fallbackGeneration?: string | null): string | null {
+  return runtime.processGeneration ?? fallbackGeneration ?? null;
+}
+
+function exactGenerationIsAlive(runtime: RuntimeState, generation: string | null): boolean {
+  return Boolean(generation && processGenerationMatches(runtime.pid, generation));
+}
+
+async function waitForExactGenerationExit(
+  runtime: RuntimeState,
+  generation: string,
+  timeoutMs: number
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processGenerationMatches(runtime.pid, generation)) return true;
+    await new Promise((resolve) => setTimeout(resolve, STOP_POLL_MS));
+  }
+  return !processGenerationMatches(runtime.pid, generation);
+}
+
+/** Send a signal only after revalidating the exact OS process generation. */
+function signalExactGeneration(
+  runtime: RuntimeState,
+  generation: string | null,
+  signal: NodeJS.Signals
+): boolean {
+  if (!exactGenerationIsAlive(runtime, generation)) return false;
   try {
-    process.kill(runtime.pid, "SIGTERM");
+    process.kill(runtime.pid, signal);
     return true;
   } catch {
     return false;
@@ -155,10 +179,41 @@ function signalExactGeneration(runtime: RuntimeState, fallbackGeneration?: strin
 }
 
 /**
+ * Escalate an exact Bridge generation until it is gone. SIGTERM is best-effort
+ * and can be intercepted by the Bridge's own graceful-close handler. After a
+ * bounded grace period, SIGKILL is re-authorized against the same generation
+ * immediately before signaling, so a recycled PID can never be force-killed.
+ */
+async function terminateExactGeneration(
+  runtime: RuntimeState,
+  generation: string | null,
+  firstSignal: NodeJS.Signals | null
+): Promise<boolean> {
+  if (!generation) return false;
+  if (!exactGenerationIsAlive(runtime, generation)) return true;
+
+  if (firstSignal) {
+    if (!signalExactGeneration(runtime, generation, firstSignal)) {
+      return !exactGenerationIsAlive(runtime, generation);
+    }
+    if (await waitForExactGenerationExit(runtime, generation, SIGNAL_STOP_MS)) return true;
+  } else if (await waitForExactGenerationExit(runtime, generation, GRACEFUL_STOP_MS)) {
+    return true;
+  }
+
+  // Revalidate generation immediately before the non-interceptable kill.
+  if (!exactGenerationIsAlive(runtime, generation)) return true;
+  if (!signalExactGeneration(runtime, generation, "SIGKILL")) {
+    return !exactGenerationIsAlive(runtime, generation);
+  }
+  return waitForExactGenerationExit(runtime, generation, FORCE_STOP_MS);
+}
+
+/**
  * Stop one exact bridge runtime generation. Prefer authenticated graceful
- * shutdown. If the admin endpoint is paused/hung, safely escalate only when the
- * persisted/authenticated OS process generation still matches immediately
- * before SIGTERM.
+ * shutdown. If the admin endpoint is unavailable, use SIGTERM first. In either
+ * path, a still-live exact generation is force-killed after a bounded grace
+ * period so in-memory credentials cannot survive a wedged shutdown handler.
  */
 export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeState): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
@@ -168,22 +223,22 @@ export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeS
   try {
     info = await adminFetch<AdminRuntimeIdentity>(runtime, "GET", "/admin/info", 2000);
   } catch {
-    // No application-level response, but a modern runtime snapshot still gives
-    // us a safe process-generation proof for termination.
-    return signalExactGeneration(runtime);
+    return terminateExactGeneration(runtime, exactGeneration(runtime), "SIGTERM");
   }
 
+  const generation = exactGeneration(runtime, info.processGeneration);
   if (!runtimeIdentityMatches(runtime, info)) {
-    // If the endpoint identity drifted, only the persisted exact process
-    // generation can authorize terminating the old recorded bridge.
-    return signalExactGeneration(runtime);
+    return terminateExactGeneration(runtime, generation, "SIGTERM");
   }
 
   try {
     await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
-    return true;
+    // The HTTP response acknowledges shutdown intent, not process exit. A stuck
+    // tunnel/server close can keep credentials live indefinitely, so verify the
+    // exact generation actually disappears and SIGKILL it if the grace expires.
+    return terminateExactGeneration(runtime, generation, null);
   } catch {
-    return signalExactGeneration(runtime, info.processGeneration);
+    return terminateExactGeneration(runtime, generation, "SIGTERM");
   }
 }
 
