@@ -1,5 +1,5 @@
 import { AuthStore } from "./store.js";
-import { readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
+import { probeBridge, readRuntimeState, type HealthPayload, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, stopBridgeRuntime } from "../process/daemon.js";
 import { processGenerationMatches } from "../process/process-identity.js";
 import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
@@ -17,6 +17,7 @@ type AdminFetch = <T = unknown>(
 type StopBridgeRuntime = (workspaceRoot: string, runtime?: RuntimeState) => Promise<boolean>;
 type RevokeTunnelToken = (workspaceId: string) => boolean;
 type IsProcessAlive = (pid: number) => boolean;
+type ProbeBridge = (port: number, timeoutMs?: number) => Promise<HealthPayload | null>;
 type RevocableAuthStore = Pick<AuthStore, "revokeAll">;
 
 interface RuntimeIdentityPayload {
@@ -35,6 +36,8 @@ export interface RevokeWorkspaceAccessDeps {
   revokeTunnelToken?: RevokeTunnelToken;
   /** Test/compatibility override. Production uses process-generation identity. */
   isProcessAlive?: IsProcessAlive;
+  /** Test override for the conservative same-workspace health fallback. */
+  probeBridge?: ProbeBridge;
   /** Retained for compatibility with older callers; runtime files are no longer deleted during revocation. */
   clearRuntimeState?: (workspaceId: string) => void;
   authStoreFactory?: (workspaceId: string) => RevocableAuthStore;
@@ -74,12 +77,6 @@ function authenticatedRuntimeMatches(runtime: RuntimeState, info: RuntimeIdentit
   );
 }
 
-/**
- * Revoke every ChatGPT credential for one workspace.
- *
- * The lifecycle lock is shared with `ensureBridge`, making startup and
- * revocation mutually exclusive across independent CLI processes.
- */
 export async function revokeWorkspaceAccess(
   workspaceRoot: string,
   deps: RevokeWorkspaceAccessDeps = {}
@@ -88,12 +85,6 @@ export async function revokeWorkspaceAccess(
   return withWorkspaceLifecycleLock(workspace.id, () => revokeWorkspaceAccessLocked(workspace, deps));
 }
 
-/**
- * Revocation is fail-safe rather than fail-fast: independent credential paths
- * are attempted even when an earlier operation fails. Runtime files are never
- * deleted by workspace id because an older process may be exiting while a
- * newer exact runtime generation is being inspected.
- */
 async function revokeWorkspaceAccessLocked(
   workspace: Workspace,
   deps: RevokeWorkspaceAccessDeps
@@ -102,6 +93,7 @@ async function revokeWorkspaceAccessLocked(
   const readRuntime = deps.readRuntimeState ?? readRuntimeState;
   const requestAdmin = deps.adminFetch ?? adminFetch;
   const stopExact = deps.stopBridge ?? stopBridgeRuntime;
+  const healthProbe = deps.probeBridge ?? probeBridge;
   const revokeTunnel = deps.revokeTunnelToken ?? revokeOpenAITunnelToken;
   const makeStore = deps.authStoreFactory ?? ((workspaceId: string) => new AuthStore(workspaceId));
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -113,23 +105,30 @@ async function revokeWorkspaceAccessLocked(
   const runtimeIsLive = async (runtime: RuntimeState): Promise<boolean> => {
     if (deps.isProcessAlive) return deps.isProcessAlive(runtime.pid);
 
-    // Strongest proof: the runtime's persisted OS process generation still
-    // identifies the same process. Numeric PID existence by itself is never
-    // considered ownership because PIDs are routinely recycled.
-    if (
-      runtime.processGeneration &&
-      processGenerationMatches(runtime.pid, runtime.processGeneration)
-    ) {
+    if (runtime.processGeneration && processGenerationMatches(runtime.pid, runtime.processGeneration)) {
       return true;
     }
 
-    // Compatibility path for runtime files created before processGeneration was
-    // persisted, and a second independent proof for platforms where generation
-    // lookup is temporarily unavailable. The admin token plus exact identity
-    // fields authenticate the bridge itself rather than the numeric PID.
+    // An authenticated exact application identity proves the recorded runtime.
+    // If it does not authenticate, do not immediately declare quiescence: a
+    // stale runtime file can have been restored over a newer bridge whose admin
+    // token/generation differs. Public loopback health intentionally exposes the
+    // service+workspace identity needed for this conservative split-brain check.
     try {
       const info = await requestAdmin<RuntimeIdentityPayload>(runtime, "GET", "/admin/info", 1500);
-      return authenticatedRuntimeMatches(runtime, info);
+      if (authenticatedRuntimeMatches(runtime, info)) return true;
+    } catch {
+      // Continue to conservative health detection below.
+    }
+
+    try {
+      const health = await healthProbe(runtime.port, 1000);
+      return Boolean(
+        health &&
+        health.service === SERVICE_NAME &&
+        health.workspaceId === runtime.workspaceId &&
+        health.status === "ok"
+      );
     } catch {
       return false;
     }
@@ -164,8 +163,6 @@ async function revokeWorkspaceAccessLocked(
     }
   };
 
-  // Revoke disk credentials before touching a live process, then repeat after
-  // each process exits to close refresh/save races.
   scrubPersistedOAuth("Failed to revoke persisted OAuth credentials");
   removeTunnelCredential("Failed to remove OpenAI tunnel credential");
 
@@ -242,7 +239,6 @@ async function revokeWorkspaceAccessLocked(
       }
     }
 
-    // A live bridge may have re-saved OAuth state just before process exit.
     scrubPersistedOAuth("Failed final persisted OAuth credential scrub");
     removeTunnelCredential("Failed final OpenAI tunnel credential scrub");
 
