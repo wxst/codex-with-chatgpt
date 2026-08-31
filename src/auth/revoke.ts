@@ -34,9 +34,11 @@ export interface RevokeWorkspaceAccessResult {
 /**
  * Revoke every ChatGPT credential for one workspace.
  *
- * Cloudflare mode revokes OAuth tokens in-place. OpenAI mode additionally
- * stops a live bridge (so its in-memory tunnel token dies), waits until that
- * process is no longer reachable, then deletes the on-disk tunnel token.
+ * OAuth credentials are revoked in every mode. A live OpenAI-mode bridge is
+ * stopped and confirmed down so its in-memory tunnel credential dies. The
+ * on-disk OpenAI tunnel token is then removed unconditionally, including when
+ * Cloudflare is currently selected, so a dormant credential cannot become
+ * valid again after a later transport switch.
  */
 export async function revokeWorkspaceAccess(
   workspaceRoot: string,
@@ -61,29 +63,28 @@ export async function revokeWorkspaceAccess(
   }
 
   let bridgeStopped = false;
-  let tunnelCredentialRevoked = false;
 
-  if (transportMode === "openai") {
-    if (runtime) {
-      if (!(await stop(workspace.root))) {
-        throw new Error("Failed to stop the OpenAI tunnel bridge during access revocation");
-      }
-
-      const deadline = Date.now() + stopTimeoutMs;
-      while (Date.now() < deadline) {
-        if (!(await findLive(workspace.id))) {
-          bridgeStopped = true;
-          break;
-        }
-        await sleep(50);
-      }
-      if (!bridgeStopped) {
-        throw new Error("OpenAI tunnel bridge did not stop before the revocation deadline");
-      }
+  if (transportMode === "openai" && runtime) {
+    if (!(await stop(workspace.root))) {
+      throw new Error("Failed to stop the OpenAI tunnel bridge during access revocation");
     }
 
-    tunnelCredentialRevoked = revokeOpenAITunnelToken(workspace.id);
+    const deadline = Date.now() + stopTimeoutMs;
+    while (Date.now() < deadline) {
+      if (!(await findLive(workspace.id))) {
+        bridgeStopped = true;
+        break;
+      }
+      await sleep(50);
+    }
+    if (!bridgeStopped) {
+      throw new Error("OpenAI tunnel bridge did not stop before the revocation deadline");
+    }
   }
+
+  // Always remove any persisted OpenAI credential, even in Cloudflare mode.
+  // Transport switches intentionally do not preserve a credential after unpair.
+  const tunnelCredentialRevoked = revokeOpenAITunnelToken(workspace.id);
 
   return {
     transportMode,
