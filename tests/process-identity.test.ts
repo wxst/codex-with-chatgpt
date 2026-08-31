@@ -5,6 +5,7 @@ import {
   getProcessGeneration,
   processGenerationMatches,
   requireCurrentProcessGeneration,
+  requireProcessSafetyRuntime,
   signalExactProcessGeneration,
 } from "../src/process/process-identity.js";
 
@@ -41,6 +42,11 @@ describe("process generation identity", () => {
     expect(first).toBeTruthy();
     expect(second).toBe(first);
     expect(processGenerationMatches(process.pid, first)).toBe(true);
+  });
+
+  it("validates the declared Linux pidfd helper runtime", () => {
+    if (process.platform !== "linux") return;
+    expect(() => requireProcessSafetyRuntime()).not.toThrow();
   });
 
   it("distinguishes another live process generation", async () => {
