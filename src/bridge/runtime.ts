@@ -14,6 +14,8 @@ export interface RuntimeState {
   workspaceId: string;
   workspaceRoot: string;
   pid: number;
+  /** OS-derived process start/generation identity. Older runtime files may omit it. */
+  processGeneration?: string | null;
   port: number;
   adminToken: string;
   publicUrl: string | null;
