@@ -1,0 +1,21 @@
+name: Mark hardening PR ready
+
+on:
+  push:
+    branches:
+      - hardening/v1
+    paths:
+      - .github/workflows/pr-ready.yml
+
+permissions:
+  pull-requests: write
+
+jobs:
+  ready:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Mark PR #1 ready for review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr ready 1 --repo "$GITHUB_REPOSITORY"
