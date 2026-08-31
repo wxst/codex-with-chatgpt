@@ -89,7 +89,8 @@ describe("revocation persistence races", () => {
     });
 
     expect(result.bridgeStopped).toBe(true);
-    expect(storeCalls).toBeGreaterThanOrEqual(1);
-    expect(events.indexOf("disk-revoke")).toBeGreaterThan(events.indexOf("stop"));
+    expect(storeCalls).toBeGreaterThanOrEqual(2);
+    expect(events.lastIndexOf("disk-revoke")).toBeGreaterThan(events.indexOf("stop"));
+    expect(events).not.toContain("clear-runtime");
   });
 });
