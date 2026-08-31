@@ -21,6 +21,20 @@ function makeWorkspace(name: string): Workspace {
   return new Workspace(root);
 }
 
+function writeManualLock(
+  workspaceId: string,
+  owner: { pid: number; nonce: string; acquiredAt: string },
+  mtimeMs = Date.now()
+): string {
+  const lockDir = path.join(stateSubdir("locks"), `${workspaceId}.lifecycle.lock`);
+  fs.mkdirSync(lockDir, { mode: 0o700 });
+  const file = path.join(lockDir, "owner.json");
+  fs.writeFileSync(file, JSON.stringify(owner), { mode: 0o600 });
+  const date = new Date(mtimeMs);
+  fs.utimesSync(file, date, date);
+  return lockDir;
+}
+
 afterEach(() => {
   delete process.env.C2C_STATE_DIR;
   for (const root of roots.splice(0)) cleanup(root);
@@ -56,17 +70,11 @@ describe("workspace lifecycle serialization", () => {
   it("does not immediately reclaim a dead-owner lock during the bridge startup grace window", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("lifecycle-dead-owner-grace");
-    const lockDir = path.join(stateSubdir("locks"), `${workspace.id}.lifecycle.lock`);
-    fs.mkdirSync(lockDir, { mode: 0o700 });
-    fs.writeFileSync(
-      path.join(lockDir, "owner.json"),
-      JSON.stringify({
-        pid: 2_147_483_647,
-        nonce: "dead-owner-nonce",
-        acquiredAt: new Date().toISOString(),
-      }),
-      { mode: 0o600 }
-    );
+    const lockDir = writeManualLock(workspace.id, {
+      pid: 2_147_483_647,
+      nonce: "dead-owner-nonce",
+      acquiredAt: new Date().toISOString(),
+    });
 
     await expect(
       acquireWorkspaceLifecycleLock(workspace.id, {
@@ -78,19 +86,18 @@ describe("workspace lifecycle serialization", () => {
     expect(fs.existsSync(lockDir)).toBe(true);
   });
 
-  it("reclaims a dead-owner lock after the startup grace window expires", async () => {
+  it("reclaims an expired owner generation even if its PID has been reused by a live process", async () => {
     isolateStateDir();
-    const workspace = makeWorkspace("lifecycle-dead-owner-expired");
-    const lockDir = path.join(stateSubdir("locks"), `${workspace.id}.lifecycle.lock`);
-    fs.mkdirSync(lockDir, { mode: 0o700 });
-    fs.writeFileSync(
-      path.join(lockDir, "owner.json"),
-      JSON.stringify({
-        pid: 2_147_483_647,
-        nonce: "expired-owner-nonce",
-        acquiredAt: new Date(Date.now() - 10_000).toISOString(),
-      }),
-      { mode: 0o600 }
+    const workspace = makeWorkspace("lifecycle-pid-reuse");
+    const old = Date.now() - 10_000;
+    writeManualLock(
+      workspace.id,
+      {
+        pid: process.pid,
+        nonce: "reused-live-pid-old-generation",
+        acquiredAt: new Date(old).toISOString(),
+      },
+      old
     );
 
     const lock = await acquireWorkspaceLifecycleLock(workspace.id, {
@@ -99,7 +106,34 @@ describe("workspace lifecycle serialization", () => {
       orphanGraceMs: 100,
     });
     try {
-      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, lock.nonce)).toBe(true);
+      expect(lock.nonce).not.toBe("reused-live-pid-old-generation");
+      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, lock.nonce, 100)).toBe(true);
+    } finally {
+      lock.release();
+    }
+  });
+
+  it("reclaims a dead-owner lock after the startup grace window expires", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-dead-owner-expired");
+    const old = Date.now() - 10_000;
+    writeManualLock(
+      workspace.id,
+      {
+        pid: 2_147_483_647,
+        nonce: "expired-owner-nonce",
+        acquiredAt: new Date(old).toISOString(),
+      },
+      old
+    );
+
+    const lock = await acquireWorkspaceLifecycleLock(workspace.id, {
+      timeoutMs: 500,
+      pollMs: 5,
+      orphanGraceMs: 100,
+    });
+    try {
+      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, lock.nonce, 100)).toBe(true);
     } finally {
       lock.release();
     }
@@ -146,6 +180,16 @@ describe("workspace lifecycle serialization", () => {
       if (second) await second.close();
       if (first) await first.close();
     }
+  });
+});
+
+describe("stale-lock takeover", () => {
+  it("uses an exclusive reclaim claim and rechecks the observed owner generation", () => {
+    const source = fs.readFileSync(path.resolve("src/process/workspace-lock.ts"), "utf8");
+    expect(source).toContain("RECLAIM_FILE");
+    expect(source).toContain('flag: "wx"');
+    expect(source).toContain("expectedNonce");
+    expect(source).toContain("current.nonce !== observed.nonce");
   });
 });
 
