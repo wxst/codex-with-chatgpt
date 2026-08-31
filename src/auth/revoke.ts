@@ -1,6 +1,7 @@
 import { AuthStore } from "./store.js";
 import { readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, stopBridgeRuntime } from "../process/daemon.js";
+import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
 import { readTransportMode, revokeOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
 import { Workspace } from "../workspace/manager.js";
 
@@ -49,30 +50,35 @@ function defaultIsProcessAlive(pid: number): boolean {
 }
 
 function runtimeIdentity(runtime: RuntimeState): string {
-  return [
-    runtime.workspaceId,
-    runtime.pid,
-    runtime.port,
-    runtime.startedAt,
-    runtime.adminToken,
-  ].join("\u0000");
+  return [runtime.workspaceId, runtime.pid, runtime.port, runtime.startedAt, runtime.adminToken].join("\u0000");
 }
 
 /**
  * Revoke every ChatGPT credential for one workspace.
  *
- * Revocation is fail-safe rather than fail-fast: independent credential paths
- * are attempted even when an earlier operation fails. Runtime files are never
- * deleted by workspace id because an overlapping bridge start can replace the
- * file while an older process is exiting. Instead, each exact runtime
- * generation is authenticated/stopped and the state file is re-read; any
- * replacement generation is revoked too before success is reported.
+ * The lifecycle lock is shared with `ensureBridge`, making startup and
+ * revocation mutually exclusive across independent CLI processes. This closes
+ * the last-writer-wins runtime race where two concurrent starters could create
+ * an untracked bridge while `unpair` was trying to prove quiescence.
  */
 export async function revokeWorkspaceAccess(
   workspaceRoot: string,
   deps: RevokeWorkspaceAccessDeps = {}
 ): Promise<RevokeWorkspaceAccessResult> {
   const workspace = new Workspace(workspaceRoot);
+  return withWorkspaceLifecycleLock(workspace.id, () => revokeWorkspaceAccessLocked(workspace, deps));
+}
+
+/**
+ * Revocation is fail-safe rather than fail-fast: independent credential paths
+ * are attempted even when an earlier operation fails. Runtime files are never
+ * deleted by workspace id because an older process may be exiting while a
+ * newer exact runtime generation is being inspected.
+ */
+async function revokeWorkspaceAccessLocked(
+  workspace: Workspace,
+  deps: RevokeWorkspaceAccessDeps
+): Promise<RevokeWorkspaceAccessResult> {
   const transportMode = readTransportMode(workspace.id);
   const readRuntime = deps.readRuntimeState ?? readRuntimeState;
   const requestAdmin = deps.adminFetch ?? adminFetch;
@@ -116,7 +122,7 @@ export async function revokeWorkspaceAccess(
   };
 
   // Revoke disk credentials before touching a live process, then repeat after
-  // each process exits to close refresh/save and replacement-start races.
+  // each process exits to close refresh/save races.
   scrubPersistedOAuth("Failed to revoke persisted OAuth credentials");
   removeTunnelCredential("Failed to remove OpenAI tunnel credential");
 
@@ -125,8 +131,6 @@ export async function revokeWorkspaceAccess(
 
   for (let generation = 0; generation < maxRuntimeGenerations; generation++) {
     if (!candidate) {
-      // Give a concurrent starter one short opportunity to publish its runtime
-      // before declaring the workspace quiescent.
       await sleep(50);
       candidate = readRuntimeSafely();
       if (!candidate) {
@@ -143,8 +147,6 @@ export async function revokeWorkspaceAccess(
       if (aliveAtStart) {
         failures.push(new Error(`Workspace bridge runtime ${current.pid} remained live after a revocation attempt`));
       } else {
-        // The state file may intentionally remain as a stale snapshot. Confirm
-        // once more that no replacement generation overwrote it.
         await sleep(50);
         const confirm = readRuntimeSafely();
         if (!confirm || (runtimeIdentity(confirm) === key && !isAlive(confirm.pid))) {
@@ -171,14 +173,17 @@ export async function revokeWorkspaceAccess(
         scrubPersistedOAuth("Failed persisted OAuth fallback after live admin revocation failure");
       }
 
-      let shutdownRequested = false;
       try {
-        shutdownRequested = await stopExact(workspace.root, current);
+        const shutdownRequested = await stopExact(workspace.root, current);
         if (!shutdownRequested) {
           failures.push(new Error(`Failed to authenticate and request shutdown for workspace bridge ${current.pid}`));
         }
       } catch (error) {
-        failures.push(new Error(`Failed to request workspace bridge ${current.pid} shutdown: ${(error as Error).message}`, { cause: error }));
+        failures.push(
+          new Error(`Failed to request workspace bridge ${current.pid} shutdown: ${(error as Error).message}`, {
+            cause: error,
+          })
+        );
       }
 
       const deadline = Date.now() + stopTimeoutMs;
@@ -194,16 +199,13 @@ export async function revokeWorkspaceAccess(
       }
     }
 
-    // A live bridge may have re-saved OAuth state just before process exit, or
-    // a replacement bridge may have generated a fresh OpenAI tunnel token.
-    // Scrub both stores after every generation, regardless of earlier errors.
+    // A live bridge may have re-saved OAuth state just before process exit.
     scrubPersistedOAuth("Failed final persisted OAuth credential scrub");
     removeTunnelCredential("Failed final OpenAI tunnel credential scrub");
 
     await sleep(50);
     const next = readRuntimeSafely();
     if (!next) {
-      // Confirm no replacement publishes immediately after the first empty read.
       await sleep(50);
       const confirm = readRuntimeSafely();
       if (!confirm) {
@@ -221,8 +223,6 @@ export async function revokeWorkspaceAccess(
     }
 
     if (!isAlive(next.pid)) {
-      // Stale runtime state is retained deliberately; it will be overwritten by
-      // the next bridge and cannot authorize destructive actions by itself.
       await sleep(50);
       const confirm = readRuntimeSafely();
       if (!confirm || (runtimeIdentity(confirm) === nextKey && !isAlive(confirm.pid))) {
@@ -242,8 +242,6 @@ export async function revokeWorkspaceAccess(
     );
   }
 
-  // Last disk scrub after the quiet check. If a late process appeared after
-  // this point it cannot reuse any credential that existed before unpair.
   scrubPersistedOAuth("Failed final persisted OAuth credential scrub after quiescence check");
   removeTunnelCredential("Failed final OpenAI tunnel credential scrub after quiescence check");
 
