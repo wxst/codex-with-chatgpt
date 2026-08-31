@@ -5,11 +5,13 @@ import { fileURLToPath } from "node:url";
 import { Workspace } from "../workspace/manager.js";
 import { stateSubdir } from "../config/paths.js";
 import { findLiveBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
-import { acquireWorkspaceLifecycleLock } from "./workspace-lock.js";
+import {
+  acquireWorkspaceLifecycleLock,
+  LIFECYCLE_LOCK_NONCE_ENV,
+  LIFECYCLE_LOCK_WORKSPACE_ENV,
+} from "./workspace-lock.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-export const LIFECYCLE_LOCK_NONCE_ENV = "C2C_LIFECYCLE_LOCK_NONCE";
-export const LIFECYCLE_LOCK_WORKSPACE_ENV = "C2C_LIFECYCLE_LOCK_WORKSPACE";
 
 /** Resolve the CLI entry for both built installs and source-mode development. */
 function cliEntry(): { cmd: string; args: string[] } {
