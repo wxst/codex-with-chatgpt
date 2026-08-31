@@ -1,6 +1,7 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { ensureDir, getStateDir, readJsonIfExists } from "../config/paths.js";
 import { getProcessGeneration } from "../process/process-identity.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 
@@ -27,12 +28,50 @@ export function runtimeFile(workspaceId: string): string {
   return path.join(ensureDir(path.join(getStateDir(), "runtime")), `${workspaceId}.json`);
 }
 
+/**
+ * Publish runtime identity atomically. Tunnel start/stop updates occur after the
+ * startup lifecycle ticket has been released, so readers such as `unpair` must
+ * never observe a truncate/write intermediate state and mistake it for a
+ * missing runtime. The temporary file lives in the same directory so rename is
+ * an atomic replacement on supported local filesystems.
+ */
 export function writeRuntimeState(state: RuntimeState): void {
-  // Centralize generation stamping so every runtime write path—including later
-  // tunnel URL updates—retains the same PID-generation proof. Callers may pass
-  // an explicit value for tests/migrations; production derives it from state.pid.
+  const file = runtimeFile(state.workspaceId);
   const processGeneration = state.processGeneration ?? getProcessGeneration(state.pid);
-  writeSecureJson(runtimeFile(state.workspaceId), { ...state, processGeneration });
+  const payload = JSON.stringify({ ...state, processGeneration }, null, 2);
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | null = null;
+
+  try {
+    fd = fs.openSync(temp, "wx", 0o600);
+    fs.writeFileSync(fd, payload, "utf8");
+    if (process.platform !== "win32") {
+      fs.fchmodSync(fd, 0o600);
+    } else {
+      try {
+        fs.fchmodSync(fd, 0o600);
+      } catch {
+        // Windows ACL semantics do not reliably map to POSIX mode bits.
+      }
+    }
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(temp, file);
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Preserve the original write error.
+      }
+    }
+    try {
+      fs.rmSync(temp, { force: true });
+    } catch {
+      // Successful rename already moved the temporary path away.
+    }
+  }
 }
 
 export function readRuntimeState(workspaceId: string): RuntimeState | null {
