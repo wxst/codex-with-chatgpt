@@ -7,6 +7,7 @@ import {
   listRuntimeStates,
   removeRuntimeStateGeneration,
   runtimeFile,
+  runtimeGenerationFile,
   runtimeIdentity,
   writeRuntimeState,
   type RuntimeState,
@@ -72,7 +73,6 @@ describe("pending bridge start fencing", () => {
       })
     ).rejects.toThrow(/cancelled|no longer valid/);
 
-    // The pending fence is checked before OpenAI tunnel credentials are read or created.
     expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
   });
 });
@@ -95,7 +95,12 @@ describe("per-generation runtime registry", () => {
     expect(new Set(listed.map(runtimeIdentity)).size).toBe(2);
 
     removeRuntimeStateGeneration(first);
-    expect(listRuntimeStates(workspace.id).map((state) => state.port)).toEqual([49001]);
+    expect(fs.existsSync(runtimeGenerationFile(first))).toBe(false);
+    expect(fs.existsSync(runtimeGenerationFile(second))).toBe(true);
+    // Cleanup never unlinks the non-authoritative mirror because a concurrent
+    // replacement may have renamed a newer snapshot onto that pathname.
+    expect(fs.existsSync(runtimeFile(workspace.id))).toBe(true);
+    expect(new Set(listRuntimeStates(workspace.id).map((state) => state.port))).toEqual(new Set([48765, 49001]));
   });
 
   it("revokes every tracked runtime generation instead of a single canonical candidate", async () => {
