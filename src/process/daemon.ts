@@ -18,6 +18,7 @@ const GRACEFUL_STOP_MS = 750;
 const SIGNAL_STOP_MS = 750;
 const FORCE_STOP_MS = 1500;
 const LEGACY_AUTHENTICATED_STOP_MS = 5_000;
+const LEGACY_EXIT_CONFIRM_MS = 750;
 const STOP_POLL_MS = 50;
 const PENDING_START_ENV = "C2C_PENDING_START_ID";
 
@@ -159,6 +160,15 @@ function exactGenerationIsAlive(runtime: RuntimeState, generation: string | null
   return Boolean(generation && processGenerationMatches(runtime.pid, generation));
 }
 
+function numericPidExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
 async function waitForExactGenerationExit(
   runtime: RuntimeState,
   generation: string,
@@ -175,28 +185,37 @@ async function waitForExactGenerationExit(
 /**
  * Legacy runtimes predate process-generation stamping. Once the exact admin
  * token has authenticated the recorded workspace/pid/port/start identity and
- * `/admin/shutdown` has acknowledged the request, the only safe compatibility
- * action is to wait for that authenticated endpoint to disappear. We never
- * signal a generationless numeric PID.
+ * `/admin/shutdown` has acknowledged the request, we still cannot safely signal
+ * the numeric PID. Confirm exit only after BOTH the authenticated endpoint is
+ * continuously absent and that numeric PID is continuously absent for a
+ * sustained window. A paused bridge keeps its PID and therefore never looks
+ * exited; a recycled PID is conservatively treated as still live.
  */
 async function waitForAuthenticatedLegacyExit(runtime: RuntimeState, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
+  let absenceSince: number | null = null;
+
   while (Date.now() < deadline) {
+    let authenticatedEndpointPresent = false;
     try {
       const info = await adminFetch<AdminRuntimeIdentity>(runtime, "GET", "/admin/info", 500);
-      if (!runtimeIdentityMatches(runtime, info)) return true;
+      authenticatedEndpointPresent = runtimeIdentityMatches(runtime, info);
     } catch {
-      return true;
+      authenticatedEndpointPresent = false;
     }
+
+    const pidPresent = numericPidExists(runtime.pid);
+    if (!authenticatedEndpointPresent && !pidPresent) {
+      absenceSince ??= Date.now();
+      if (Date.now() - absenceSince >= LEGACY_EXIT_CONFIRM_MS) return true;
+    } else {
+      absenceSince = null;
+    }
+
     await new Promise((resolve) => setTimeout(resolve, STOP_POLL_MS));
   }
 
-  try {
-    const info = await adminFetch<AdminRuntimeIdentity>(runtime, "GET", "/admin/info", 500);
-    return !runtimeIdentityMatches(runtime, info);
-  } catch {
-    return true;
-  }
+  return false;
 }
 
 function signalExactGeneration(
