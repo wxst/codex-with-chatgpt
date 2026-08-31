@@ -41,8 +41,11 @@ Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](
 请帮我完整安装并配置 Codex with ChatGPT，全程自动，我是不懂技术的小白，
 所有事情你自己做：
 
-1. 环境自检：需要 git 和 Node.js ≥ 20，缺什么就自动安装
-  （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
+1. 环境自检：需要 git 和 Node.js ≥ 20；Linux 还必须有 Python ≥ 3.9，
+   并确认该 Python 提供 os.pidfd_open 和 signal.pidfd_send_signal。
+   如果系统有多个 Python，可设置 C2C_PYTHON 指向合适的解释器。
+   缺什么就自动安装（macOS 用 Homebrew，Windows 用 winget，Linux 用系统包管理器），
+   同时安装 cloudflared。
 2. 下载：把 https://github.com/XiaoDuoYa/codex-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已存在就 git pull 更新）。
 3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
@@ -66,9 +69,11 @@ paragraph below, paste it to your coding agent (Codex), and go grab a coffee:
 Please install and configure "Codex with ChatGPT" for me, fully automatically.
 I am a non-technical user — do everything yourself:
 
-1. Check the environment: git and Node.js >= 20 must be available. Install
-   anything missing yourself (macOS: Homebrew, Windows: winget). Also install
-   cloudflared.
+1. Check the environment: git and Node.js >= 20 must be available. On Linux,
+   Python >= 3.9 is also required and must expose os.pidfd_open and
+   signal.pidfd_send_signal; if multiple interpreters exist, set C2C_PYTHON to
+   the suitable executable. Install anything missing yourself (macOS: Homebrew,
+   Windows: winget, Linux: the system package manager). Also install cloudflared.
 2. Download: clone https://github.com/XiaoDuoYa/codex-with-chatgpt into
    ~/codex-with-chatgpt (if it already exists, git pull to update).
 3. Build: inside that folder run `corepack pnpm install` then `corepack pnpm build`.
@@ -84,6 +89,14 @@ I am a non-technical user — do everything yourself:
    I don't know what MCP, OAuth, tunnels or ports are. Don't explain them.
    If anything breaks, fix it yourself first.
 ```
+
+> [!IMPORTANT]
+> **Linux safety runtime requirement:** before the Bridge reads or creates any
+> OAuth/tunnel credential, it requires Python 3.9+ with `os.pidfd_open` and
+> `signal.pidfd_send_signal`. This is a required safety dependency used to
+> terminate a wedged Bridge through a generation-bound pidfd without risking PID
+> reuse. The Bridge fails closed if the capability is unavailable. Set
+> `C2C_PYTHON=/path/to/python3` to select a specific interpreter.
 
 
 **Updates · 更新** — The Skill checks GitHub once a day and updates itself when a
@@ -207,8 +220,12 @@ c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
 c2c status / doctor / pair / unpair / logs / stop
 ```
 
-Requirements: Node.js >= 20, git. `cloudflared` for the public connection
-(auto-detected; the Skill installs it for you).
+Requirements: Node.js >= 20 and git. `cloudflared` is required for the public
+connection (auto-detected; the Skill installs it for you). **Linux additionally
+requires Python >= 3.9 with `os.pidfd_open` and `signal.pidfd_send_signal`; use
+`C2C_PYTHON` to select the interpreter if needed.** The Bridge checks this
+safety capability before reading credentials and refuses to start if it is not
+available.
 
 Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
 [security](docs/security.md) · [troubleshooting](docs/troubleshooting.md)
