@@ -1,15 +1,11 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Workspace } from "../workspace/manager.js";
 import { stateSubdir } from "../config/paths.js";
 import { findLiveBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
-import {
-  acquireWorkspaceLifecycleLock,
-  LIFECYCLE_LOCK_NONCE_ENV,
-  LIFECYCLE_LOCK_WORKSPACE_ENV,
-} from "./workspace-lock.js";
+import { acquireWorkspaceLifecycleLock } from "./workspace-lock.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -62,43 +58,46 @@ export function openPrivateAppendFile(file: string): number {
 export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: RuntimeState; spawned: boolean }> {
   const workspace = new Workspace(workspaceRoot);
   const lock = await acquireWorkspaceLifecycleLock(workspace.id);
+  let child: ChildProcess | null = null;
+  let logFile = daemonLogFile(workspace.id);
 
+  // The parent lock protects only check-and-spawn. The detached child does not
+  // inherit or bypass this ticket: `startBridge()` acquires its own ticket,
+  // bound to the child's OS process generation, before loading any credential.
+  // Releasing here avoids a parent-owned lease after spawn and makes parent
+  // death/pause irrelevant to the child's startup critical section.
   try {
     const existing = await findLiveBridge(workspace.id);
     if (existing) return { runtime: existing, spawned: false };
 
-    const logFile = daemonLogFile(workspace.id);
     const logFd = openPrivateAppendFile(logFile);
     const entry = cliEntry();
-    let child;
     try {
       child = spawn(entry.cmd, [...entry.args, "serve", "--workspace", workspace.root], {
         detached: true,
         stdio: ["ignore", logFd, logFd],
-        env: {
-          ...process.env,
-          [LIFECYCLE_LOCK_NONCE_ENV]: lock.nonce,
-          [LIFECYCLE_LOCK_WORKSPACE_ENV]: workspace.id,
-        },
+        env: { ...process.env },
       });
     } finally {
       fs.closeSync(logFd);
     }
     child.unref();
-
-    const deadline = Date.now() + 20_000;
-    while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      const runtime = await findLiveBridge(workspace.id);
-      if (runtime) return { runtime, spawned: true };
-      if (child.exitCode !== null && child.exitCode !== 0) {
-        throw new Error(`Bridge process exited with code ${child.exitCode}. See ${logFile}`);
-      }
-    }
-    throw new Error(`Bridge did not become healthy within 20s. See ${logFile}`);
   } finally {
     lock.release();
   }
+
+  if (!child) throw new Error(`Bridge process could not be spawned. See ${logFile}`);
+
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const runtime = await findLiveBridge(workspace.id);
+    if (runtime) return { runtime, spawned: true };
+    if (child.exitCode !== null && child.exitCode !== 0) {
+      throw new Error(`Bridge process exited with code ${child.exitCode}. See ${logFile}`);
+    }
+  }
+  throw new Error(`Bridge did not become healthy within 20s. See ${logFile}`);
 }
 
 export async function adminFetch<T = unknown>(
@@ -166,9 +165,6 @@ export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeS
     await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
     return true;
   } catch {
-    // Fail safe: do not fall back to PID-level SIGTERM. A PID can be recycled
-    // after the authenticated identity check, and an unrelated process must
-    // never be signaled from a stale runtime file.
     return false;
   }
 }
