@@ -26,17 +26,58 @@ import { readRuntimeState, writeRuntimeState, type RuntimeState } from "./runtim
 
 const activePersistedBridges = new Set<string>();
 
-function processExists(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+interface RuntimeIdentityPayload {
+  service?: string;
+  workspaceId?: string;
+  pid?: number;
+  port?: number;
+  startedAt?: string;
+}
+
+async function fetchLocalJson<T>(
+  url: string,
+  timeoutMs: number,
+  headers?: Record<string, string>
+): Promise<T | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    const response = await fetch(url, { headers, signal: controller.signal });
+    if (!response.ok) return null;
+    return (await response.json()) as T;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-function assertNoActivePersistedBridge(workspace: Workspace): void {
+function exactRuntimeIdentityMatches(runtime: RuntimeState, info: RuntimeIdentityPayload): boolean {
+  return (
+    info.service === SERVICE_NAME &&
+    info.workspaceId === runtime.workspaceId &&
+    info.pid === runtime.pid &&
+    info.port === runtime.port &&
+    info.startedAt === runtime.startedAt
+  );
+}
+
+async function persistedRuntimeIsLiveBridge(runtime: RuntimeState): Promise<boolean> {
+  const base = `http://127.0.0.1:${runtime.port}`;
+  const info = await fetchLocalJson<RuntimeIdentityPayload>(`${base}/admin/info`, 1500, {
+    Authorization: `Bearer ${runtime.adminToken}`,
+  });
+  if (info && exactRuntimeIdentityMatches(runtime, info)) return true;
+
+  // A runtime file can be stale while another real C2C bridge for the same
+  // workspace is listening on the recorded port. In that case fail closed and
+  // avoid creating an untracked duplicate, even if the stale admin token no
+  // longer authenticates to the replacement generation.
+  const health = await fetchLocalJson<{ service?: string; workspaceId?: string }>(`${base}/health`, 1000);
+  return health?.service === SERVICE_NAME && health.workspaceId === runtime.workspaceId;
+}
+
+async function assertNoActivePersistedBridge(workspace: Workspace): Promise<void> {
   if (activePersistedBridges.has(workspace.id)) {
     throw new Error(`A persisted bridge is already running for workspace ${workspace.id}`);
   }
@@ -44,16 +85,13 @@ function assertNoActivePersistedBridge(workspace: Workspace): void {
   const existing = readRuntimeState(workspace.id);
   if (!existing) return;
 
-  // A direct library caller can close and restart a persisted bridge within the
-  // same Node process. In that case the runtime file is intentionally stale,
-  // but the in-process set above proves whether this module still owns a live
-  // bridge for the workspace. For another PID, fail closed while that process
-  // exists rather than risk creating an untracked second bridge.
-  if (existing.pid === process.pid) return;
-  if (processExists(existing.pid)) {
-    throw new Error(
-      `A persisted bridge runtime is already active for workspace ${workspace.id} (pid ${existing.pid})`
-    );
+  // PID existence alone is not ownership: a stale bridge PID can be reused by
+  // an unrelated process. Prove the endpoint instead, using authenticated exact
+  // runtime identity first and C2C health/workspace identity as a conservative
+  // duplicate-Bridge fallback. If neither endpoint proves a bridge, the stale
+  // runtime must not block recovery/startup merely because its numeric PID lives.
+  if (await persistedRuntimeIsLiveBridge(existing)) {
+    throw new Error(`A persisted bridge runtime is already active for workspace ${workspace.id}`);
   }
 }
 
@@ -148,7 +186,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
 async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): Promise<Bridge> {
   const persistRuntimeEnabled = opts.persistRuntime !== false;
-  if (persistRuntimeEnabled) assertNoActivePersistedBridge(workspace);
+  if (persistRuntimeEnabled) await assertNoActivePersistedBridge(workspace);
 
   const logger = opts.logger ?? nullLogger;
   const host = opts.host ?? DEFAULT_HOST;
