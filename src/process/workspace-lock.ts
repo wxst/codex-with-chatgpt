@@ -16,13 +16,22 @@ export interface WorkspaceLifecycleLockOptions {
 }
 
 export interface WorkspaceLifecycleLock {
+  /** Opaque proof passed only to a child startup process spawned under this lock. */
+  nonce: string;
   release(): void;
 }
+
+const DEFAULT_ORPHAN_GRACE_MS = 30_000;
 
 function assertWorkspaceId(workspaceId: string): void {
   if (!/^[A-Za-z0-9._-]+$/.test(workspaceId)) {
     throw new Error("Invalid workspace id for lifecycle lock");
   }
+}
+
+function lockDirectory(workspaceId: string): string {
+  assertWorkspaceId(workspaceId);
+  return path.join(stateSubdir("locks"), `${workspaceId}.lifecycle.lock`);
 }
 
 function ownerFile(lockDir: string): string {
@@ -37,7 +46,8 @@ function readOwner(lockDir: string): LockOwner | null {
       (value.pid ?? 0) <= 0 ||
       typeof value.nonce !== "string" ||
       value.nonce.length < 8 ||
-      typeof value.acquiredAt !== "string"
+      typeof value.acquiredAt !== "string" ||
+      !Number.isFinite(Date.parse(value.acquiredAt))
     ) {
       return null;
     }
@@ -56,10 +66,37 @@ function processExists(pid: number): boolean {
   }
 }
 
+function ownerAgeMs(owner: LockOwner): number {
+  return Math.max(0, Date.now() - Date.parse(owner.acquiredAt));
+}
+
+/**
+ * Verify an inherited startup nonce without trusting an environment variable by
+ * itself. A dead parent remains a valid owner only during the startup grace
+ * window, which is longer than ensureBridge's normal 20 second startup wait.
+ */
+export function isWorkspaceLifecycleLockHeldBy(
+  workspaceId: string,
+  nonce: string,
+  orphanGraceMs = DEFAULT_ORPHAN_GRACE_MS
+): boolean {
+  if (!nonce) return false;
+  const owner = readOwner(lockDirectory(workspaceId));
+  if (!owner || owner.nonce !== nonce) return false;
+  if (processExists(owner.pid)) return true;
+  return ownerAgeMs(owner) < orphanGraceMs;
+}
+
 function tryReclaimStaleLock(lockDir: string, orphanGraceMs: number): boolean {
   const owner = readOwner(lockDir);
   if (owner) {
     if (processExists(owner.pid)) return false;
+
+    // A parent can die immediately after spawning the bridge but before the
+    // child publishes runtime state. Preserve the dead owner's lock for a full
+    // startup window so unpair/another starter cannot enter that gap.
+    if (ownerAgeMs(owner) < orphanGraceMs) return false;
+
     try {
       fs.rmSync(lockDir, { recursive: true, force: true });
       return true;
@@ -70,7 +107,7 @@ function tryReclaimStaleLock(lockDir: string, orphanGraceMs: number): boolean {
 
   // mkdir and owner-file creation are separate syscalls. A missing owner file
   // can therefore be a lock that is still being initialized. Only reclaim an
-  // ownerless directory after a generous grace period.
+  // ownerless directory after the same generous grace period.
   try {
     const ageMs = Date.now() - fs.statSync(lockDir).mtimeMs;
     if (ageMs < orphanGraceMs) return false;
@@ -88,8 +125,8 @@ export async function acquireWorkspaceLifecycleLock(
   assertWorkspaceId(workspaceId);
   const timeoutMs = options.timeoutMs ?? 60_000;
   const pollMs = options.pollMs ?? 50;
-  const orphanGraceMs = options.orphanGraceMs ?? 10_000;
-  const lockDir = path.join(stateSubdir("locks"), `${workspaceId}.lifecycle.lock`);
+  const orphanGraceMs = options.orphanGraceMs ?? DEFAULT_ORPHAN_GRACE_MS;
+  const lockDir = lockDirectory(workspaceId);
   const nonce = randomUUID();
   const deadline = Date.now() + timeoutMs;
 
@@ -110,6 +147,7 @@ export async function acquireWorkspaceLifecycleLock(
 
       let released = false;
       return {
+        nonce,
         release(): void {
           if (released) return;
           released = true;
