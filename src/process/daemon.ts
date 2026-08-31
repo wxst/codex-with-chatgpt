@@ -17,6 +17,7 @@ const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const GRACEFUL_STOP_MS = 750;
 const SIGNAL_STOP_MS = 750;
 const FORCE_STOP_MS = 1500;
+const LEGACY_AUTHENTICATED_STOP_MS = 5_000;
 const STOP_POLL_MS = 50;
 const PENDING_START_ENV = "C2C_PENDING_START_ID";
 
@@ -171,6 +172,33 @@ async function waitForExactGenerationExit(
   return !processGenerationMatches(runtime.pid, generation);
 }
 
+/**
+ * Legacy runtimes predate process-generation stamping. Once the exact admin
+ * token has authenticated the recorded workspace/pid/port/start identity and
+ * `/admin/shutdown` has acknowledged the request, the only safe compatibility
+ * action is to wait for that authenticated endpoint to disappear. We never
+ * signal a generationless numeric PID.
+ */
+async function waitForAuthenticatedLegacyExit(runtime: RuntimeState, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const info = await adminFetch<AdminRuntimeIdentity>(runtime, "GET", "/admin/info", 500);
+      if (!runtimeIdentityMatches(runtime, info)) return true;
+    } catch {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, STOP_POLL_MS));
+  }
+
+  try {
+    const info = await adminFetch<AdminRuntimeIdentity>(runtime, "GET", "/admin/info", 500);
+    return !runtimeIdentityMatches(runtime, info);
+  } catch {
+    return true;
+  }
+}
+
 function signalExactGeneration(
   runtime: RuntimeState,
   generation: string | null,
@@ -222,6 +250,9 @@ export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeS
 
   try {
     await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
+    if (!generation) {
+      return waitForAuthenticatedLegacyExit(runtime, LEGACY_AUTHENTICATED_STOP_MS);
+    }
     return terminateExactGeneration(runtime, generation, null);
   } catch {
     return terminateExactGeneration(runtime, generation, "SIGTERM");
