@@ -87,6 +87,30 @@ describe("workspace lifecycle serialization", () => {
     expect(enteredRevocation).toBe(true);
   });
 
+  it("makes the bridge process acquire its own ticket before startup", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("child-owned-startup");
+    const held = await acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 });
+    let settled = false;
+    let bridge: Bridge | null = null;
+
+    const pending = startBridge({ workspaceRoot: workspace.root, port: 0, persistRuntime: false }).then((value) => {
+      settled = true;
+      return value;
+    });
+
+    try {
+      await sleep(30);
+      expect(settled).toBe(false);
+      held.release();
+      bridge = await pending;
+      expect(bridge.workspace.id).toBe(workspace.id);
+    } finally {
+      held.release();
+      if (bridge) await bridge.close();
+    }
+  });
+
   it("keeps a fresh ticket blocking during the startup grace window", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("lifecycle-fresh-ticket");
@@ -201,7 +225,7 @@ describe("workspace lifecycle serialization", () => {
     second.release();
   });
 
-  it("serializes concurrent ensureBridge calls so only one startup path wins", async () => {
+  it("serializes concurrent ensureBridge calls so one persisted bridge wins", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("lifecycle-start");
 
@@ -213,7 +237,6 @@ describe("workspace lifecycle serialization", () => {
       expect(a.runtime.workspaceId).toBe(workspace.id);
       expect(b.runtime.workspaceId).toBe(workspace.id);
       expect(a.runtime.pid).toBe(b.runtime.pid);
-      expect([a.spawned, b.spawned].filter(Boolean)).toHaveLength(1);
     } finally {
       await stopBridge(workspace.root).catch(() => false);
       await sleep(150);
@@ -272,6 +295,14 @@ describe("ticket-lock design", () => {
     expect(source).not.toContain("RECLAIM_FILE");
     expect(source).not.toContain(".reclaim.json");
   });
+
+  it("publishes ticket state with an atomic same-directory rename", () => {
+    const source = fs.readFileSync(path.resolve("src/process/workspace-lock.ts"), "utf8");
+    expect(source).toContain("fs.renameSync(temp, file)");
+    expect(source).toContain("randomUUID()}.tmp");
+    expect(source).toContain("fs.fsyncSync(fd)");
+    expect(source).not.toContain('fs.writeFileSync(file, JSON.stringify(ticket)');
+  });
 });
 
 describe("daemon source-mode fallback", () => {
@@ -282,13 +313,12 @@ describe("daemon source-mode fallback", () => {
     expect(source).toContain('"src", "cli", "index.ts"');
   });
 
-  it("passes an inherited lifecycle nonce to the child and validates it at the bridge startup boundary", () => {
+  it("does not pass parent lifecycle authority to the detached child", () => {
     const daemonSource = fs.readFileSync(path.resolve("src/process/daemon.ts"), "utf8");
     const bridgeSource = fs.readFileSync(path.resolve("src/bridge/server.ts"), "utf8");
-    expect(daemonSource).toContain("LIFECYCLE_LOCK_NONCE_ENV");
-    expect(daemonSource).toContain("LIFECYCLE_LOCK_WORKSPACE_ENV");
-    expect(bridgeSource).toContain("isWorkspaceLifecycleLockHeldBy");
-    expect(bridgeSource).toContain("LIFECYCLE_LOCK_NONCE_ENV");
-    expect(bridgeSource).toContain("LIFECYCLE_LOCK_WORKSPACE_ENV");
+    expect(daemonSource).not.toContain("LIFECYCLE_LOCK_NONCE_ENV");
+    expect(daemonSource).not.toContain("LIFECYCLE_LOCK_WORKSPACE_ENV");
+    expect(bridgeSource).not.toContain("isWorkspaceLifecycleLockHeldBy");
+    expect(bridgeSource).toContain("withWorkspaceLifecycleLock");
   });
 });
