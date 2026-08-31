@@ -15,12 +15,8 @@ import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { ensureOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
-import {
-  isWorkspaceLifecycleLockHeldBy,
-  LIFECYCLE_LOCK_NONCE_ENV,
-  LIFECYCLE_LOCK_WORKSPACE_ENV,
-  withWorkspaceLifecycleLock,
-} from "../process/workspace-lock.js";
+import { getProcessGeneration } from "../process/process-identity.js";
+import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { readRuntimeState, writeRuntimeState, type RuntimeState } from "./runtime.js";
 
@@ -30,6 +26,7 @@ interface RuntimeIdentityPayload {
   service?: string;
   workspaceId?: string;
   pid?: number;
+  processGeneration?: string | null;
   port?: number;
   startedAt?: string;
 }
@@ -58,7 +55,8 @@ function exactRuntimeIdentityMatches(runtime: RuntimeState, info: RuntimeIdentit
     info.workspaceId === runtime.workspaceId &&
     info.pid === runtime.pid &&
     info.port === runtime.port &&
-    info.startedAt === runtime.startedAt
+    info.startedAt === runtime.startedAt &&
+    (!runtime.processGeneration || info.processGeneration === runtime.processGeneration)
   );
 }
 
@@ -85,11 +83,6 @@ async function assertNoActivePersistedBridge(workspace: Workspace): Promise<void
   const existing = readRuntimeState(workspace.id);
   if (!existing) return;
 
-  // PID existence alone is not ownership: a stale bridge PID can be reused by
-  // an unrelated process. Prove the endpoint instead, using authenticated exact
-  // runtime identity first and C2C health/workspace identity as a conservative
-  // duplicate-Bridge fallback. If neither endpoint proves a bridge, the stale
-  // runtime must not block recovery/startup merely because its numeric PID lives.
   if (await persistedRuntimeIsLiveBridge(existing)) {
     throw new Error(`A persisted bridge runtime is already active for workspace ${workspace.id}`);
   }
@@ -138,9 +131,6 @@ export interface Bridge {
   close(): Promise<void>;
 }
 
-/**
- * Listen on the preferred port; on EADDRINUSE fall back to an ephemeral port.
- */
 function listen(app: express.Express, host: string, preferredPort: number): Promise<{ server: Server; port: number }> {
   return new Promise((resolve, reject) => {
     const tryListen = (port: number, allowFallback: boolean): void => {
@@ -163,24 +153,14 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
 }
 
 /**
- * The bridge startup boundary itself participates in the workspace lifecycle
- * lock. A daemon child spawned by ensureBridge may inherit the parent's opaque
- * nonce and proceed under that already-held lock. Direct callers acquire their
- * own lock, so no startup route can overlap `unpair` merely by bypassing the
- * daemon helper.
+ * Every bridge process owns its own startup critical section. No parent ticket
+ * is inherited or trusted. This means a detached child cannot resume using a
+ * dead parent's stale authority: it must acquire a ticket bound to its own OS
+ * process generation before reading tunnel/OAuth credentials or opening a
+ * listener. The ticket is released once runtime state has been published.
  */
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const workspace = new Workspace(opts.workspaceRoot);
-  const inheritedNonce = process.env[LIFECYCLE_LOCK_NONCE_ENV] ?? "";
-  const inheritedWorkspaceId = process.env[LIFECYCLE_LOCK_WORKSPACE_ENV] ?? "";
-  const inheritedLockIsValid =
-    inheritedWorkspaceId === workspace.id &&
-    isWorkspaceLifecycleLockHeldBy(workspace.id, inheritedNonce);
-
-  if (inheritedLockIsValid) {
-    return startBridgeUnlocked(opts, workspace);
-  }
-
   return withWorkspaceLifecycleLock(workspace.id, () => startBridgeUnlocked(opts, workspace));
 }
 
@@ -201,6 +181,7 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
   const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
+  const processGeneration = getProcessGeneration(process.pid);
 
   let publicBaseUrl: string | null = null;
 
@@ -215,15 +196,9 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
     return `${proto}://${hostHeader}`;
   };
 
-  // ---- Health (public but minimal; listener itself is loopback-only) --------
-
   app.get("/health", (_req, res) => {
     res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok" });
   });
-
-  // ---- OAuth + discovery ---------------------------------------------------
-  // Retained for the explicit Cloudflare fallback. In OpenAI mode the MCP
-  // endpoint uses a private per-workspace tunnel token instead.
 
   app.use(
     createOAuthRouter({
@@ -234,8 +209,6 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
       logger,
     })
   );
-
-  // ---- MCP endpoint ---------------------------------------------------------
 
   const mcpHandler = createMcpHttpHandler(() => createMcpServer({ workspace, logger }), logger);
   const mcpAuth =
@@ -251,10 +224,7 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
     }
   );
 
-  // ---- Admin API (loopback + admin token only; used by the CLI/Skill) --------
-
   const adminGuard = (req: Request, res: Response, next: NextFunction): void => {
-    // Defense in depth: reject anything that arrived through a proxy/tunnel.
     const remote = req.socket.remoteAddress ?? "";
     const isLoopback = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
     const viaProxy = Boolean(
@@ -266,7 +236,7 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
     const header = req.headers.authorization ?? "";
     const token = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
     if (!isLoopback || viaProxy || token !== adminToken) {
-      res.status(404).end(); // do not advertise the admin surface
+      res.status(404).end();
       return;
     }
     next();
@@ -292,6 +262,7 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
       tokenCount: authStore.tokenCount(),
       pairingActive: pairing.hasActiveSession(),
       pid: process.pid,
+      processGeneration,
       startedAt,
     });
   });
@@ -351,6 +322,7 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
       workspaceId: workspace.id,
       workspaceRoot: workspace.root,
       pid: process.pid,
+      processGeneration,
       port,
       adminToken,
       publicUrl: publicBaseUrl,
@@ -368,11 +340,6 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
     if (persistRuntimeEnabled) activePersistedBridges.delete(workspace.id);
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    // Do not unlink the workspace runtime file here. A replacement bridge may
-    // already have overwritten it; deleting by workspace id would erase that
-    // newer generation's identity. Stale runtime files are harmless because
-    // destructive operations authenticate an exact runtime snapshot first,
-    // and the next bridge startup overwrites the file.
     logger.info("Bridge stopped");
   };
 
