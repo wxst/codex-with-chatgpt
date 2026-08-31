@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { acquireWorkspaceLifecycleLock } from "../src/process/workspace-lock.js";
-import { ensureBridge } from "../src/process/daemon.js";
+import { ensureBridge, stopBridge } from "../src/process/daemon.js";
 import { revokeWorkspaceAccess } from "../src/auth/revoke.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
@@ -49,14 +49,20 @@ describe("workspace lifecycle serialization", () => {
   it("serializes concurrent ensureBridge calls so only one startup path wins", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("lifecycle-start");
-    const first = ensureBridge(workspace.root);
-    const second = ensureBridge(workspace.root);
 
-    const [a, b] = await Promise.all([first, second]);
-    expect(a.runtime.workspaceId).toBe(workspace.id);
-    expect(b.runtime.workspaceId).toBe(workspace.id);
-    expect(a.runtime.pid).toBe(b.runtime.pid);
-    expect([a.spawned, b.spawned].filter(Boolean)).toHaveLength(1);
+    try {
+      const first = ensureBridge(workspace.root);
+      const second = ensureBridge(workspace.root);
+      const [a, b] = await Promise.all([first, second]);
+
+      expect(a.runtime.workspaceId).toBe(workspace.id);
+      expect(b.runtime.workspaceId).toBe(workspace.id);
+      expect(a.runtime.pid).toBe(b.runtime.pid);
+      expect([a.spawned, b.spawned].filter(Boolean)).toHaveLength(1);
+    } finally {
+      await stopBridge(workspace.root).catch(() => false);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
   }, 30_000);
 });
 
