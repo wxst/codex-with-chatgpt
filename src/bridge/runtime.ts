@@ -180,30 +180,20 @@ export function listRuntimeStates(workspaceId: string): RuntimeState[] {
 }
 
 /**
- * Remove only one exact generation. The canonical mirror is compare-and-deleted
- * only when it still names the same generation, so a replacement generation's
- * state can never be erased by cleanup of an older Bridge.
+ * Remove only one authoritative generation file. The canonical compatibility
+ * mirror is intentionally never unlinked here: compare-then-unlink cannot be
+ * made atomic with concurrent mirror writers and could delete a replacement's
+ * newly-renamed snapshot. Security-sensitive callers use the generation
+ * registry; leaving a stale mirror is safer than deleting another generation's
+ * compatibility state.
  */
 export function removeRuntimeStateGeneration(state: RuntimeState): void {
   const dir = runtimeRegistryDir(state.workspaceId, false);
-  if (fs.existsSync(dir)) {
-    try {
-      fs.rmSync(path.join(dir, `${runtimeGenerationKey(state)}.json`), { force: true });
-    } catch {
-      // Callers re-list and fail closed if the generation remains.
-    }
-  }
-
-  const canonical = runtimeFile(state.workspaceId);
-  if (!fs.existsSync(canonical)) return;
+  if (!fs.existsSync(dir)) return;
   try {
-    const current = readRuntimeStrict(canonical, state.workspaceId);
-    if (runtimeIdentity(current) === runtimeIdentity(state)) {
-      fs.rmSync(canonical, { force: true });
-    }
+    fs.rmSync(path.join(dir, `${runtimeGenerationKey(state)}.json`), { force: true });
   } catch {
-    // Preserve malformed/unreadable state so the next security-sensitive list
-    // fails closed instead of silently deleting evidence we cannot identify.
+    // Callers re-list and fail closed if the generation remains.
   }
 }
 
