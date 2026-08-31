@@ -63,28 +63,34 @@ export function lifecycleTicketFile(workspaceId: string, nonce: string): string 
 function parseTicket(content: string): LifecycleTicket | null {
   try {
     const value = JSON.parse(content) as Partial<LifecycleTicket>;
+    const pid = value.pid;
+    const nonce = value.nonce;
+    const ticketNumber = value.number;
+    const createdAt = value.createdAt;
     if (
-      !Number.isSafeInteger(value.pid) ||
-      (value.pid ?? 0) <= 0 ||
-      typeof value.nonce !== "string" ||
-      !/^[A-Za-z0-9_-]{8,}$/.test(value.nonce) ||
-      !Number.isSafeInteger(value.number) ||
-      (value.number ?? -1) < 0 ||
-      typeof value.createdAt !== "string" ||
-      !Number.isFinite(Date.parse(value.createdAt))
+      typeof pid !== "number" ||
+      !Number.isSafeInteger(pid) ||
+      pid <= 0 ||
+      typeof nonce !== "string" ||
+      !/^[A-Za-z0-9_-]{8,}$/.test(nonce) ||
+      typeof ticketNumber !== "number" ||
+      !Number.isSafeInteger(ticketNumber) ||
+      ticketNumber < 0 ||
+      typeof createdAt !== "string" ||
+      !Number.isFinite(Date.parse(createdAt))
     ) {
       return null;
     }
 
     return {
-      pid: value.pid,
-      nonce: value.nonce,
-      number: value.number,
+      pid,
+      nonce,
+      number: ticketNumber,
       // Older/manual fixtures with a positive ticket number represent a fully
       // chosen ticket. Production always writes these fields explicitly.
-      choosing: value.choosing ?? value.number === 0,
-      acquired: value.acquired ?? value.number > 0,
-      createdAt: value.createdAt,
+      choosing: value.choosing ?? ticketNumber === 0,
+      acquired: value.acquired ?? ticketNumber > 0,
+      createdAt,
     };
   } catch {
     return null;
