@@ -157,11 +157,6 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
   });
 }
 
-/**
- * Detached children never inherit lifecycle authority. They acquire their own
- * ticket and, when spawned by ensureBridge, must also present a durable pending
- * start intent that `unpair` can cancel during the parent→child handoff gap.
- */
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const workspace = new Workspace(opts.workspaceRoot);
   const pendingStartId = opts.pendingStartId ?? process.env[PENDING_START_ENV];
@@ -345,7 +340,19 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
     if (!persistRuntimeEnabled) return;
     writeRuntimeState(runtimeState());
   };
-  persistRuntime();
+
+  try {
+    persistRuntime();
+  } catch (error) {
+    // A listener that cannot publish its authoritative generation must never
+    // remain alive as an untracked Bridge. Roll back while the lifecycle lock is
+    // still held, then let the pending-start wrapper fail closed.
+    await tunnel.stop().catch(() => undefined);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (persistRuntimeEnabled) removeRuntimeStateGeneration(runtimeState());
+    throw error;
+  }
+
   if (persistRuntimeEnabled) activePersistedBridges.add(workspace.id);
 
   let closed = false;
