@@ -49,10 +49,14 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
 
     let revokedLegacy = false;
     let stopped = false;
+    let liveChecks = 0;
     const fakeRuntime = { port: 48765, adminToken: "test" } as never;
 
     const result = await revokeWorkspaceAccess(workspace.root, {
-      findLiveBridge: async () => fakeRuntime,
+      findLiveBridge: async () => {
+        liveChecks += 1;
+        return liveChecks === 1 ? fakeRuntime : null;
+      },
       adminFetch: async () => {
         revokedLegacy = true;
         return { revoked: 1 };
@@ -65,11 +69,17 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
 
     expect(revokedLegacy).toBe(true);
     expect(stopped).toBe(true);
+    expect(liveChecks).toBeGreaterThanOrEqual(2);
     expect(result.transportMode).toBe("openai");
     expect(result.tunnelCredentialRevoked).toBe(true);
     expect(result.bridgeStopped).toBe(true);
     expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
     expect(ensureOpenAITunnelToken(workspace.id)).not.toBe(before);
+  });
+
+  it("wires the CLI unpair command through the hardened revocation path", () => {
+    const cli = fs.readFileSync(path.join(projectRoot, "src", "cli", "index.ts"), "utf8");
+    expect(cli).toContain("await revokeWorkspaceAccess(root)");
   });
 });
 
