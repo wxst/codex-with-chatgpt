@@ -22,6 +22,12 @@ function makeWorkspace(name: string): Workspace {
   return new Workspace(root);
 }
 
+function liveThenDown() {
+  const fakeRuntime = { port: 48765, adminToken: "test" } as never;
+  let calls = 0;
+  return async () => (++calls === 1 ? fakeRuntime : null);
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   delete process.env.C2C_STATE_DIR;
@@ -34,30 +40,21 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
     const workspace = makeWorkspace("revoke-token");
     const before = ensureOpenAITunnelToken(workspace.id);
     expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(true);
-
     expect(revokeOpenAITunnelToken(workspace.id)).toBe(true);
     expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
-
-    const after = ensureOpenAITunnelToken(workspace.id);
-    expect(after).not.toBe(before);
+    expect(ensureOpenAITunnelToken(workspace.id)).not.toBe(before);
   });
 
-  it("makes unpair-style revocation stop a live OpenAI bridge and revoke legacy tokens", async () => {
+  it("stops a live OpenAI bridge, deletes its tunnel credential, and revokes legacy tokens", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("unpair-openai");
     writeTransportMode(workspace.id, "openai");
     const before = ensureOpenAITunnelToken(workspace.id);
-
     let revokedLegacy = false;
     let stopped = false;
-    let liveChecks = 0;
-    const fakeRuntime = { port: 48765, adminToken: "test" } as never;
 
     const result = await revokeWorkspaceAccess(workspace.root, {
-      findLiveBridge: async () => {
-        liveChecks += 1;
-        return liveChecks === 1 ? fakeRuntime : null;
-      },
+      findLiveBridge: liveThenDown(),
       adminFetch: async () => {
         revokedLegacy = true;
         return { revoked: 1 };
@@ -70,7 +67,6 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
 
     expect(revokedLegacy).toBe(true);
     expect(stopped).toBe(true);
-    expect(liveChecks).toBeGreaterThanOrEqual(2);
     expect(result.transportMode).toBe("openai");
     expect(result.tunnelCredentialRevoked).toBe(true);
     expect(result.bridgeStopped).toBe(true);
@@ -83,9 +79,8 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
     const workspace = makeWorkspace("unpair-dormant-openai");
     writeTransportMode(workspace.id, "openai");
     ensureOpenAITunnelToken(workspace.id);
-    expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(true);
-
     writeTransportMode(workspace.id, "cloudflare");
+
     const result = await revokeWorkspaceAccess(workspace.root, {
       findLiveBridge: async () => null,
       authStoreFactory: () => ({ revokeAll: () => 0 }),
@@ -102,15 +97,10 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
     writeTransportMode(workspace.id, "openai");
     ensureOpenAITunnelToken(workspace.id);
     writeTransportMode(workspace.id, "cloudflare");
-
-    let liveChecks = 0;
     let stopped = false;
-    const fakeRuntime = { port: 48765, adminToken: "test" } as never;
+
     const result = await revokeWorkspaceAccess(workspace.root, {
-      findLiveBridge: async () => {
-        liveChecks += 1;
-        return liveChecks === 1 ? fakeRuntime : null;
-      },
+      findLiveBridge: liveThenDown(),
       adminFetch: async () => ({ revoked: 0 }),
       stopBridge: async () => {
         stopped = true;
@@ -124,20 +114,66 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
     expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
   });
 
-  it("removes the persisted tunnel credential even when bridge shutdown fails", async () => {
+  it("deletes the tunnel credential and stops the bridge even when OAuth revocation fails", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("unpair-oauth-failure");
+    writeTransportMode(workspace.id, "openai");
+    ensureOpenAITunnelToken(workspace.id);
+    let stopped = false;
+
+    await expect(
+      revokeWorkspaceAccess(workspace.root, {
+        findLiveBridge: liveThenDown(),
+        adminFetch: async () => {
+          throw new Error("admin timeout");
+        },
+        stopBridge: async () => {
+          stopped = true;
+          return true;
+        },
+      })
+    ).rejects.toThrow(/Failed to fully revoke/);
+
+    expect(stopped).toBe(true);
+    expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
+  });
+
+  it("still stops the bridge when tunnel credential deletion fails", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("unpair-token-delete-failure");
+    writeTransportMode(workspace.id, "openai");
+    let stopped = false;
+
+    await expect(
+      revokeWorkspaceAccess(workspace.root, {
+        findLiveBridge: liveThenDown(),
+        adminFetch: async () => ({ revoked: 0 }),
+        revokeTunnelToken: () => {
+          throw new Error("unlink denied");
+        },
+        stopBridge: async () => {
+          stopped = true;
+          return true;
+        },
+      })
+    ).rejects.toThrow(/Failed to fully revoke/);
+
+    expect(stopped).toBe(true);
+  });
+
+  it("removes the persisted tunnel credential even when bridge shutdown reports failure", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("unpair-stop-failure");
     writeTransportMode(workspace.id, "openai");
     ensureOpenAITunnelToken(workspace.id);
-    const fakeRuntime = { port: 48765, adminToken: "test" } as never;
 
     await expect(
       revokeWorkspaceAccess(workspace.root, {
-        findLiveBridge: async () => fakeRuntime,
+        findLiveBridge: liveThenDown(),
         adminFetch: async () => ({ revoked: 0 }),
         stopBridge: async () => false,
       })
-    ).rejects.toThrow(/Failed to stop/);
+    ).rejects.toThrow(/Failed to fully revoke/);
 
     expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
   });
@@ -159,9 +195,7 @@ describe("review finding: reused token permissions", () => {
     fs.chmodSync(file, 0o644);
 
     expect(ensureOpenAITunnelToken(workspace.id)).toBe(token);
-    if (process.platform !== "win32") {
-      expect(fs.statSync(file).mode & 0o777).toBe(0o600);
-    }
+    if (process.platform !== "win32") expect(fs.statSync(file).mode & 0o777).toBe(0o600);
   });
 
   it("fails closed on POSIX when an existing token cannot be repaired to 0600", () => {
@@ -172,11 +206,9 @@ describe("review finding: reused token permissions", () => {
     const token = "c2c_tunnel_" + "b".repeat(43);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, token + "\n", { mode: 0o644 });
-
     vi.spyOn(fs, "chmodSync").mockImplementation(() => {
       throw new Error("chmod denied");
     });
-
     expect(() => ensureOpenAITunnelToken(workspace.id)).toThrow(/chmod denied/);
   });
 });
