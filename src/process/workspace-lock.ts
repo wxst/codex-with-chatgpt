@@ -5,26 +5,20 @@ import { stateSubdir } from "../config/paths.js";
 
 export const LIFECYCLE_LOCK_NONCE_ENV = "C2C_LIFECYCLE_LOCK_NONCE";
 export const LIFECYCLE_LOCK_WORKSPACE_ENV = "C2C_LIFECYCLE_LOCK_WORKSPACE";
-export const RECLAIM_FILE = ".reclaim.json";
 
-interface LockOwner {
+interface LifecycleTicket {
   pid: number;
   nonce: string;
-  acquiredAt: string;
+  number: number;
+  choosing: boolean;
+  acquired: boolean;
+  createdAt: string;
 }
 
-interface ReclaimClaim {
-  expectedNonce: string | null;
-  claimantNonce: string;
-  claimedAt: string;
-}
-
-interface LockGenerationSnapshot {
-  owner: LockOwner | null;
-  dirDev: number;
-  dirIno: number;
-  dirBirthtimeMs: number;
-  leaseMtimeMs: number;
+interface TicketEntry {
+  file: string;
+  mtimeMs: number;
+  ticket: LifecycleTicket | null;
 }
 
 export interface WorkspaceLifecycleLockOptions {
@@ -41,6 +35,7 @@ export interface WorkspaceLifecycleLock {
 
 const DEFAULT_ORPHAN_GRACE_MS = 30_000;
 const DEFAULT_HEARTBEAT_MS = 1_000;
+const TICKET_SUFFIX = ".ticket.json";
 
 function assertWorkspaceId(workspaceId: string): void {
   if (!/^[A-Za-z0-9._-]+$/.test(workspaceId)) {
@@ -48,179 +43,153 @@ function assertWorkspaceId(workspaceId: string): void {
   }
 }
 
-function lockDirectory(workspaceId: string): string {
+function assertNonce(nonce: string): void {
+  if (!/^[A-Za-z0-9_-]{8,}$/.test(nonce)) {
+    throw new Error("Invalid lifecycle ticket nonce");
+  }
+}
+
+function ticketPrefix(workspaceId: string): string {
   assertWorkspaceId(workspaceId);
-  return path.join(stateSubdir("locks"), `${workspaceId}.lifecycle.lock`);
+  return `${workspaceId}.lifecycle.`;
 }
 
-function ownerFile(lockDir: string): string {
-  return path.join(lockDir, "owner.json");
+export function lifecycleTicketFile(workspaceId: string, nonce: string): string {
+  const prefix = ticketPrefix(workspaceId);
+  assertNonce(nonce);
+  return path.join(stateSubdir("locks"), `${prefix}${nonce}${TICKET_SUFFIX}`);
 }
 
-function reclaimFile(lockDir: string): string {
-  return path.join(lockDir, RECLAIM_FILE);
-}
-
-function readOwner(lockDir: string): LockOwner | null {
+function parseTicket(content: string): LifecycleTicket | null {
   try {
-    const value = JSON.parse(fs.readFileSync(ownerFile(lockDir), "utf8")) as Partial<LockOwner>;
+    const value = JSON.parse(content) as Partial<LifecycleTicket>;
     if (
       !Number.isSafeInteger(value.pid) ||
       (value.pid ?? 0) <= 0 ||
       typeof value.nonce !== "string" ||
-      value.nonce.length < 8 ||
-      typeof value.acquiredAt !== "string" ||
-      !Number.isFinite(Date.parse(value.acquiredAt))
+      !/^[A-Za-z0-9_-]{8,}$/.test(value.nonce) ||
+      !Number.isSafeInteger(value.number) ||
+      (value.number ?? -1) < 0 ||
+      typeof value.createdAt !== "string" ||
+      !Number.isFinite(Date.parse(value.createdAt))
     ) {
       return null;
     }
-    return value as LockOwner;
-  } catch {
-    return null;
-  }
-}
 
-function readReclaimClaim(lockDir: string): ReclaimClaim | null {
-  try {
-    const value = JSON.parse(fs.readFileSync(reclaimFile(lockDir), "utf8")) as Partial<ReclaimClaim>;
-    if (
-      (value.expectedNonce !== null && typeof value.expectedNonce !== "string") ||
-      typeof value.claimantNonce !== "string" ||
-      value.claimantNonce.length < 8 ||
-      typeof value.claimedAt !== "string" ||
-      !Number.isFinite(Date.parse(value.claimedAt))
-    ) {
-      return null;
-    }
-    return value as ReclaimClaim;
-  } catch {
-    return null;
-  }
-}
-
-function leaseMtimeMs(lockDir: string, owner: LockOwner | null): number {
-  try {
-    return owner ? fs.statSync(ownerFile(lockDir)).mtimeMs : fs.statSync(lockDir).mtimeMs;
-  } catch {
-    return 0;
-  }
-}
-
-function leaseIsFresh(lockDir: string, owner: LockOwner | null, graceMs: number): boolean {
-  const mtimeMs = leaseMtimeMs(lockDir, owner);
-  return mtimeMs > 0 && Date.now() - mtimeMs < graceMs;
-}
-
-function snapshotGeneration(lockDir: string): LockGenerationSnapshot | null {
-  try {
-    const dir = fs.statSync(lockDir);
-    const owner = readOwner(lockDir);
     return {
-      owner,
-      dirDev: dir.dev,
-      dirIno: dir.ino,
-      dirBirthtimeMs: dir.birthtimeMs,
-      leaseMtimeMs: leaseMtimeMs(lockDir, owner),
+      pid: value.pid,
+      nonce: value.nonce,
+      number: value.number,
+      // Older/manual fixtures with a positive ticket number represent a fully
+      // chosen ticket. Production always writes these fields explicitly.
+      choosing: value.choosing ?? value.number === 0,
+      acquired: value.acquired ?? value.number > 0,
+      createdAt: value.createdAt,
     };
   } catch {
     return null;
   }
 }
 
-function sameDirectoryGeneration(lockDir: string, observed: LockGenerationSnapshot): boolean {
-  try {
-    const current = fs.statSync(lockDir);
-    return (
-      current.dev === observed.dirDev &&
-      current.ino === observed.dirIno &&
-      current.birthtimeMs === observed.dirBirthtimeMs
-    );
-  } catch {
-    return false;
-  }
+function ticketIsFresh(entry: TicketEntry, graceMs: number): boolean {
+  return entry.mtimeMs > 0 && Date.now() - entry.mtimeMs < graceMs;
 }
 
-function removeReclaimIfOwned(lockDir: string, claimantNonce: string): void {
-  const claim = readReclaimClaim(lockDir);
-  if (!claim || claim.claimantNonce !== claimantNonce) return;
+function listTickets(workspaceId: string): TicketEntry[] {
+  const dir = stateSubdir("locks");
+  const prefix = ticketPrefix(workspaceId);
+  let names: string[];
   try {
-    fs.unlinkSync(reclaimFile(lockDir));
+    names = fs.readdirSync(dir);
   } catch {
-    // Another actor may already have moved/reclaimed this generation.
+    return [];
   }
-}
 
-function reclaimClaimIsStale(lockDir: string, graceMs: number): boolean {
-  try {
-    return Date.now() - fs.statSync(reclaimFile(lockDir)).mtimeMs >= graceMs;
-  } catch {
-    return false;
-  }
-}
-
-function tryCreateReclaimClaim(
-  lockDir: string,
-  expectedNonce: string | null,
-  graceMs: number
-): string | null {
-  const claimantNonce = randomUUID();
-  const claim: ReclaimClaim = {
-    expectedNonce,
-    claimantNonce,
-    claimedAt: new Date().toISOString(),
-  };
-
-  try {
-    fs.writeFileSync(reclaimFile(lockDir), JSON.stringify(claim), { mode: 0o600, flag: "wx" });
+  const entries: TicketEntry[] = [];
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith(TICKET_SUFFIX)) continue;
+    const file = path.join(dir, name);
     try {
-      fs.chmodSync(reclaimFile(lockDir), 0o600);
+      const stat = fs.statSync(file);
+      if (!stat.isFile()) continue;
+      entries.push({
+        file,
+        mtimeMs: stat.mtimeMs,
+        ticket: parseTicket(fs.readFileSync(file, "utf8")),
+      });
     } catch {
-      // Windows ACLs do not reliably map to POSIX mode bits.
+      // A ticket can disappear only when its own owner releases it. Ignore the
+      // raced-away entry and rescan on the next acquisition iteration.
     }
-    return claimantNonce;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return null;
-    if (code !== "EEXIST") throw error;
   }
-
-  // A reclaimer can itself crash. After a full lease interval, another waiter
-  // may clear only that exact reclaim claim and retry. The original claimant
-  // rechecks ownership before rename, so a resumed stale claimant cannot act.
-  const existing = readReclaimClaim(lockDir);
-  if (existing && reclaimClaimIsStale(lockDir, graceMs)) {
-    removeReclaimIfOwned(lockDir, existing.claimantNonce);
-  }
-  return null;
+  return entries;
 }
 
-function reclaimClaimStillOwned(lockDir: string, claimantNonce: string): boolean {
-  return readReclaimClaim(lockDir)?.claimantNonce === claimantNonce;
+function writeTicket(file: string, ticket: LifecycleTicket): void {
+  fs.writeFileSync(file, JSON.stringify(ticket), { mode: 0o600 });
+  if (process.platform !== "win32") {
+    fs.chmodSync(file, 0o600);
+  } else {
+    try {
+      fs.chmodSync(file, 0o600);
+    } catch {
+      // Windows ACL semantics do not reliably map to POSIX mode bits.
+    }
+  }
 }
 
-function refreshOwnerHeartbeat(lockDir: string, nonce: string): boolean {
-  const current = readOwner(lockDir);
-  if (!current || current.nonce !== nonce || current.pid !== process.pid) return false;
+function compareTickets(a: LifecycleTicket, b: LifecycleTicket): number {
+  if (a.number !== b.number) return a.number - b.number;
+  return a.nonce.localeCompare(b.nonce);
+}
 
-  // Once a stale takeover has an exclusive claim, stop renewing the old lease.
-  // Keep the timer alive so it can resume if the claimant aborts and removes
-  // its marker after discovering a generation mismatch/fresh heartbeat.
-  if (fs.existsSync(reclaimFile(lockDir))) return true;
-
+function refreshTicket(file: string, nonce: string, graceMs: number): boolean {
   try {
+    const stat = fs.statSync(file);
+    const ticket = parseTicket(fs.readFileSync(file, "utf8"));
+    if (!ticket || ticket.nonce !== nonce) return false;
+
+    // A lease that has already expired must never be resurrected by a delayed
+    // timer after a long event-loop/system pause. Once expired, this generation
+    // is fenced and future contenders may ignore it.
+    if (Date.now() - stat.mtimeMs >= graceMs) return false;
+
     const now = new Date();
-    fs.utimesSync(ownerFile(lockDir), now, now);
+    fs.utimesSync(file, now, now);
     return true;
   } catch {
     return false;
   }
 }
 
+function removeOwnTicket(file: string, nonce: string): void {
+  try {
+    const ticket = parseTicket(fs.readFileSync(file, "utf8"));
+    if (!ticket || ticket.nonce !== nonce) return;
+    fs.unlinkSync(file);
+  } catch {
+    // Already released or removed by state cleanup outside this process.
+  }
+}
+
+function ownTicketEntry(workspaceId: string, nonce: string): TicketEntry | null {
+  const file = lifecycleTicketFile(workspaceId, nonce);
+  try {
+    const stat = fs.statSync(file);
+    return {
+      file,
+      mtimeMs: stat.mtimeMs,
+      ticket: parseTicket(fs.readFileSync(file, "utf8")),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Verify an inherited startup nonce against the current lock generation and its
- * heartbeat lease. PID existence is intentionally not used as ownership proof:
- * PIDs can be reused by unrelated processes, while the nonce+heartbeat pair is
- * unique to this lock generation.
+ * Verify inherited startup proof against a unique, acquired, fresh ticket.
+ * No shared pathname is reclaimed or deleted, so a stale generation cannot be
+ * confused with a successor generation at the same path.
  */
 export function isWorkspaceLifecycleLockHeldBy(
   workspaceId: string,
@@ -228,64 +197,24 @@ export function isWorkspaceLifecycleLockHeldBy(
   orphanGraceMs = DEFAULT_ORPHAN_GRACE_MS
 ): boolean {
   if (!nonce) return false;
-  const lockDir = lockDirectory(workspaceId);
-  const owner = readOwner(lockDir);
-  if (!owner || owner.nonce !== nonce) return false;
-  if (fs.existsSync(reclaimFile(lockDir))) return false;
-  return leaseIsFresh(lockDir, owner, orphanGraceMs);
-}
-
-function tryReclaimStaleLock(lockDir: string, orphanGraceMs: number): boolean {
-  const observed = snapshotGeneration(lockDir);
-  if (!observed) return true;
-  if (Date.now() - observed.leaseMtimeMs < orphanGraceMs) return false;
-
-  const expectedNonce = observed.owner?.nonce ?? null;
-  const claimantNonce = tryCreateReclaimClaim(lockDir, expectedNonce, orphanGraceMs);
-  if (!claimantNonce) return false;
-
+  let own: TicketEntry | null;
   try {
-    // The exclusive marker is only a right to inspect/reclaim the generation we
-    // observed. It is not permission to delete whatever later appears at the
-    // same pathname. Bind takeover to directory identity and owner nonce.
-    if (!reclaimClaimStillOwned(lockDir, claimantNonce)) return false;
-    if (!sameDirectoryGeneration(lockDir, observed)) return false;
-
-    const current = readOwner(lockDir);
-    if (expectedNonce === null) {
-      if (current !== null) return false;
-    } else {
-      if (!current || current.nonce !== observed.owner?.nonce) return false;
-      // Keep this exact expression covered by regression tests: a waiter that
-      // observes an old generation must never delete a newer owner.
-      if (current.nonce !== observed.owner.nonce) return false;
-      if (leaseIsFresh(lockDir, current, orphanGraceMs)) return false;
-    }
-
-    if (!reclaimClaimStillOwned(lockDir, claimantNonce)) return false;
-
-    // Release observes RECLAIM_FILE and will not remove/replace this directory,
-    // so once the marker is ours the pathname cannot legitimately switch to a
-    // new lock generation between this verification and the atomic rename.
-    const quarantine = `${lockDir}.reclaimed-${expectedNonce ?? "ownerless"}-${claimantNonce}`;
-    try {
-      fs.renameSync(lockDir, quarantine);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "EEXIST" || code === "ENOTEMPTY") return false;
-      throw error;
-    }
-
-    try {
-      fs.rmSync(quarantine, { recursive: true, force: true });
-    } catch {
-      // The active lock pathname is already free. A leftover quarantine has a
-      // generation-specific name and cannot be mistaken for the live lock.
-    }
-    return true;
-  } finally {
-    removeReclaimIfOwned(lockDir, claimantNonce);
+    own = ownTicketEntry(workspaceId, nonce);
+  } catch {
+    return false;
   }
+  if (!own || !own.ticket || !own.ticket.acquired || own.ticket.choosing) return false;
+  if (!ticketIsFresh(own, orphanGraceMs)) return false;
+
+  // Defensive split-brain detection: an acquired ticket must remain the first
+  // fresh finalized ticket in the total order.
+  for (const entry of listTickets(workspaceId)) {
+    if (!ticketIsFresh(entry, orphanGraceMs) || !entry.ticket) continue;
+    const ticket = entry.ticket;
+    if (ticket.nonce === nonce || ticket.choosing || ticket.number <= 0) continue;
+    if (ticket.acquired && compareTickets(ticket, own.ticket) < 0) return false;
+  }
+  return true;
 }
 
 export async function acquireWorkspaceLifecycleLock(
@@ -297,68 +226,102 @@ export async function acquireWorkspaceLifecycleLock(
   const pollMs = options.pollMs ?? 50;
   const orphanGraceMs = options.orphanGraceMs ?? DEFAULT_ORPHAN_GRACE_MS;
   const heartbeatMs = Math.max(10, Math.min(DEFAULT_HEARTBEAT_MS, Math.floor(orphanGraceMs / 4)));
-  const lockDir = lockDirectory(workspaceId);
   const nonce = randomUUID();
+  const file = lifecycleTicketFile(workspaceId, nonce);
   const deadline = Date.now() + timeoutMs;
+  let heartbeat: NodeJS.Timeout | null = null;
+  let released = false;
 
-  while (true) {
-    try {
-      fs.mkdirSync(lockDir, { mode: 0o700 });
-      fs.writeFileSync(
-        ownerFile(lockDir),
-        JSON.stringify({ pid: process.pid, nonce, acquiredAt: new Date().toISOString() } satisfies LockOwner),
-        { mode: 0o600, flag: "wx" }
-      );
-      try {
-        fs.chmodSync(lockDir, 0o700);
-        fs.chmodSync(ownerFile(lockDir), 0o600);
-      } catch {
-        // Windows ACLs do not reliably map to POSIX mode bits.
+  const createdAt = new Date().toISOString();
+  let ticket: LifecycleTicket = {
+    pid: process.pid,
+    nonce,
+    number: 0,
+    choosing: true,
+    acquired: false,
+    createdAt,
+  };
+
+  try {
+    fs.writeFileSync(file, JSON.stringify(ticket), { mode: 0o600, flag: "wx" });
+    if (process.platform !== "win32") fs.chmodSync(file, 0o600);
+
+    // Heartbeat starts before number selection so a live waiter cannot age out
+    // while queued behind a long-running holder.
+    heartbeat = setInterval(() => {
+      if (!refreshTicket(file, nonce, orphanGraceMs) && heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = null;
+      }
+    }, heartbeatMs);
+    heartbeat.unref();
+
+    const initial = listTickets(workspaceId).filter((entry) => ticketIsFresh(entry, orphanGraceMs));
+    let maxNumber = 0;
+    for (const entry of initial) {
+      if (!entry.ticket || entry.ticket.nonce === nonce) continue;
+      if (entry.ticket.number > maxNumber) maxNumber = entry.ticket.number;
+    }
+
+    ticket = { ...ticket, number: maxNumber + 1, choosing: false };
+    writeTicket(file, ticket);
+
+    while (true) {
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for workspace lifecycle lock: ${workspaceId}`);
       }
 
-      let released = false;
-      const heartbeat = setInterval(() => {
-        if (!refreshOwnerHeartbeat(lockDir, nonce)) clearInterval(heartbeat);
-      }, heartbeatMs);
-      heartbeat.unref();
+      const own = ownTicketEntry(workspaceId, nonce);
+      if (!own || !own.ticket || !ticketIsFresh(own, orphanGraceMs)) {
+        throw new Error(`Workspace lifecycle ticket was lost or expired: ${workspaceId}`);
+      }
+      ticket = own.ticket;
 
-      return {
-        nonce,
-        release(): void {
-          if (released) return;
-          released = true;
-          clearInterval(heartbeat);
-          const current = readOwner(lockDir);
-          if (!current || current.nonce !== nonce || current.pid !== process.pid) return;
-
-          // A generation-safe reclaimer has fenced this owner. Do not remove the
-          // directory and create a pathname-reuse race underneath its takeover.
-          if (fs.existsSync(reclaimFile(lockDir))) return;
-          fs.rmSync(lockDir, { recursive: true, force: true });
-        },
-      };
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") {
-        // If owner-file creation failed after mkdir, remove only the directory
-        // that still has no valid owner. Never disturb an established lock.
-        const current = readOwner(lockDir);
-        if (!current) {
-          try {
-            fs.rmSync(lockDir, { recursive: true, force: true });
-          } catch {
-            // Preserve the original error.
-          }
+      let blocked = false;
+      for (const entry of listTickets(workspaceId)) {
+        if (!ticketIsFresh(entry, orphanGraceMs)) continue;
+        if (!entry.ticket) {
+          // A fresh truncated/partial ticket may belong to a process between
+          // create and write. Wait for it to become valid or naturally expire.
+          blocked = true;
+          break;
         }
-        throw error;
+        const other = entry.ticket;
+        if (other.nonce === nonce) continue;
+        if (other.choosing || other.number <= 0) {
+          blocked = true;
+          break;
+        }
+        if (compareTickets(other, ticket) < 0) {
+          blocked = true;
+          break;
+        }
       }
+
+      if (!blocked) {
+        ticket = { ...ticket, acquired: true };
+        writeTicket(file, ticket);
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
 
-    if (tryReclaimStaleLock(lockDir, orphanGraceMs)) continue;
-    if (Date.now() >= deadline) {
-      throw new Error(`Timed out waiting for workspace lifecycle lock: ${workspaceId}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    return {
+      nonce,
+      release(): void {
+        if (released) return;
+        released = true;
+        if (heartbeat) {
+          clearInterval(heartbeat);
+          heartbeat = null;
+        }
+        removeOwnTicket(file, nonce);
+      },
+    };
+  } catch (error) {
+    if (heartbeat) clearInterval(heartbeat);
+    removeOwnTicket(file, nonce);
+    throw error;
   }
 }
 
