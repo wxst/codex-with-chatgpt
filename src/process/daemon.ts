@@ -3,9 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Workspace } from "../workspace/manager.js";
-import { Logger } from "../logger/index.js";
 import { stateSubdir } from "../config/paths.js";
-import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
+import { findLiveBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const cliEntry = path.resolve(moduleDir, "../cli/index.js");
@@ -14,13 +13,43 @@ function daemonLogFile(workspaceId: string): string {
   return path.join(stateSubdir("logs"), `bridge-${workspaceId}.out.log`);
 }
 
+/**
+ * Open a daemon log for append while repairing permissions on reused files.
+ * Existing files do not honor the mode argument to open(2), so POSIX systems
+ * explicitly fchmod and verify the descriptor before any bridge output is
+ * handed to it.
+ */
+export function openPrivateAppendFile(file: string): number {
+  const fd = fs.openSync(file, "a", 0o600);
+  try {
+    if (process.platform === "win32") {
+      try {
+        fs.fchmodSync(fd, 0o600);
+      } catch {
+        // Windows ACLs do not reliably map to POSIX mode bits.
+      }
+      return fd;
+    }
+
+    fs.fchmodSync(fd, 0o600);
+    const mode = fs.fstatSync(fd).mode & 0o777;
+    if (mode !== 0o600) {
+      throw new Error(`Daemon log permissions are not owner-only (expected 0600): ${file}`);
+    }
+    return fd;
+  } catch (error) {
+    fs.closeSync(fd);
+    throw error;
+  }
+}
+
 export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: RuntimeState; spawned: boolean }> {
   const workspace = new Workspace(workspaceRoot);
   const existing = await findLiveBridge(workspace.id);
   if (existing) return { runtime: existing, spawned: false };
 
   const logFile = daemonLogFile(workspace.id);
-  const logFd = fs.openSync(logFile, "a", 0o600);
+  const logFd = openPrivateAppendFile(logFile);
   const child = spawn(process.execPath, [cliEntry, "serve", "--workspace", workspace.root], {
     detached: true,
     stdio: ["ignore", logFd, logFd],
@@ -65,40 +94,57 @@ export async function adminFetch<T = unknown>(
   }
 }
 
-export async function stopBridge(workspaceRoot: string): Promise<boolean> {
+interface AdminRuntimeIdentity {
+  workspaceId?: string;
+  workspaceRoot?: string;
+  port?: number;
+  pid?: number;
+  startedAt?: string;
+}
+
+function runtimeIdentityMatches(expected: RuntimeState, actual: AdminRuntimeIdentity): boolean {
+  return (
+    actual.workspaceId === expected.workspaceId &&
+    actual.pid === expected.pid &&
+    actual.port === expected.port &&
+    actual.startedAt === expected.startedAt
+  );
+}
+
+/**
+ * Stop one exact bridge runtime generation.
+ *
+ * The runtime file can be stale and its PID can be reused by an unrelated
+ * process. Destructive process signaling is therefore intentionally avoided.
+ * We only request shutdown after the runtime's secret admin token authenticates
+ * to the endpoint and `/admin/info` proves pid/start-time/port identity.
+ */
+export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeState): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
-  const runtime = readRuntimeState(workspace.id);
-  if (!runtime) return false;
+  if (runtime.workspaceId !== workspace.id || path.resolve(runtime.workspaceRoot) !== workspace.root) return false;
 
-  // A persisted PID can be stale and later reused by an unrelated process.
-  // Never send a signal until this runtime has been positively identified as
-  // the bridge for the requested workspace.
-  const healthy = await probeBridge(runtime.port);
-  let identityConfirmed = Boolean(healthy && healthy.workspaceId === workspace.id);
-
-  if (!identityConfirmed) {
-    try {
-      const info = await adminFetch<{ workspaceId?: string }>(runtime, "GET", "/admin/info", 2000);
-      identityConfirmed = info.workspaceId === workspace.id;
-    } catch {
-      identityConfirmed = false;
-    }
+  let info: AdminRuntimeIdentity;
+  try {
+    info = await adminFetch<AdminRuntimeIdentity>(runtime, "GET", "/admin/info", 2000);
+  } catch {
+    return false;
   }
-
-  if (!identityConfirmed) return false;
+  if (!runtimeIdentityMatches(runtime, info)) return false;
 
   try {
     await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
     return true;
   } catch {
-    // Identity was confirmed above, so a PID-level fallback cannot target an
-    // arbitrary stale/reused process merely because the runtime file survived.
-  }
-
-  try {
-    process.kill(runtime.pid, "SIGTERM");
-    return true;
-  } catch {
+    // Fail safe: do not fall back to PID-level SIGTERM. A PID can be recycled
+    // after the authenticated identity check, and an unrelated process must
+    // never be signaled from a stale runtime file.
     return false;
   }
+}
+
+export async function stopBridge(workspaceRoot: string): Promise<boolean> {
+  const workspace = new Workspace(workspaceRoot);
+  const runtime = readRuntimeState(workspace.id);
+  if (!runtime) return false;
+  return stopBridgeRuntime(workspace.root, runtime);
 }
