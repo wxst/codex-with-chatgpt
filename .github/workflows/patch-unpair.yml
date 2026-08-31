@@ -1,0 +1,91 @@
+name: Patch unpair revocation
+
+on:
+  push:
+    branches:
+      - fix/review-findings
+    paths:
+      - .github/workflows/patch-unpair.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout fix branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fix/review-findings
+          fetch-depth: 0
+
+      - name: Patch CLI exactly
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/cli/index.ts")
+          text = path.read_text()
+
+          old_import = 'import { AuthStore } from "../auth/store.js";'
+          new_import = 'import { revokeWorkspaceAccess } from "../auth/revoke.js";'
+          if text.count(old_import) != 1:
+              raise SystemExit(f"expected one AuthStore import, found {text.count(old_import)}")
+          text = text.replace(old_import, new_import, 1)
+
+          old_block = '''  .action(async (opts: { workspace?: string }) => {
+              const root = resolveWorkspace(opts.workspace);
+              const workspace = new Workspace(root);
+              const runtime = await findLiveBridge(workspace.id);
+              if (runtime) {
+                await adminFetch(runtime, "POST", "/admin/revoke-all");
+              } else {
+                // bridge not running: revoke directly in the persisted store
+                new AuthStore(workspace.id).revokeAll();
+              }
+              check("已断开 ChatGPT 对当前项目的访问（所有令牌已吊销）");
+            });'''
+          new_block = '''  .action(async (opts: { workspace?: string }) => {
+              const root = resolveWorkspace(opts.workspace);
+              try {
+                const result = await revokeWorkspaceAccess(root);
+                if (result.transportMode === "openai") {
+                  check("已断开 ChatGPT 对当前项目的访问（Tunnel 凭证已撤销，Bridge 已停止）");
+                } else {
+                  check("已断开 ChatGPT 对当前项目的访问（OAuth 令牌已吊销）");
+                }
+              } catch (error) {
+                handleCliError(error, false);
+              }
+            });'''
+          if text.count(old_block) != 1:
+              raise SystemExit(f"expected one unpair block, found {text.count(old_block)}")
+          text = text.replace(old_block, new_block, 1)
+          path.write_text(text)
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Verify before commit
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm test
+          pnpm build
+          git diff --check
+
+      - name: Commit CLI patch
+        run: |
+          git config user.name "wxst-review-fix-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/cli/index.ts
+          git diff --cached --check
+          git commit -m "fix: revoke tunnel credential on unpair"
+          git push origin HEAD:fix/review-findings
