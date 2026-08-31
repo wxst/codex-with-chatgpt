@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +23,7 @@ function makeWorkspace(name: string): Workspace {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   delete process.env.C2C_STATE_DIR;
   for (const root of roots.splice(0)) cleanup(root);
 });
@@ -77,6 +78,24 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
     expect(ensureOpenAITunnelToken(workspace.id)).not.toBe(before);
   });
 
+  it("revokes a dormant OpenAI token even when the current transport is Cloudflare", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("unpair-dormant-openai");
+    writeTransportMode(workspace.id, "openai");
+    ensureOpenAITunnelToken(workspace.id);
+    expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(true);
+
+    writeTransportMode(workspace.id, "cloudflare");
+    const result = await revokeWorkspaceAccess(workspace.root, {
+      findLiveBridge: async () => null,
+      authStoreFactory: () => ({ revokeAll: () => 0 }),
+    });
+
+    expect(result.transportMode).toBe("cloudflare");
+    expect(result.tunnelCredentialRevoked).toBe(true);
+    expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
+  });
+
   it("wires the CLI unpair command through the hardened revocation path", () => {
     const cli = fs.readFileSync(path.join(projectRoot, "src", "cli", "index.ts"), "utf8");
     expect(cli).toContain("await revokeWorkspaceAccess(root)");
@@ -97,6 +116,22 @@ describe("review finding: reused token permissions", () => {
     if (process.platform !== "win32") {
       expect(fs.statSync(file).mode & 0o777).toBe(0o600);
     }
+  });
+
+  it("fails closed on POSIX when an existing token cannot be repaired to 0600", () => {
+    if (process.platform === "win32") return;
+    isolateStateDir();
+    const workspace = makeWorkspace("token-mode-failure");
+    const file = openAITunnelTokenFile(workspace.id);
+    const token = "c2c_tunnel_" + "b".repeat(43);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, token + "\n", { mode: 0o644 });
+
+    vi.spyOn(fs, "chmodSync").mockImplementation(() => {
+      throw new Error("chmod denied");
+    });
+
+    expect(() => ensureOpenAITunnelToken(workspace.id)).toThrow(/chmod denied/);
   });
 });
 
