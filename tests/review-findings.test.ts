@@ -86,7 +86,7 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
 
     expect(revokedLegacy).toBe(true);
     expect(stopped).toBe(true);
-    expect(cleared).toBe(true);
+    expect(cleared).toBe(false);
     expect(result.transportMode).toBe("openai");
     expect(result.tunnelCredentialRevoked).toBe(true);
     expect(result.bridgeStopped).toBe(true);
@@ -172,7 +172,7 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
     expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
   });
 
-  it("confirms shutdown from the recorded PID and clears stale runtime state", async () => {
+  it("confirms shutdown from the recorded PID without deleting workspace runtime state", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("unpair-pid-confirmation");
     const runtime = fakeRuntime(workspace);
@@ -196,7 +196,7 @@ describe("review finding: OpenAI tunnel credential revocation", () => {
 
     expect(checkedPids.every((pid) => pid === runtime.pid)).toBe(true);
     expect(result.bridgeStopped).toBe(true);
-    expect(cleared).toBe(true);
+    expect(cleared).toBe(false);
   });
 
   it("still stops the bridge when tunnel credential deletion fails", async () => {
