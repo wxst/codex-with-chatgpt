@@ -1,15 +1,27 @@
-import { stopBridge as stopWorkspaceBridge } from "../process/daemon.js";
+import { stopBridgeWithinLifecycleLock } from "../process/daemon.js";
+import {
+  acquireWorkspaceLifecycleLock,
+  type WorkspaceLifecycleLock,
+} from "../process/workspace-lock.js";
 import { Workspace } from "../workspace/manager.js";
 import {
+  ensureOpenAITunnelToken,
   readTransportMode,
   writeTransportMode,
   type TransportMode,
 } from "./transport-mode.js";
 
 type StopBridge = (workspaceRoot: string) => Promise<boolean>;
+type AcquireLock = (workspaceId: string) => Promise<WorkspaceLifecycleLock>;
+type EnsureToken = (workspaceId: string) => string;
 
 export interface SwitchWorkspaceTransportDeps {
+  /** Test seam; production uses the stop path that assumes this transaction owns the lifecycle lock. */
   stopBridge?: StopBridge;
+  acquireLock?: AcquireLock;
+  ensureToken?: EnsureToken;
+  /** Fence pending/live generations even when the selected transport is unchanged. */
+  forceFence?: boolean;
 }
 
 export interface SwitchWorkspaceTransportResult {
@@ -19,13 +31,12 @@ export interface SwitchWorkspaceTransportResult {
 }
 
 /**
- * Change the persisted transport while fencing every pending/live Bridge.
+ * Change transport as one workspace lifecycle transaction.
  *
- * The new mode is published before shutdown so a delayed child that reaches
- * startup during the transition cannot start with the old policy. If the
- * lifecycle-fenced shutdown fails, the previous persisted mode is restored
- * before the error is surfaced, preventing a retry from mistaking the failed
- * transition for an already-completed one.
+ * The lifecycle lock serializes the committed-mode read, provisional write,
+ * pending/runtime drain, rollback, and OpenAI-token provisioning. A concurrent
+ * command can therefore never observe a provisional mode as committed or
+ * recreate a tunnel token while unpair owns the same workspace fence.
  */
 export async function switchWorkspaceTransport(
   workspaceRoot: string,
@@ -33,28 +44,58 @@ export async function switchWorkspaceTransport(
   deps: SwitchWorkspaceTransportDeps = {}
 ): Promise<SwitchWorkspaceTransportResult> {
   const workspace = new Workspace(workspaceRoot);
-  const previous = readTransportMode(workspace.id);
-
-  if (previous === next) {
-    return { previous, mode: next, changed: false };
-  }
-
-  const stopBridge = deps.stopBridge ?? stopWorkspaceBridge;
-  writeTransportMode(workspace.id, next);
+  const acquireLock = deps.acquireLock ?? acquireWorkspaceLifecycleLock;
+  const stopBridge = deps.stopBridge ?? stopBridgeWithinLifecycleLock;
+  const ensureToken = deps.ensureToken ?? ensureOpenAITunnelToken;
+  const lock = await acquireLock(workspace.id);
 
   try {
-    await stopBridge(workspace.root);
-  } catch (stopError) {
-    try {
-      writeTransportMode(workspace.id, previous);
-    } catch (rollbackError) {
-      throw new AggregateError(
-        [stopError, rollbackError],
-        `Failed to switch workspace transport to ${next} and failed to restore ${previous}`
-      );
-    }
-    throw stopError;
-  }
+    const previous = readTransportMode(workspace.id);
+    const changed = previous !== next;
+    if (changed) writeTransportMode(workspace.id, next);
 
-  return { previous, mode: next, changed: true };
+    try {
+      if (changed || deps.forceFence) await stopBridge(workspace.root);
+      if (next === "openai") ensureToken(workspace.id);
+    } catch (error) {
+      if (changed) {
+        try {
+          writeTransportMode(workspace.id, previous);
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            `Failed to switch workspace transport to ${next} and failed to restore ${previous}`
+          );
+        }
+      }
+      throw error;
+    }
+
+    return { previous, mode: next, changed };
+  } finally {
+    lock.release();
+  }
+}
+
+/**
+ * Create/read the OpenAI local tunnel token while holding the same lifecycle
+ * fence used by startup, transport mutation, stop, and unpair.
+ */
+export async function ensureWorkspaceOpenAITunnelToken(
+  workspaceRoot: string,
+  deps: Pick<SwitchWorkspaceTransportDeps, "acquireLock" | "ensureToken"> = {}
+): Promise<string> {
+  const workspace = new Workspace(workspaceRoot);
+  const acquireLock = deps.acquireLock ?? acquireWorkspaceLifecycleLock;
+  const ensureToken = deps.ensureToken ?? ensureOpenAITunnelToken;
+  const lock = await acquireLock(workspace.id);
+
+  try {
+    if (readTransportMode(workspace.id) !== "openai") {
+      throw new Error("OpenAI tunnel token requested while the workspace transport is not openai");
+    }
+    return ensureToken(workspace.id);
+  } finally {
+    lock.release();
+  }
 }
