@@ -15,7 +15,7 @@ The scheduled upstream workflow runs a test merge in a read-only GitHub Actions 
 The hardened Bridge currently starts only where it can prove that a wedged daemon can be terminated through a generation-bound OS process handle before any OAuth or tunnel credential is loaded:
 
 - **Linux** — supported when Python 3.9+ is available and the running kernel/container policy permits `os.pidfd_open` and `signal.pidfd_send_signal`. C2C executes both pidfd syscalls safely during startup to verify the capability. `C2C_PYTHON` can select a specific interpreter.
-- **Windows** — supported using a generation-validated Windows `Process` object/handle.
+- **Windows** — routine liveness observation uses the process creation time exposed by `Get-Process`, while destructive shutdown opens one native process handle, derives creation identity through `GetProcessTimes`, validates the expected generation, and terminates through that same handle. Startup verifies this native path with a disposable child before credentials are loaded.
 - **macOS / BSD** — intentionally fail-closed for now. C2C can derive a process start identity there, but this hardened fork does not yet have an atomic generation-bound termination handle suitable for killing a wedged detached Bridge without a PID-reuse race. Startup is rejected before credentials are read or created.
 
 This restriction is a hardening choice, not a claim that Node.js or the upstream project cannot otherwise run on macOS.
@@ -121,4 +121,4 @@ corepack pnpm build
 corepack pnpm smoke:install
 ```
 
-Security regressions covered by tests include path traversal/symlink boundaries, sensitive file leakage, sensitive git-diff renames, transport rollback, OpenAI tunnel token handling, proxy-header rejection, read-only tool exposure, prevention of Cloudflare tunnel startup in OpenAI mode, workspace lifecycle serialization, pending-start fencing, multi-generation runtime discovery, legacy revocation behavior, generation-bound process termination, failed-start cleanup, and fail-closed stop semantics.
+Security regressions covered by tests include path traversal/symlink boundaries, sensitive file leakage, sensitive git-diff renames, transport rollback, OpenAI tunnel token handling, proxy-header rejection, read-only tool exposure, prevention of Cloudflare tunnel startup in OpenAI mode, workspace lifecycle serialization, pending-start fencing, multi-generation runtime discovery, legacy revocation behavior, generation-bound process termination, failed-start cleanup, Windows process-identity observation, and fail-closed stop semantics.
