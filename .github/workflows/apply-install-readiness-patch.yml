@@ -1,0 +1,69 @@
+name: Apply installation readiness patch
+
+on:
+  push:
+    branches:
+      - fix/review-findings
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-install-readiness-patch
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/review-findings
+          fetch-depth: 0
+
+      - name: Route transport changes through the transactional helper
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cli = Path("src/cli/index.ts")
+          text = cli.read_text(encoding="utf-8")
+
+          import_line = 'import { switchWorkspaceTransport } from "../tunnel/switch-transport.js";'
+          if import_line not in text:
+              marker = 'from "../tunnel/transport-mode.js";'
+              position = text.find(marker)
+              if position < 0:
+                  raise SystemExit("transport-mode import marker not found")
+              position += len(marker)
+              text = text[:position] + "\n" + import_line + text[position:]
+
+          old = '''        const next = requested as TransportMode;
+          const previous = readTransportMode(workspace.id);
+          writeTransportMode(workspace.id, next);
+          if (previous !== next) {
+            await stopBridge(root);
+          }
+'''
+          new = '''        const next = requested as TransportMode;
+          await switchWorkspaceTransport(root, next);
+'''
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise SystemExit("transport command block did not match expected source")
+
+          cli.write_text(text, encoding="utf-8")
+          Path(".github/workflows/apply-install-readiness-patch.yml").unlink()
+          PY
+
+      - name: Commit patch and remove this workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/cli/index.ts .github/workflows/apply-install-readiness-patch.yml
+          git commit -m "fix: roll back failed transport switches"
+          git push origin HEAD:fix/review-findings
