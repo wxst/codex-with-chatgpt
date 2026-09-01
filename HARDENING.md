@@ -50,6 +50,8 @@ The bridge refuses `/admin/tunnel/start` while OpenAI mode is active.
 
 Transport changes are lifecycle-fenced. The new mode is persisted first, then the workspace stop path runs unconditionally to cancel every pending daemon start and drain every tracked runtime generation before the command returns. This prevents a delayed child from starting with the previous transport after the user has switched modes.
 
+The stop path returns `false` only when no pending start or runtime generation exists. If any discovered generation cannot be safely terminated or conclusively shown dead, it throws instead of letting `stop`, `restart`, or a transport switch misreport the workspace as stopped.
+
 ## Read-only MCP invariant
 
 The ChatGPT-facing MCP surface remains limited to:
@@ -110,4 +112,4 @@ pnpm test
 pnpm build
 ```
 
-Security regressions covered by tests include path traversal/symlink boundaries, sensitive file leakage, sensitive git-diff renames, transport state, OpenAI tunnel token handling, proxy-header rejection, read-only tool exposure, prevention of Cloudflare tunnel startup in OpenAI mode, workspace lifecycle serialization, pending-start fencing, multi-generation runtime discovery, legacy revocation behavior, and generation-bound process termination.
+Security regressions covered by tests include path traversal/symlink boundaries, sensitive file leakage, sensitive git-diff renames, transport state, OpenAI tunnel token handling, proxy-header rejection, read-only tool exposure, prevention of Cloudflare tunnel startup in OpenAI mode, workspace lifecycle serialization, pending-start fencing, multi-generation runtime discovery, legacy revocation behavior, generation-bound process termination, and fail-closed stop semantics.
