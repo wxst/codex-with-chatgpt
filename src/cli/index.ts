@@ -1076,17 +1076,22 @@ tunnelCmd
       if (mode !== "quick" && mode !== "named") {
         throw new Error("mode must be quick or named");
       }
-      await switchWorkspaceTransport(root, "cloudflare", { forceFence: true });
+
       if (mode === "quick") {
-        const state = chooseQuickTunnel(workspace.id);
+        let state: ReturnType<typeof chooseQuickTunnel> | null = null;
+        await switchWorkspaceTransport(root, "cloudflare", {
+          forceFence: true,
+          afterFence: () => {
+            state = chooseQuickTunnel(workspace.id);
+          },
+        });
+        if (!state) throw new Error("Cloudflare quick-tunnel preference was not committed");
         const payload = { ...tunnelChoicePayload(workspace), state };
         if (opts.json) say(JSON.stringify(payload));
         else check("已选用临时地址");
         return;
       }
-      if (mode !== "named") {
-        throw new Error("mode must be quick or named");
-      }
+
       const zone = parseZoneInput(opts.zone ?? "");
       if (!zone) {
         const payload = {
@@ -1102,13 +1107,21 @@ tunnelCmd
         say(payload.userMessage);
         return;
       }
+
       if (!opts.json) say(NAMED_LOGIN_PROMPT);
-      const result = await provisionNamedTunnel({
-        workspaceId: workspace.id,
-        workspaceName: workspace.name,
-        zone,
-        hostname: opts.hostname,
+      let result: Awaited<ReturnType<typeof provisionNamedTunnel>> | null = null;
+      await switchWorkspaceTransport(root, "cloudflare", {
+        forceFence: true,
+        afterFence: async () => {
+          result = await provisionNamedTunnel({
+            workspaceId: workspace.id,
+            workspaceName: workspace.name,
+            zone,
+            hostname: opts.hostname,
+          });
+        },
       });
+      if (!result) throw new Error("Cloudflare named-tunnel preference was not committed");
 
       const payload = {
         ...tunnelChoicePayload(workspace),
