@@ -139,6 +139,7 @@ finally:
 `;
 
 let cachedLinuxPidfdPython: string | null | undefined;
+let cachedWindowsExactTermination: boolean | undefined;
 
 function detectLinuxPidfdPython(): string | null {
   if (cachedLinuxPidfdPython !== undefined) return cachedLinuxPidfdPython;
@@ -163,6 +164,93 @@ function detectLinuxPidfdPython(): string | null {
   return null;
 }
 
+const WINDOWS_NATIVE_TYPE = String.raw`
+using System;
+using System.Runtime.InteropServices;
+public static class C2CProcessNative {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct FILETIME { public uint dwLowDateTime; public uint dwHighDateTime; }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool GetProcessTimes(IntPtr hProcess, out FILETIME creation, out FILETIME exit, out FILETIME kernel, out FILETIME user);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool TerminateProcess(IntPtr hProcess, uint exitCode);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool CloseHandle(IntPtr hObject);
+}
+`;
+
+const WINDOWS_HANDLE_CAPABILITY_SCRIPT = String.raw`
+$ErrorActionPreference='Stop'
+$source=@'
+using System;
+using System.Runtime.InteropServices;
+public static class C2CProcessNative {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct FILETIME { public uint dwLowDateTime; public uint dwHighDateTime; }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool GetProcessTimes(IntPtr hProcess, out FILETIME creation, out FILETIME exit, out FILETIME kernel, out FILETIME user);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool TerminateProcess(IntPtr hProcess, uint exitCode);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool CloseHandle(IntPtr hObject);
+}
+'@
+Add-Type -TypeDefinition $source -Language CSharp
+$child=$null
+$handle=[IntPtr]::Zero
+try {
+  $child=Start-Process -FilePath $env:ComSpec -ArgumentList '/d','/c','ping -t 127.0.0.1' -WindowStyle Hidden -PassThru
+  $expected='win32:'+$child.StartTime.ToUniversalTime().ToString('o')
+  $PROCESS_TERMINATE=0x0001
+  $PROCESS_QUERY_LIMITED_INFORMATION=0x1000
+  $handle=[C2CProcessNative]::OpenProcess($PROCESS_TERMINATE -bor $PROCESS_QUERY_LIMITED_INFORMATION,$false,[uint32]$child.Id)
+  if ($handle -eq [IntPtr]::Zero) { exit 21 }
+  $creation=New-Object C2CProcessNative+FILETIME
+  $exitTime=New-Object C2CProcessNative+FILETIME
+  $kernel=New-Object C2CProcessNative+FILETIME
+  $user=New-Object C2CProcessNative+FILETIME
+  if (-not [C2CProcessNative]::GetProcessTimes($handle,[ref]$creation,[ref]$exitTime,[ref]$kernel,[ref]$user)) { exit 22 }
+  $creationTicks=([int64]$creation.dwHighDateTime * 4294967296L) + [int64]$creation.dwLowDateTime
+  $actual='win32:'+[DateTime]::FromFileTimeUtc($creationTicks).ToString('o')
+  if ($actual -ne $expected) { exit 23 }
+  if (-not [C2CProcessNative]::TerminateProcess($handle,197)) { exit 24 }
+  if (-not $child.WaitForExit(2000)) { exit 25 }
+  exit 0
+} finally {
+  if ($handle -ne [IntPtr]::Zero) { [void][C2CProcessNative]::CloseHandle($handle) }
+  if ($child -ne $null -and -not $child.HasExited) {
+    try { $child.Kill(); $child.WaitForExit(1000) | Out-Null } catch {}
+  }
+}
+`;
+
+function probeWindowsExactTermination(): boolean {
+  if (cachedWindowsExactTermination !== undefined) return cachedWindowsExactTermination;
+  try {
+    const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
+    const powershell = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const result = spawnSync(
+      powershell,
+      ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_HANDLE_CAPABILITY_SCRIPT],
+      { encoding: "utf8", timeout: 8000, windowsHide: true }
+    );
+    cachedWindowsExactTermination = result.status === 0;
+  } catch {
+    cachedWindowsExactTermination = false;
+  }
+  return cachedWindowsExactTermination;
+}
+
+/**
+ * Validate the same exact-termination mechanism that revocation will depend on
+ * before any Bridge credential is read. Linux executes pidfd syscalls against
+ * the helper itself; Windows creates a disposable child and proves that one
+ * retained native HANDLE can read creation identity and terminate that child.
+ */
 export function requireProcessSafetyRuntime(): void {
   if (!supportsExactProcessTermination(process.platform)) {
     throw new Error(
@@ -181,8 +269,11 @@ export function requireProcessSafetyRuntime(): void {
     return;
   }
 
-  if (process.platform === "win32" && !windowsGeneration(process.pid)) {
-    throw new Error("Windows cannot establish a generation-bound process handle for safe Bridge lifecycle management.");
+  if (process.platform === "win32" && !probeWindowsExactTermination()) {
+    throw new Error(
+      "Windows cannot prove generation-bound native process termination (OpenProcess/GetProcessTimes/TerminateProcess). " +
+        "PowerShell language mode or process-security policy may be blocking the required handle operations."
+    );
   }
 }
 
