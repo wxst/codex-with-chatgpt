@@ -85,7 +85,7 @@ describe("process generation identity", () => {
   });
 
   it("refuses an atomic signal when the expected generation does not match", async () => {
-    if (process.platform !== "linux") return;
+    if (process.platform !== "linux" && process.platform !== "win32") return;
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
       stdio: "ignore",
     });
@@ -93,13 +93,14 @@ describe("process generation identity", () => {
     if (!child.pid) throw new Error("child pid unavailable");
 
     await waitForGeneration(child.pid);
-    expect(signalExactProcessGeneration(child.pid, "linux:wrong-generation", "SIGKILL")).toBe(false);
+    const wrongGeneration = process.platform === "linux" ? "linux:wrong-generation" : "win32:wrong-generation";
+    expect(signalExactProcessGeneration(child.pid, wrongGeneration, "SIGKILL")).toBe(false);
     expect(child.exitCode).toBeNull();
     expect(child.signalCode).toBeNull();
   });
 
-  it("uses a generation-bound handle to signal the exact Linux process", async () => {
-    if (process.platform !== "linux") return;
+  it("uses a generation-bound handle to signal the exact supported process", async () => {
+    if (process.platform !== "linux" && process.platform !== "win32") return;
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
       stdio: "ignore",
     });
@@ -109,6 +110,7 @@ describe("process generation identity", () => {
     const generation = await waitForGeneration(child.pid);
     expect(signalExactProcessGeneration(child.pid, generation, "SIGKILL")).toBe(true);
     await waitForExit(child);
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
     expect(processGenerationMatches(child.pid, generation)).toBe(false);
   });
 
