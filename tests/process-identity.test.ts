@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import fs from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  classifyProcessGeneration,
   getProcessGeneration,
   processGenerationMatches,
   requireCurrentProcessGeneration,
@@ -42,6 +45,13 @@ describe("process generation identity", () => {
     expect(first).toBeTruthy();
     expect(second).toBe(first);
     expect(processGenerationMatches(process.pid, first)).toBe(true);
+  });
+
+  it("classifies an unavailable generation on an existing PID as unknown, not mismatch", () => {
+    expect(classifyProcessGeneration(null, true, "expected-generation")).toBe("unknown");
+    expect(classifyProcessGeneration(null, false, "expected-generation")).toBe("mismatch");
+    expect(classifyProcessGeneration("expected-generation", true, "expected-generation")).toBe("match");
+    expect(classifyProcessGeneration("different-generation", true, "expected-generation")).toBe("mismatch");
   });
 
   it("validates the declared Linux pidfd helper runtime", () => {
@@ -100,5 +110,14 @@ describe("process generation identity", () => {
     expect(signalExactProcessGeneration(child.pid, generation, "SIGKILL")).toBe(true);
     await waitForExit(child);
     expect(processGenerationMatches(child.pid, generation)).toBe(false);
+  });
+
+  it("pins Windows validation and termination to one native process handle", () => {
+    const source = fs.readFileSync(path.resolve("src/process/process-identity.ts"), "utf8");
+    expect(source).toContain("OpenProcess");
+    expect(source).toContain("GetProcessTimes");
+    expect(source).toContain("TerminateProcess");
+    expect(source).toContain("CloseHandle");
+    expect(source).not.toContain("$p.Kill()");
   });
 });
