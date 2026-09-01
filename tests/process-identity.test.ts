@@ -120,4 +120,14 @@ describe("process generation identity", () => {
     expect(source).toContain("CloseHandle");
     expect(source).not.toContain("$p.Kill()");
   });
+
+  it("keeps cold Windows helper startup retryable without weakening fail-closed identity checks", () => {
+    const source = fs.readFileSync(path.resolve("src/process/process-identity.ts"), "utf8");
+    expect(source).toContain("const WINDOWS_GENERATION_TIMEOUT_MS = 15_000");
+    expect(source).toContain("const WINDOWS_NATIVE_CAPABILITY_TIMEOUT_MS = 20_000");
+    expect(source).toContain("const WINDOWS_NATIVE_SIGNAL_TIMEOUT_MS = 15_000");
+    expect(source).toContain("let cachedCurrentProcessGeneration: string | undefined");
+    expect(source).toContain("if (pid === process.pid && generation) cachedCurrentProcessGeneration = generation");
+    expect(source).not.toContain("cachedCurrentProcessGeneration = null");
+  });
 });
