@@ -61,7 +61,7 @@ describe("authenticated process identity", () => {
     });
     const kill = vi.spyOn(process, "kill").mockReturnValue(true);
 
-    expect(await daemon.stopBridge(workspace.root)).toBe(false);
+    await expect(daemon.stopBridge(workspace.root)).rejects.toThrow(/could not be fully stopped/);
     expect(kill).not.toHaveBeenCalled();
   });
 });
