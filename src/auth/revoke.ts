@@ -32,7 +32,6 @@ type RevokeTunnelToken = (workspaceId: string) => boolean;
 type IsProcessAlive = (pid: number) => boolean;
 type ProbeBridge = (port: number, timeoutMs?: number) => Promise<HealthPayload | null>;
 type RevocableAuthStore = Pick<AuthStore, "revokeAll">;
-
 type ProcessGenerationStatusFn = (pid: number, expectedGeneration: string) => ProcessGenerationStatus;
 
 interface RuntimeIdentityPayload {
@@ -183,10 +182,6 @@ async function revokeWorkspaceAccessLocked(
     if (runtime.processGeneration) {
       const status = generationStatus(runtime.pid, runtime.processGeneration);
       if (status === "match") return "exact-live";
-      // A transient identity-query failure while the numeric PID still exists is
-      // not evidence of process exit. Do not fall through to endpoint timeouts,
-      // remove the generation, or report quiescence. This mirrors lifecycle-lock
-      // fencing: unknown identity always fails closed.
       if (status === "unknown") return "unknown-live";
     }
 
@@ -286,19 +281,26 @@ async function revokeWorkspaceAccessLocked(
         );
       }
 
+      // Only confirmed death authorizes removal of the runtime generation.
+      // Unknown identity after a stop attempt is still potentially live and
+      // must remain discoverable for this and future revocation attempts.
       const deadline = Date.now() + stopTimeoutMs;
-      while (Date.now() < deadline) {
-        const nextStatus = await runtimeLiveness(runtime);
-        if (nextStatus !== "exact-live") {
-          bridgeStopped = true;
-          break;
-        }
+      let postStopStatus: RuntimeLiveness = await runtimeLiveness(runtime);
+      while (Date.now() < deadline && postStopStatus !== "dead") {
         await sleep(50);
+        postStopStatus = await runtimeLiveness(runtime);
       }
-      if ((await runtimeLiveness(runtime)) === "exact-live") {
-        failures.push(new Error(`Workspace bridge process ${runtime.pid} did not exit before the revocation deadline`));
-      } else {
+
+      if (postStopStatus === "dead") {
+        bridgeStopped = true;
         removeRuntime(runtime);
+      } else if (postStopStatus === "unknown-live") {
+        failures.push(
+          new Error(`Workspace bridge process ${runtime.pid} could not be confirmed dead after the revocation attempt`)
+        );
+        lastUnknown.push(runtime);
+      } else {
+        failures.push(new Error(`Workspace bridge process ${runtime.pid} did not exit before the revocation deadline`));
       }
 
       scrubPersistedOAuth("Failed post-stop persisted OAuth credential scrub");
