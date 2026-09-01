@@ -77,6 +77,12 @@ afterEach(() => {
 });
 
 describe("latest automated-review findings", () => {
+  it("always lifecycle-fences a transport mode change, even with only a pending child", () => {
+    const cliSource = fs.readFileSync(path.join(process.cwd(), "src", "cli", "index.ts"), "utf8");
+    expect(cliSource).toContain("if (previous !== next) {\n          await stopBridge(root);");
+    expect(cliSource).not.toContain("previous !== next && (await findLiveBridge");
+  });
+
   it("cancels a pending start when the daemon health wait times out", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("startup-timeout-cancel");

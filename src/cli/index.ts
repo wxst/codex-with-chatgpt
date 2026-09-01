@@ -360,7 +360,7 @@ program
         const next = requested as TransportMode;
         const previous = readTransportMode(workspace.id);
         writeTransportMode(workspace.id, next);
-        if (previous !== next && (await findLiveBridge(workspace.id))) {
+        if (previous !== next) {
           await stopBridge(root);
         }
       }
