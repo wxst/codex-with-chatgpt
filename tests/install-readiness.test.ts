@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { waitForBridgeStartup } from "../src/process/daemon.js";
 import { switchWorkspaceTransport } from "../src/tunnel/switch-transport.js";
 import {
   openAITunnelTokenFile,
@@ -81,6 +82,30 @@ describe("transactional transport switching", () => {
     const cli = fs.readFileSync(path.join(process.cwd(), "src", "cli", "index.ts"), "utf8");
     expect(cli).not.toContain('writeTransportMode(workspace.id, "cloudflare")');
     expect(cli.match(/switchWorkspaceTransport\(root,/gu)?.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("failed-start cleanup", () => {
+  it("reports an aggregate cleanup failure when the stop fence returns false", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("startup-cleanup-false");
+
+    await expect(
+      waitForBridgeStartup(workspace, { exitCode: null }, "missing-start", "bridge.log", {
+        timeoutMs: 0,
+        pollMs: 0,
+        findLive: async () => null,
+        sleep: async () => undefined,
+        stopBridge: async () => false,
+      })
+    ).rejects.toSatisfy((error: unknown) => {
+      return (
+        error instanceof AggregateError &&
+        /could not be fully fenced/u.test(error.message) &&
+        error.errors.some((entry) => /did not become healthy/u.test(String(entry))) &&
+        error.errors.some((entry) => /cleanup was not confirmed/u.test(String(entry)))
+      );
+    });
   });
 });
 
