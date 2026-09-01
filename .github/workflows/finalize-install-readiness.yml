@@ -1,0 +1,175 @@
+name: Finalize installation readiness
+
+on:
+  push:
+    branches:
+      - fix/review-findings
+
+permissions:
+  contents: write
+
+concurrency:
+  group: finalize-install-readiness
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/review-findings
+          fetch-depth: 0
+
+      - name: Apply final source and documentation changes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          # Route transport changes through a helper that restores the previous
+          # mode whenever the old Bridge cannot be fully fenced.
+          cli = Path("src/cli/index.ts")
+          text = cli.read_text(encoding="utf-8")
+          helper_import = 'import { switchWorkspaceTransport } from "../tunnel/switch-transport.js";'
+          if helper_import not in text:
+              marker = 'from "../tunnel/transport-mode.js";'
+              index = text.find(marker)
+              if index < 0:
+                  raise SystemExit("transport-mode import marker not found")
+              index += len(marker)
+              text = text[:index] + "\n" + helper_import + text[index:]
+
+          direct_block = re.compile(
+              r'        const next = requested as TransportMode;\n'
+              r'        const previous = readTransportMode\(workspace\.id\);\n'
+              r'        writeTransportMode\(workspace\.id, next\);\n'
+              r'        if \(previous !== next\) \{\n'
+              r'          await stopBridge\(root\);\n'
+              r'        \}\n'
+          )
+          replacement = (
+              '        const next = requested as TransportMode;\n'
+              '        await switchWorkspaceTransport(root, next);\n'
+          )
+          text, replaced = direct_block.subn(replacement, text, count=1)
+          if replaced == 0 and replacement not in text:
+              raise SystemExit("transport command did not match the expected source")
+          if text.count("writeTransportMode") == 1:
+              text = re.sub(r'^\s*writeTransportMode,\s*\n', '', text, count=1, flags=re.MULTILINE)
+          if replacement not in text or helper_import not in text:
+              raise SystemExit("transactional transport helper was not wired into the CLI")
+          cli.write_text(text, encoding="utf-8")
+
+          # Make failed-start cleanup directly injectable and behaviorally
+          # testable. Production still defaults to the lifecycle-fenced
+          # stopBridge implementation, which throws if any generation survives.
+          daemon = Path("src/process/daemon.ts")
+          text = daemon.read_text(encoding="utf-8")
+          interface = re.search(
+              r'export interface BridgeStartupWaitOptions \{(?P<body>.*?)\n\}',
+              text,
+              flags=re.DOTALL,
+          )
+          if not interface:
+              raise SystemExit("BridgeStartupWaitOptions interface not found")
+          if "stopWorkspace?:" not in interface.group(0):
+              replacement_interface = interface.group(0)[:-2] + (
+                  '\n  stopWorkspace?: (workspaceRoot: string) => Promise<boolean>;\n}'
+              )
+              text = text[:interface.start()] + replacement_interface + text[interface.end():]
+
+          wait_start = text.find("export async function waitForBridgeStartup(")
+          wait_end = text.find("export async function ensureBridge(", wait_start)
+          if wait_start < 0 or wait_end < 0:
+              raise SystemExit("waitForBridgeStartup function boundaries not found")
+          segment = text[wait_start:wait_end]
+          if "const stopWorkspace = options.stopWorkspace ?? stopBridge;" not in segment:
+              sleep_line = re.search(r'(^\s*const sleep = options\.sleep .*?;\n)', segment, flags=re.MULTILINE)
+              if not sleep_line:
+                  raise SystemExit("waitForBridgeStartup sleep dependency line not found")
+              segment = (
+                  segment[:sleep_line.end()]
+                  + "  const stopWorkspace = options.stopWorkspace ?? stopBridge;\n"
+                  + segment[sleep_line.end():]
+              )
+          segment, stop_replaced = re.subn(
+              r'await stopBridge\(workspace\.root\);',
+              'await stopWorkspace(workspace.root);',
+              segment,
+              count=1,
+          )
+          if stop_replaced == 0 and "await stopWorkspace(workspace.root);" not in segment:
+              raise SystemExit("failed-start cleanup stop call not found")
+          text = text[:wait_start] + segment + text[wait_end:]
+          daemon.write_text(text, encoding="utf-8")
+
+          # Document the actual rollback guarantee rather than implying that a
+          # failed stop leaves the newly persisted mode behind.
+          hardening = Path("HARDENING.md")
+          text = hardening.read_text(encoding="utf-8")
+          old = (
+              "Transport changes are lifecycle-fenced. The new mode is persisted first, then the workspace stop path runs unconditionally to cancel every pending daemon start and drain every tracked runtime generation before the command returns. This prevents a delayed child from starting with the previous transport after the user has switched modes.\n\n"
+              "The stop path returns `false` only when no pending start or runtime generation exists. If any discovered generation cannot be safely terminated or conclusively shown dead, it throws instead of letting `stop`, `restart`, or a transport switch misreport the workspace as stopped."
+          )
+          new = (
+              "Transport changes are transactional and lifecycle-fenced. C2C tentatively persists the requested mode, then runs the workspace stop path unconditionally to cancel every pending daemon start and drain every tracked runtime generation. If fencing fails, C2C restores the previous mode before returning an error, so a retry cannot skip shutdown while an old Cloudflare Bridge remains active. Only after successful fencing may the command create or report credentials for the new mode.\n\n"
+              "The stop path returns `false` only when no pending start or runtime generation exists. If any discovered generation cannot be safely terminated or conclusively shown dead, it throws instead of letting `stop`, `restart`, failed-start cleanup, or a transport switch misreport the workspace as stopped."
+          )
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise SystemExit("HARDENING transport paragraph did not match expected text")
+          hardening.write_text(text, encoding="utf-8")
+
+          # Windows .cmd launchers require shell dispatch in Node's spawn API.
+          # Also tolerate npm warnings surrounding the JSON pack metadata.
+          smoke = Path("scripts/install-smoke.mjs")
+          text = smoke.read_text(encoding="utf-8")
+          if 'shell: process.platform === "win32",' not in text:
+              marker = '    stdio: ["ignore", "pipe", "pipe"],\n'
+              if marker not in text:
+                  raise SystemExit("install smoke stdio marker not found")
+              text = text.replace(
+                  marker,
+                  marker + '    shell: process.platform === "win32",\n',
+                  1,
+              )
+          old_parse = '  const packMetadata = JSON.parse(packOutput);'
+          new_parse = (
+              '  const jsonStart = packOutput.indexOf("[");\n'
+              '  const jsonEnd = packOutput.lastIndexOf("]");\n'
+              '  if (jsonStart < 0 || jsonEnd < jsonStart) {\n'
+              '    throw new Error(`npm pack did not return JSON metadata: ${packOutput}`);\n'
+              '  }\n'
+              '  const packMetadata = JSON.parse(packOutput.slice(jsonStart, jsonEnd + 1));'
+          )
+          if old_parse in text:
+              text = text.replace(old_parse, new_parse, 1)
+          elif new_parse not in text:
+              raise SystemExit("install smoke JSON parser did not match expected source")
+          smoke.write_text(text, encoding="utf-8")
+
+          # No write-enabled patch workflow is allowed to survive this commit.
+          for relative in (
+              ".github/workflows/apply-install-readiness-patch.yml",
+              ".github/workflows/update-stop-tests.yml",
+              ".github/workflows/finalize-install-readiness.yml",
+          ):
+              Path(relative).unlink(missing_ok=True)
+          PY
+
+      - name: Commit final patch and remove temporary workflows
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes were required"
+            exit 1
+          fi
+          git commit -m "fix: complete installation readiness safeguards"
+          git push origin HEAD:fix/review-findings
