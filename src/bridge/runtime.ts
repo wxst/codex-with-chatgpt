@@ -50,7 +50,7 @@ export function runtimeGenerationFile(state: RuntimeState): string {
   return path.join(runtimeRegistryDir(state.workspaceId, true), `${runtimeGenerationKey(state)}.json`);
 }
 
-function atomicPrivateWrite(file: string, payload: string): void {
+function writePrivateTemp(file: string, payload: string): string {
   ensureDir(path.dirname(file));
   const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   let fd: number | null = null;
@@ -69,19 +69,65 @@ function atomicPrivateWrite(file: string, payload: string): void {
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = null;
-    fs.renameSync(temp, file);
-  } finally {
+    return temp;
+  } catch (error) {
     if (fd !== null) {
       try {
         fs.closeSync(fd);
       } catch {
-        // Preserve the original write error.
+        // Preserve the original write failure.
       }
     }
     try {
       fs.rmSync(temp, { force: true });
     } catch {
+      // best effort
+    }
+    throw error;
+  }
+}
+
+function atomicPrivateWrite(file: string, payload: string): void {
+  const temp = writePrivateTemp(file, payload);
+  try {
+    fs.renameSync(temp, file);
+  } finally {
+    try {
+      fs.rmSync(temp, { force: true });
+    } catch {
       // Successful rename already moved the temporary path away.
+    }
+  }
+}
+
+/**
+ * Publish the compatibility mirror only when the pathname is still absent.
+ * A complete 0600 temporary file is hard-linked into place, so there is no
+ * check-then-overwrite window. If a legacy Bridge creates the canonical file
+ * before this operation, EEXIST preserves that legacy generation exactly.
+ * New Bridges never overwrite a different canonical generation; authoritative
+ * updates live exclusively in the per-generation registry.
+ */
+function createCanonicalMirrorIfAbsent(file: string, payload: string): void {
+  if (fs.existsSync(file)) return;
+  const temp = writePrivateTemp(file, payload);
+  try {
+    try {
+      fs.linkSync(temp, file);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") {
+        // The mirror is compatibility-only. If a filesystem cannot create the
+        // no-overwrite hard link, leave it absent rather than weaken safety by
+        // falling back to an overwrite-capable publication primitive.
+        return;
+      }
+    }
+  } finally {
+    try {
+      fs.rmSync(temp, { force: true });
+    } catch {
+      // best effort
     }
   }
 }
@@ -125,22 +171,24 @@ function readRuntimeStrict(file: string, workspaceId: string): RuntimeState {
 }
 
 /**
- * Publish one exact runtime generation first, then refresh the legacy canonical
- * mirror. New writes always stamp the current service name even when a caller
- * passed a legacy fixture/state object.
+ * Publish one exact authoritative runtime generation. The canonical legacy
+ * mirror is first-writer-wins and immutable from hardened writers. This is
+ * deliberate: an old pre-registry Bridge may use that pathname as its only
+ * discoverability record, so replacing it could hide a still-live legacy
+ * generation on another port.
  */
 export function writeRuntimeState(state: RuntimeState): void {
   const processGeneration = state.processGeneration ?? getProcessGeneration(state.pid);
-  const normalized: RuntimeState = { ...state, service: SERVICE_NAME, version: state.version || VERSION, processGeneration };
+  const normalized: RuntimeState = {
+    ...state,
+    service: SERVICE_NAME,
+    version: state.version || VERSION,
+    processGeneration,
+  };
   const payload = JSON.stringify(normalized, null, 2);
 
   atomicPrivateWrite(runtimeGenerationFile(normalized), payload);
-  try {
-    atomicPrivateWrite(runtimeFile(normalized.workspaceId), payload);
-  } catch {
-    // The authoritative generation remains discoverable. A stale canonical
-    // mirror is included only as an extra candidate and can never hide it.
-  }
+  createCanonicalMirrorIfAbsent(runtimeFile(normalized.workspaceId), payload);
 }
 
 /** Legacy compatibility read. Security-sensitive callers should use listRuntimeStates(). */
@@ -181,11 +229,8 @@ export function listRuntimeStates(workspaceId: string): RuntimeState[] {
 
 /**
  * Remove only one authoritative generation file. The canonical compatibility
- * mirror is intentionally never unlinked here: compare-then-unlink cannot be
- * made atomic with concurrent mirror writers and could delete a replacement's
- * newly-renamed snapshot. Security-sensitive callers use the generation
- * registry; leaving a stale mirror is safer than deleting another generation's
- * compatibility state.
+ * mirror is intentionally never unlinked here: it may be the only record of a
+ * concurrently running pre-registry Bridge.
  */
 export function removeRuntimeStateGeneration(state: RuntimeState): void {
   const dir = runtimeRegistryDir(state.workspaceId, false);
