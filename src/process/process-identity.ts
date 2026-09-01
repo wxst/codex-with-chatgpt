@@ -73,9 +73,36 @@ export function getProcessGeneration(pid: number): string | null {
   return null;
 }
 
+function numericPidExists(pid: number): boolean {
+  if (!validPid(pid)) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+export type ProcessGenerationStatus = "match" | "mismatch" | "unknown";
+
+export function classifyProcessGeneration(
+  observedGeneration: string | null,
+  pidExists: boolean,
+  expectedGeneration: string
+): ProcessGenerationStatus {
+  if (!expectedGeneration) return "mismatch";
+  if (observedGeneration) return observedGeneration === expectedGeneration ? "match" : "mismatch";
+  return pidExists ? "unknown" : "mismatch";
+}
+
+export function processGenerationStatus(pid: number, expectedGeneration: string): ProcessGenerationStatus {
+  if (!validPid(pid) || !expectedGeneration) return "mismatch";
+  const observed = getProcessGeneration(pid);
+  return classifyProcessGeneration(observed, observed === null && numericPidExists(pid), expectedGeneration);
+}
+
 export function processGenerationMatches(pid: number, expectedGeneration: string): boolean {
-  if (!expectedGeneration) return false;
-  return getProcessGeneration(pid) === expectedGeneration;
+  return processGenerationStatus(pid, expectedGeneration) === "match";
 }
 
 export function requireCurrentProcessGeneration(): string {
@@ -86,23 +113,10 @@ export function requireCurrentProcessGeneration(): string {
   return generation;
 }
 
-/**
- * Hardened lifecycle safety currently has an atomic, generation-bound external
- * termination primitive only on Linux (pidfd) and Windows (one Process object).
- * macOS/BSD can derive a start identity but lack the atomic handle used here to
- * safely terminate a wedged daemon without a PID-reuse race, so startup must
- * fail closed there before credentials are loaded.
- */
 export function supportsExactProcessTermination(platform: NodeJS.Platform = process.platform): boolean {
   return platform === "linux" || platform === "win32";
 }
 
-/**
- * This probe intentionally executes both pidfd syscalls rather than merely
- * checking that Python exposes their symbols. Signal 0 performs kernel
- * validation without delivering a real signal, so a kernel/seccomp policy that
- * rejects pidfd_open or pidfd_send_signal is detected before credentials load.
- */
 const LINUX_PIDFD_CAPABILITY_SCRIPT = String.raw`
 import os, signal, sys
 fd = None
@@ -149,11 +163,6 @@ function detectLinuxPidfdPython(): string | null {
   return null;
 }
 
-/**
- * Validate process-safety prerequisites before a Bridge can load credentials.
- * Platforms without a generation-bound termination handle are rejected rather
- * than allowed to run with an access path that `unpair` cannot reliably kill.
- */
 export function requireProcessSafetyRuntime(): void {
   if (!supportsExactProcessTermination(process.platform)) {
     throw new Error(
@@ -172,9 +181,6 @@ export function requireProcessSafetyRuntime(): void {
     return;
   }
 
-  // Windows process-generation discovery and termination both use PowerShell's
-  // Process object. Prove that the current process can be identified before any
-  // credential is read; failure here also fails startup closed.
   if (process.platform === "win32" && !windowsGeneration(process.pid)) {
     throw new Error("Windows cannot establish a generation-bound process handle for safe Bridge lifecycle management.");
   }
@@ -235,24 +241,56 @@ function signalLinuxPidfd(pid: number, expectedGeneration: string, signalName: N
   }
 }
 
+const WINDOWS_HANDLE_SIGNAL_SCRIPT = String.raw`
+$ErrorActionPreference='Stop'
+$source=@'
+using System;
+using System.Runtime.InteropServices;
+public static class C2CProcessNative {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct FILETIME { public uint dwLowDateTime; public uint dwHighDateTime; }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool GetProcessTimes(IntPtr hProcess, out FILETIME creation, out FILETIME exit, out FILETIME kernel, out FILETIME user);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool TerminateProcess(IntPtr hProcess, uint exitCode);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool CloseHandle(IntPtr hObject);
+}
+'@
+Add-Type -TypeDefinition $source -Language CSharp
+$pidValue=[uint32]$args[0]
+$expected=$args[1]
+$PROCESS_TERMINATE=0x0001
+$PROCESS_QUERY_LIMITED_INFORMATION=0x1000
+$handle=[C2CProcessNative]::OpenProcess($PROCESS_TERMINATE -bor $PROCESS_QUERY_LIMITED_INFORMATION,$false,$pidValue)
+if ($handle -eq [IntPtr]::Zero) { exit 21 }
+try {
+  $creation=New-Object C2CProcessNative+FILETIME
+  $exitTime=New-Object C2CProcessNative+FILETIME
+  $kernel=New-Object C2CProcessNative+FILETIME
+  $user=New-Object C2CProcessNative+FILETIME
+  if (-not [C2CProcessNative]::GetProcessTimes($handle,[ref]$creation,[ref]$exitTime,[ref]$kernel,[ref]$user)) { exit 23 }
+  $creationTicks=([int64]$creation.dwHighDateTime * 4294967296L) + [int64]$creation.dwLowDateTime
+  $actual='win32:'+[DateTime]::FromFileTimeUtc($creationTicks).ToString('o')
+  if ($actual -ne $expected) { exit 22 }
+  if (-not [C2CProcessNative]::TerminateProcess($handle,1)) { exit 24 }
+  exit 0
+} finally {
+  [void][C2CProcessNative]::CloseHandle($handle)
+}
+`;
+
 function signalWindowsProcessHandle(pid: number, expectedGeneration: string): boolean {
   try {
     const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
     const powershell = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    const escapedExpected = expectedGeneration.replace(/'/g, "''");
-    const script = [
-      "$ErrorActionPreference='Stop'",
-      `$p=Get-Process -Id ${pid}`,
-      "$actual='win32:'+$p.StartTime.ToUniversalTime().ToString('o')",
-      `if ($actual -ne '${escapedExpected}') { exit 22 }`,
-      "$p.Kill()",
-      "exit 0",
-    ].join("; ");
-    const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], {
-      encoding: "utf8",
-      timeout: 3000,
-      windowsHide: true,
-    });
+    const result = spawnSync(
+      powershell,
+      ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_HANDLE_SIGNAL_SCRIPT, String(pid), expectedGeneration],
+      { encoding: "utf8", timeout: 5000, windowsHide: true }
+    );
     return result.status === 0;
   } catch {
     return false;
