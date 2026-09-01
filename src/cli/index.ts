@@ -321,7 +321,7 @@ program
       check("Workspace Bridge 已启动");
       say("");
       if (info.transportMode === "openai") {
-        ensureOpenAITunnelToken(info.workspaceId);
+        await ensureWorkspaceOpenAITunnelToken(root);
         check("默认安全模式：OpenAI Secure MCP Tunnel");
         say(`本机 MCP：http://127.0.0.1:${runtime.port}/mcp`);
         say(`本机认证文件：${openAITunnelTokenFile(info.workspaceId)}`);
@@ -1078,13 +1078,14 @@ tunnelCmd
       }
 
       if (mode === "quick") {
-        let state: ReturnType<typeof chooseQuickTunnel> | null = null;
+        const stateBox: { value?: ReturnType<typeof chooseQuickTunnel> } = {};
         await switchWorkspaceTransport(root, "cloudflare", {
           forceFence: true,
           afterFence: () => {
-            state = chooseQuickTunnel(workspace.id);
+            stateBox.value = chooseQuickTunnel(workspace.id);
           },
         });
+        const state = stateBox.value;
         if (!state) throw new Error("Cloudflare quick-tunnel preference was not committed");
         const payload = { ...tunnelChoicePayload(workspace), state };
         if (opts.json) say(JSON.stringify(payload));
@@ -1109,11 +1110,11 @@ tunnelCmd
       }
 
       if (!opts.json) say(NAMED_LOGIN_PROMPT);
-      let result: Awaited<ReturnType<typeof provisionNamedTunnel>> | null = null;
+      const resultBox: { value?: Awaited<ReturnType<typeof provisionNamedTunnel>> } = {};
       await switchWorkspaceTransport(root, "cloudflare", {
         forceFence: true,
         afterFence: async () => {
-          result = await provisionNamedTunnel({
+          resultBox.value = await provisionNamedTunnel({
             workspaceId: workspace.id,
             workspaceName: workspace.name,
             zone,
@@ -1121,6 +1122,7 @@ tunnelCmd
           });
         },
       });
+      const result = resultBox.value;
       if (!result) throw new Error("Cloudflare named-tunnel preference was not committed");
 
       const payload = {
