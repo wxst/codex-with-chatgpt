@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { startBridge } from "../src/bridge/server.js";
 import { writeRuntimeState, type RuntimeState } from "../src/bridge/runtime.js";
-import { stopBridge } from "../src/process/daemon.js";
+import { stopBridge, waitForBridgeStartup } from "../src/process/daemon.js";
 import { getProcessGeneration } from "../src/process/process-identity.js";
 import {
   createPendingStart,
@@ -77,6 +77,53 @@ afterEach(() => {
 });
 
 describe("latest automated-review findings", () => {
+  it("cancels a pending start when the daemon health wait times out", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("startup-timeout-cancel");
+    const pending = createPendingStart(workspace.id);
+
+    await expect(
+      waitForBridgeStartup(
+        workspace,
+        { exitCode: null },
+        pending.startId,
+        "test-daemon.log",
+        {
+          timeoutMs: 0,
+          pollMs: 0,
+          findLive: async () => null,
+          sleep: async () => undefined,
+        }
+      )
+    ).rejects.toThrow(/did not become healthy/);
+
+    expect(listPendingStarts(workspace.id)).toEqual([]);
+    expect(() => requirePendingStart(workspace.id, pending.startId)).toThrow(/cancelled|no longer valid/);
+  });
+
+  it("cancels a pending start when the daemon child exits unsuccessfully", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("startup-exit-cancel");
+    const pending = createPendingStart(workspace.id);
+
+    await expect(
+      waitForBridgeStartup(
+        workspace,
+        { exitCode: 7 },
+        pending.startId,
+        "test-daemon.log",
+        {
+          timeoutMs: 100,
+          pollMs: 0,
+          findLive: async () => null,
+          sleep: async () => undefined,
+        }
+      )
+    ).rejects.toThrow(/exited with code 7/);
+
+    expect(listPendingStarts(workspace.id)).toEqual([]);
+  });
+
   it("cancels a pending detached start before reporting the workspace stopped", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("stop-pending-start");
