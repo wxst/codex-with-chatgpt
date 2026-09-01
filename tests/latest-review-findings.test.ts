@@ -78,10 +78,12 @@ afterEach(() => {
 });
 
 describe("latest automated-review findings", () => {
-  it("always lifecycle-fences a transport mode change, even with only a pending child", () => {
+  it("always lifecycle-fences every transport mode change through the transactional helper", () => {
     const cliSource = fs.readFileSync(path.join(process.cwd(), "src", "cli", "index.ts"), "utf8");
-    expect(cliSource).toContain("if (previous !== next) {\n          await stopBridge(root);");
+    expect(cliSource).toContain("await switchWorkspaceTransport(root, next);");
+    expect(cliSource).toContain('await switchWorkspaceTransport(root, "cloudflare");');
     expect(cliSource).not.toContain("previous !== next && (await findLiveBridge");
+    expect(cliSource).not.toContain('writeTransportMode(workspace.id, "cloudflare")');
   });
 
   it("cancels a pending start when the daemon health wait times out", async () => {
