@@ -48,6 +48,8 @@ c2c transport -w <workspace> --mode openai --json
 
 The bridge refuses `/admin/tunnel/start` while OpenAI mode is active.
 
+Transport changes are lifecycle-fenced. The new mode is persisted first, then the workspace stop path runs unconditionally to cancel every pending daemon start and drain every tracked runtime generation before the command returns. This prevents a delayed child from starting with the previous transport after the user has switched modes.
+
 ## Read-only MCP invariant
 
 The ChatGPT-facing MCP surface remains limited to:
