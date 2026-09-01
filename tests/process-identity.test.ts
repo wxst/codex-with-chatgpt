@@ -143,5 +143,9 @@ describe("process generation identity", () => {
     expect(source).toContain("C2C_EXPECTED_GENERATION: expectedGeneration");
     expect(source).not.toContain("$pidValue=[uint32]$args[0]");
     expect(source).not.toContain("$expected=$args[1]");
+    expect(source).not.toContain('["-NoProfile", "-NonInteractive", "-Command", script, String(pid)]');
+    expect(source).not.toContain(
+      '["-NoProfile", "-NonInteractive", "-Command", WINDOWS_HANDLE_SIGNAL_SCRIPT, String(pid), expectedGeneration]'
+    );
   });
 });
