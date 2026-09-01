@@ -78,6 +78,7 @@ export interface BridgeStartupWaitOptions {
   pollMs?: number;
   findLive?: (workspaceId: string) => Promise<RuntimeState | null>;
   sleep?: (ms: number) => Promise<void>;
+  stopBridge?: (workspaceRoot: string) => Promise<boolean>;
 }
 
 /**
@@ -100,6 +101,7 @@ export async function waitForBridgeStartup(
   const pollMs = options.pollMs ?? 300;
   const findLive = options.findLive ?? findLiveBridge;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const stopWorkspace = options.stopBridge ?? stopBridge;
 
   try {
     const deadline = Date.now() + timeoutMs;
@@ -114,7 +116,10 @@ export async function waitForBridgeStartup(
     throw new Error(`Bridge did not become healthy within ${Math.ceil(timeoutMs / 1000)}s. See ${logFile}`);
   } catch (startupError) {
     try {
-      await stopBridge(workspace.root);
+      const cleanupConfirmed = await stopWorkspace(workspace.root);
+      if (!cleanupConfirmed) {
+        throw new Error("Failed-start cleanup was not confirmed by the workspace lifecycle fence");
+      }
     } catch (cleanupError) {
       throw new AggregateError(
         [startupError, cleanupError],
