@@ -4,7 +4,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Workspace } from "../workspace/manager.js";
 import { stateSubdir } from "../config/paths.js";
-import { findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
+import {
+  findLiveBridge,
+  listRuntimeStates,
+  probeBridge,
+  removeRuntimeStateGeneration,
+  type RuntimeState,
+} from "../bridge/runtime.js";
 import {
   processGenerationStatus,
   signalExactProcessGeneration,
@@ -275,9 +281,81 @@ export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeS
   }
 }
 
+/**
+ * Stop every persisted Bridge generation for one workspace, including exact
+ * generations whose admin endpoint is paused or wedged. The lifecycle lock
+ * prevents a new pending start from being published while the registry is
+ * enumerated and drained. A stale/dead generation may be removed, but an
+ * unknown generation or a still-responsive workspace endpoint keeps the result
+ * fail-closed instead of being reported as stopped.
+ */
 export async function stopBridge(workspaceRoot: string): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
-  const runtime = await findLiveBridge(workspace.id);
-  if (!runtime) return false;
-  return stopBridgeRuntime(workspace.root, runtime);
+  const lock = await acquireWorkspaceLifecycleLock(workspace.id);
+
+  try {
+    const runtimes = listRuntimeStates(workspace.id);
+    if (runtimes.length === 0) return false;
+
+    let allStopped = true;
+    const observedPorts = new Set<number>();
+
+    for (const runtime of runtimes) {
+      observedPorts.add(runtime.port);
+      let stopped = false;
+
+      if (runtime.processGeneration) {
+        const status = processGenerationStatus(runtime.pid, runtime.processGeneration);
+        if (status === "mismatch") {
+          // The exact recorded generation is positively gone. Do not signal a
+          // recycled PID; the port-level verification below still catches an
+          // untracked replacement Bridge using the stale snapshot's endpoint.
+          stopped = true;
+        } else {
+          stopped = await stopBridgeRuntime(workspace.root, runtime);
+        }
+      } else if (!numericPidExists(runtime.pid)) {
+        // A generationless legacy snapshot is dead only when its numeric PID is
+        // also absent. PID reuse remains conservative and cannot authorize a
+        // signal or successful stop.
+        stopped = true;
+      } else {
+        stopped = await stopBridgeRuntime(workspace.root, runtime);
+      }
+
+      if (stopped) {
+        removeRuntimeStateGeneration(runtime);
+      } else {
+        allStopped = false;
+      }
+    }
+
+    // A stale snapshot can point at a different Bridge generation on the same
+    // port. Never report success while any observed endpoint still identifies
+    // this workspace, even when the stale admin token cannot authenticate it.
+    for (const port of observedPorts) {
+      const health = await probeBridge(port, 1000);
+      if (health?.service === SERVICE_NAME && health.workspaceId === workspace.id && health.status === "ok") {
+        allStopped = false;
+      }
+    }
+
+    // Re-list after every stop attempt. New generation-bearing entries are
+    // allowed to disappear only on a confirmed mismatch; match/unknown and
+    // generationless live PIDs keep the operation fail-closed.
+    for (const runtime of listRuntimeStates(workspace.id)) {
+      observedPorts.add(runtime.port);
+      if (runtime.processGeneration) {
+        if (processGenerationStatus(runtime.pid, runtime.processGeneration) !== "mismatch") {
+          allStopped = false;
+        }
+      } else if (numericPidExists(runtime.pid)) {
+        allStopped = false;
+      }
+    }
+
+    return allStopped;
+  } finally {
+    lock.release();
+  }
 }
