@@ -1,0 +1,113 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import fs from "node:fs";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { startBridge } from "../src/bridge/server.js";
+import { writeRuntimeState, type RuntimeState } from "../src/bridge/runtime.js";
+import { stopBridge } from "../src/process/daemon.js";
+import { getProcessGeneration } from "../src/process/process-identity.js";
+import { openAITunnelTokenFile } from "../src/tunnel/transport-mode.js";
+import { Workspace } from "../src/workspace/manager.js";
+import { SERVICE_NAME } from "../src/version.js";
+import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
+
+const roots: string[] = [];
+const children: Array<ReturnType<typeof spawn>> = [];
+
+function makeWorkspace(name: string): Workspace {
+  const root = makeTmpDir(name);
+  roots.push(root);
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name }));
+  return new Workspace(root);
+}
+
+async function processGeneration(pid: number): Promise<string> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const generation = getProcessGeneration(pid);
+    if (generation) return generation;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Process generation unavailable for ${pid}`);
+}
+
+async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await Promise.race([
+    once(child, "exit").then(() => undefined),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("child did not exit")), 4_000)),
+  ]);
+}
+
+function runtimeFor(
+  workspace: Workspace,
+  pid: number,
+  generation: string,
+  port: number,
+  suffix: string
+): RuntimeState {
+  return {
+    service: SERVICE_NAME,
+    version: "0.1.0",
+    workspaceId: workspace.id,
+    workspaceRoot: workspace.root,
+    pid,
+    processGeneration: generation,
+    port,
+    adminToken: `c2c_admin_${suffix}`,
+    publicUrl: null,
+    startedAt: new Date(Date.now() + port).toISOString(),
+  };
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  delete process.env.C2C_STATE_DIR;
+  delete process.env.C2C_PENDING_START_ID;
+  for (const child of children.splice(0)) {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }
+  for (const root of roots.splice(0)) cleanup(root);
+});
+
+describe("latest automated-review findings", () => {
+  it("stops every persisted exact generation even when every admin/health probe is unavailable", async () => {
+    if (process.platform !== "linux") return;
+    isolateStateDir();
+    const workspace = makeWorkspace("stop-all-generations");
+    const first = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const second = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    children.push(first, second);
+    if (!first.pid || !second.pid) throw new Error("child pid unavailable");
+
+    writeRuntimeState(runtimeFor(workspace, first.pid, await processGeneration(first.pid), 49101, "first"));
+    writeRuntimeState(runtimeFor(workspace, second.pid, await processGeneration(second.pid), 49102, "second"));
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("bridge endpoint wedged"));
+
+    expect(await stopBridge(workspace.root)).toBe(true);
+    await Promise.all([waitForExit(first), waitForExit(second)]);
+    expect(first.exitCode !== null || first.signalCode !== null).toBe(true);
+    expect(second.exitCode !== null || second.signalCode !== null).toBe(true);
+  });
+
+  it("refuses replacement startup from process-generation evidence before creating tunnel credentials", async () => {
+    if (process.platform !== "linux") return;
+    isolateStateDir();
+    const workspace = makeWorkspace("startup-generation-fence");
+    const generation = await processGeneration(process.pid);
+    writeRuntimeState(runtimeFor(workspace, process.pid, generation, 49111, "existing"));
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("existing bridge event loop paused"));
+
+    await expect(
+      startBridge({
+        workspaceRoot: workspace.root,
+        port: 0,
+        transportMode: "openai",
+        persistRuntime: true,
+      })
+    ).rejects.toThrow(/already active|may still be active/);
+
+    expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
+  });
+});
