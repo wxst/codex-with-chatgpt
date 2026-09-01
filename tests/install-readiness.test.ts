@@ -76,6 +76,12 @@ describe("transactional transport switching", () => {
     expect(stopCalls).toBe(0);
     expect(result).toEqual({ previous: "openai", mode: "openai", changed: false });
   });
+
+  it("routes both transport commands through the transactional helper", () => {
+    const cli = fs.readFileSync(path.join(process.cwd(), "src", "cli", "index.ts"), "utf8");
+    expect(cli).not.toContain('writeTransportMode(workspace.id, "cloudflare")');
+    expect(cli.match(/switchWorkspaceTransport\(root,/gu)?.length).toBeGreaterThanOrEqual(2);
+  });
 });
 
 describe("installation documentation contract", () => {
