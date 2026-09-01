@@ -131,5 +131,7 @@ describe("process generation identity", () => {
     expect(source).toContain("let cachedCurrentProcessGeneration: string | undefined");
     expect(source).toContain("if (pid === process.pid && generation) cachedCurrentProcessGeneration = generation");
     expect(source).not.toContain("cachedCurrentProcessGeneration = null");
+    expect(source).toContain(String.raw`if (!/^win32:\d{4}-\d{2}-\d{2}T/.test(generation)) return null;`);
+    expect(source).not.toContain(String.raw`if (!/^win32:\\d`);
   });
 });
