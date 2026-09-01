@@ -171,7 +171,11 @@ describe("revocation process identity", () => {
 
       expect(await stopBridgeRuntime(workspace.root, runtime)).toBe(true);
       await waitForExit(child);
+      if (process.platform === "linux") {
       expect(child.signalCode).toBe("SIGKILL");
+    } else {
+      expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+    }
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }

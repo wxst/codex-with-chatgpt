@@ -51,37 +51,8 @@ function windowsGeneration(pid: number): string | null {
     const powershell = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
     const script = String.raw`
 $ErrorActionPreference='Stop'
-$source=@'
-using System;
-using System.Runtime.InteropServices;
-public static class C2CGenerationNative {
-  [StructLayout(LayoutKind.Sequential)]
-  public struct FILETIME { public uint dwLowDateTime; public uint dwHighDateTime; }
-  [DllImport("kernel32.dll", SetLastError=true)]
-  public static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
-  [DllImport("kernel32.dll", SetLastError=true)]
-  public static extern bool GetProcessTimes(IntPtr hProcess, out FILETIME creation, out FILETIME exit, out FILETIME kernel, out FILETIME user);
-  [DllImport("kernel32.dll", SetLastError=true)]
-  public static extern bool CloseHandle(IntPtr hObject);
-}
-'@
-Add-Type -TypeDefinition $source -Language CSharp
-$pidValue=[uint32]$env:C2C_PROCESS_PID
-$PROCESS_QUERY_LIMITED_INFORMATION=0x1000
-$handle=[C2CGenerationNative]::OpenProcess($PROCESS_QUERY_LIMITED_INFORMATION,$false,$pidValue)
-if ($handle -eq [IntPtr]::Zero) { exit 21 }
-try {
-  $creation=New-Object C2CGenerationNative+FILETIME
-  $exitTime=New-Object C2CGenerationNative+FILETIME
-  $kernel=New-Object C2CGenerationNative+FILETIME
-  $user=New-Object C2CGenerationNative+FILETIME
-  if (-not [C2CGenerationNative]::GetProcessTimes($handle,[ref]$creation,[ref]$exitTime,[ref]$kernel,[ref]$user)) { exit 22 }
-  $creationTicks=([int64]$creation.dwHighDateTime * 4294967296L) + [int64]$creation.dwLowDateTime
-  'win32:'+[DateTime]::FromFileTimeUtc($creationTicks).ToString('o')
-  exit 0
-} finally {
-  [void][C2CGenerationNative]::CloseHandle($handle)
-}
+$process = Get-Process -Id ([int]$env:C2C_PROCESS_PID) -ErrorAction Stop
+'win32:'+$process.StartTime.ToUniversalTime().ToString('o')
 `;
     const result = spawnSync(
       powershell,
