@@ -81,11 +81,13 @@ export interface BridgeStartupWaitOptions {
 }
 
 /**
- * Wait for one detached daemon launch to publish a usable runtime. The one-shot
- * pending intent is retained only while the launch can still legitimately
- * complete. Every unsuccessful path—timeout, child failure, probe exception, or
- * cancellation—removes the intent so a delayed child cannot start after the
- * caller has already observed failure.
+ * Wait for one detached daemon launch to publish a usable runtime. Every
+ * unsuccessful outcome is cleaned up through the same lifecycle-fenced stop
+ * path used by explicit stop/restart/transport changes. If the child has not
+ * consumed its pending intent, stop cancels it before the child can proceed. If
+ * the child consumed the intent and published a runtime just before cleanup,
+ * stop drains that exact process generation instead of leaving a Bridge alive
+ * after the caller has already observed startup failure.
  */
 export async function waitForBridgeStartup(
   workspace: Workspace,
@@ -98,24 +100,28 @@ export async function waitForBridgeStartup(
   const pollMs = options.pollMs ?? 300;
   const findLive = options.findLive ?? findLiveBridge;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  let succeeded = false;
 
   try {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await sleep(pollMs);
       const runtime = await findLive(workspace.id);
-      if (runtime) {
-        succeeded = true;
-        return runtime;
-      }
+      if (runtime) return runtime;
       if (child.exitCode !== null && child.exitCode !== 0) {
         throw new Error(`Bridge process exited with code ${child.exitCode}. See ${logFile}`);
       }
     }
     throw new Error(`Bridge did not become healthy within ${Math.ceil(timeoutMs / 1000)}s. See ${logFile}`);
-  } finally {
-    if (!succeeded) cancelPendingStart(workspace.id, pendingStartId);
+  } catch (startupError) {
+    try {
+      await stopBridge(workspace.root);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [startupError, cleanupError],
+        "Bridge startup failed and the workspace could not be fully fenced during cleanup"
+      );
+    }
+    throw startupError;
   }
 }
 
