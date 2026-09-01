@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { stateSubdir } from "../config/paths.js";
 import {
-  processGenerationMatches,
+  processGenerationStatus,
   requireCurrentProcessGeneration,
 } from "./process-identity.js";
 
@@ -104,8 +104,9 @@ function parseTicket(content: string): LifecycleTicket | null {
 
 function ticketIsFresh(entry: TicketEntry, graceMs: number): boolean {
   const ticket = entry.ticket;
-  if (ticket?.processGeneration && processGenerationMatches(ticket.pid, ticket.processGeneration)) {
-    return true;
+  if (ticket?.processGeneration) {
+    const status = processGenerationStatus(ticket.pid, ticket.processGeneration);
+    if (status === "match" || status === "unknown") return true;
   }
   return entry.mtimeMs > 0 && Date.now() - entry.mtimeMs < graceMs;
 }
@@ -185,8 +186,10 @@ function refreshTicket(file: string, nonce: string, graceMs: number): boolean {
     const ticket = parseTicket(fs.readFileSync(file, "utf8"));
     if (!ticket || ticket.nonce !== nonce || !ticket.processGeneration) return false;
 
-    const sameGeneration = processGenerationMatches(ticket.pid, ticket.processGeneration);
-    if (!sameGeneration && Date.now() - stat.mtimeMs >= graceMs) return false;
+    const status = processGenerationStatus(ticket.pid, ticket.processGeneration);
+    // Unknown identity is not proof of owner death. Keep the ticket fresh so a
+    // transient /proc or PowerShell failure cannot allow a second owner in.
+    if (status === "mismatch" && Date.now() - stat.mtimeMs >= graceMs) return false;
 
     const now = new Date();
     fs.utimesSync(file, now, now);
@@ -228,11 +231,11 @@ export function isWorkspaceLifecycleLockHeldBy(
   if (!nonce) return false;
   const own = ownTicketEntry(workspaceId, nonce);
   if (!own || !own.ticket || !own.ticket.acquired || own.ticket.choosing) return false;
-  // Lifecycle ownership never degrades to an mtime-only lease. If generation
-  // proof disappears, the holder is fenced out rather than allowed to resume a
-  // sensitive critical section after a long pause.
   if (!own.ticket.processGeneration) return false;
-  if (!processGenerationMatches(own.ticket.pid, own.ticket.processGeneration)) return false;
+  // The holder itself must positively prove identity before entering/resuming a
+  // sensitive critical section. "unknown" fences the holder, while other
+  // contenders still treat its ticket as active and remain blocked.
+  if (processGenerationStatus(own.ticket.pid, own.ticket.processGeneration) !== "match") return false;
 
   for (const entry of listTickets(workspaceId)) {
     if (!ticketIsFresh(entry, orphanGraceMs)) continue;
@@ -251,8 +254,6 @@ export async function acquireWorkspaceLifecycleLock(
   options: WorkspaceLifecycleLockOptions = {}
 ): Promise<WorkspaceLifecycleLock> {
   assertWorkspaceId(workspaceId);
-  // This is a security precondition, not an optional optimization. Never create
-  // a lifecycle ticket whose ownership could later fall back to heartbeat age.
   const currentProcessGeneration = requireCurrentProcessGeneration();
   const timeoutMs = options.timeoutMs ?? 60_000;
   const pollMs = options.pollMs ?? 50;
@@ -302,13 +303,16 @@ export async function acquireWorkspaceLifecycleLock(
       }
 
       const own = ownTicketEntry(workspaceId, nonce);
-      if (
-        !own ||
-        !own.ticket ||
-        !own.ticket.processGeneration ||
-        !processGenerationMatches(own.ticket.pid, own.ticket.processGeneration)
-      ) {
+      if (!own || !own.ticket || !own.ticket.processGeneration) {
         throw new Error(`Workspace lifecycle ticket lost process-generation ownership: ${workspaceId}`);
+      }
+      const ownStatus = processGenerationStatus(own.ticket.pid, own.ticket.processGeneration);
+      if (ownStatus !== "match") {
+        throw new Error(
+          ownStatus === "unknown"
+            ? `Workspace lifecycle ticket process identity is temporarily unavailable: ${workspaceId}`
+            : `Workspace lifecycle ticket lost process-generation ownership: ${workspaceId}`
+        );
       }
       ticket = own.ticket;
 
