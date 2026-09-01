@@ -110,6 +110,58 @@ describe("generationless legacy revocation", () => {
     expect(stopCalls).toBe(0);
     expect(removeCalls).toBe(0);
   });
+
+  it("keeps a runtime registered when identity becomes unknown after an exact stop attempt", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("post-stop-unknown-generation");
+    const runtime: RuntimeState = {
+      service: SERVICE_NAME,
+      version: "0.1.0",
+      workspaceId: workspace.id,
+      workspaceRoot: workspace.root,
+      pid: process.pid,
+      processGeneration: "expected-generation",
+      port: 49993,
+      adminToken: "post-stop-admin-token",
+      publicUrl: null,
+      startedAt: new Date().toISOString(),
+    };
+    let generationChecks = 0;
+    let stopCalls = 0;
+    let removeCalls = 0;
+
+    await expect(
+      revokeWorkspaceAccess(workspace.root, {
+        listRuntimeStates: () => [runtime],
+        removeRuntimeStateGeneration: () => {
+          removeCalls += 1;
+        },
+        processGenerationStatus: () => {
+          generationChecks += 1;
+          return generationChecks === 1 ? "match" : "unknown";
+        },
+        adminFetch: async (_runtime, method, route) => {
+          if (method === "POST" && route === "/admin/revoke-all") return { revoked: 0 } as never;
+          throw new Error("unexpected admin request");
+        },
+        probeBridge: async () => null,
+        stopBridge: async () => {
+          stopCalls += 1;
+          return true;
+        },
+        authStoreFactory: () => ({ revokeAll: () => 0 }),
+        revokeTunnelToken: () => false,
+        cancelPendingStarts: () => 0,
+        listPendingStarts: () => [],
+        sleep: async () => undefined,
+        stopTimeoutMs: 0,
+        maxRuntimeGenerations: 1,
+      })
+    ).rejects.toThrow(/Failed to fully revoke/);
+
+    expect(stopCalls).toBe(1);
+    expect(removeCalls).toBe(0);
+  });
 });
 
 describe("exact process-termination platform support", () => {
@@ -135,5 +187,12 @@ describe("exact process-termination platform support", () => {
     expect(source).toContain("TerminateProcess");
     expect(source).toContain("WaitForExit(2000)");
     expect(source).toContain("probeWindowsExactTermination()");
+  });
+
+  it("does not collapse unknown daemon process identity into a confirmed exit", () => {
+    const source = fs.readFileSync(path.resolve("src/process/daemon.ts"), "utf8");
+    expect(source).toContain("processGenerationStatus");
+    expect(source).not.toContain("processGenerationMatches");
+    expect(source).toContain('=== "mismatch"');
   });
 });
