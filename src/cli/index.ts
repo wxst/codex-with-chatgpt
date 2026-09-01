@@ -1067,8 +1067,11 @@ tunnelCmd
     const root = resolveWorkspace(opts.workspace);
     try {
       const workspace = new Workspace(root);
-      writeTransportMode(workspace.id, "cloudflare");
       const mode = opts.mode.trim().toLowerCase();
+      if (mode !== "quick" && mode !== "named") {
+        throw new Error("mode must be quick or named");
+      }
+      await switchWorkspaceTransport(root, "cloudflare");
       const previous = readTunnelState(workspace.id);
       if (mode === "quick") {
         const state = chooseQuickTunnel(workspace.id);
