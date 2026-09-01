@@ -15,7 +15,8 @@
     "dev": "tsx src/cli/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke:install": "node scripts/install-smoke.mjs"
   },
   "packageManager": "pnpm@11.24.0",
   "dependencies": {

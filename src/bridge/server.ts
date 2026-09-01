@@ -15,8 +15,107 @@ import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { ensureOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
+import {
+  processGenerationStatus,
+  requireCurrentProcessGeneration,
+  requireProcessSafetyRuntime,
+} from "../process/process-identity.js";
+import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
+import {
+  cancelPendingStart,
+  completePendingStart,
+  requirePendingStart,
+} from "../process/startup-registry.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
-import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import {
+  listRuntimeStates,
+  removeRuntimeStateGeneration,
+  writeRuntimeState,
+  type RuntimeState,
+} from "./runtime.js";
+
+const activePersistedBridges = new Set<string>();
+const PENDING_START_ENV = "C2C_PENDING_START_ID";
+
+interface RuntimeIdentityPayload {
+  service?: string;
+  workspaceId?: string;
+  pid?: number;
+  processGeneration?: string | null;
+  port?: number;
+  startedAt?: string;
+}
+
+async function fetchLocalJson<T>(
+  url: string,
+  timeoutMs: number,
+  headers?: Record<string, string>
+): Promise<T | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { headers, signal: controller.signal });
+    if (!response.ok) return null;
+    return (await response.json()) as T;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function exactRuntimeIdentityMatches(runtime: RuntimeState, info: RuntimeIdentityPayload): boolean {
+  return (
+    info.service === SERVICE_NAME &&
+    info.workspaceId === runtime.workspaceId &&
+    info.pid === runtime.pid &&
+    info.port === runtime.port &&
+    info.startedAt === runtime.startedAt &&
+    (!runtime.processGeneration || info.processGeneration === runtime.processGeneration)
+  );
+}
+
+async function persistedRuntimeIsLiveBridge(runtime: RuntimeState): Promise<boolean> {
+  const base = `http://127.0.0.1:${runtime.port}`;
+  const info = await fetchLocalJson<RuntimeIdentityPayload>(`${base}/admin/info`, 1500, {
+    Authorization: `Bearer ${runtime.adminToken}`,
+  });
+  if (info && exactRuntimeIdentityMatches(runtime, info)) return true;
+
+  const health = await fetchLocalJson<{ service?: string; workspaceId?: string }>(`${base}/health`, 1000);
+  return health?.service === SERVICE_NAME && health.workspaceId === runtime.workspaceId;
+}
+
+/**
+ * Refuse a second persisted Bridge whenever an existing runtime may still own
+ * credentials. Generation-bearing runtimes use exact OS identity before any
+ * endpoint probe: `match` proves a live Bridge process and `unknown` fails
+ * closed. A generationless compatibility snapshot cannot safely claim process
+ * ownership from a reusable numeric PID, so it remains governed by exact
+ * authenticated application identity plus the conservative workspace health
+ * fallback. Only positively dead or unrelated state may permit startup.
+ */
+async function assertNoActivePersistedBridge(workspace: Workspace): Promise<void> {
+  if (activePersistedBridges.has(workspace.id)) {
+    throw new Error(`A persisted bridge is already running for workspace ${workspace.id}`);
+  }
+
+  for (const existing of listRuntimeStates(workspace.id)) {
+    if (existing.processGeneration) {
+      const generation = processGenerationStatus(existing.pid, existing.processGeneration);
+      if (generation === "match") {
+        throw new Error(`A persisted bridge process is already active for workspace ${workspace.id}`);
+      }
+      if (generation === "unknown") {
+        throw new Error(`A persisted bridge process may still be active for workspace ${workspace.id}`);
+      }
+    }
+
+    if (await persistedRuntimeIsLiveBridge(existing)) {
+      throw new Error(`A persisted bridge runtime is already active for workspace ${workspace.id}`);
+    }
+  }
+}
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
@@ -36,15 +135,14 @@ export interface BridgeOptions {
   host?: string;
   logger?: Logger;
   tunnelProvider?: TunnelProvider;
-  /** Transport is explicit in production; direct library callers retain the legacy default. */
   transportMode?: TransportMode;
-  /** Test/embedding override. Production reads a mode-0600 per-workspace token file. */
   openAITunnelToken?: string;
-  /** Persist runtime state file (disable in tests). */
   persistRuntime?: boolean;
   authStoreFile?: string;
   pairingTtlMs?: number;
   accessTokenTtlMs?: number;
+  /** Parent-created one-shot start intent for detached daemon launches. */
+  pendingStartId?: string;
 }
 
 export interface Bridge {
@@ -61,9 +159,6 @@ export interface Bridge {
   close(): Promise<void>;
 }
 
-/**
- * Listen on the preferred port; on EADDRINUSE fall back to an ephemeral port.
- */
 function listen(app: express.Express, host: string, preferredPort: number): Promise<{ server: Server; port: number }> {
   return new Promise((resolve, reject) => {
     const tryListen = (port: number, allowFallback: boolean): void => {
@@ -86,8 +181,30 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
 }
 
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
-  const logger = opts.logger ?? nullLogger;
   const workspace = new Workspace(opts.workspaceRoot);
+  const pendingStartId = opts.pendingStartId ?? process.env[PENDING_START_ENV];
+  return withWorkspaceLifecycleLock(workspace.id, async () => {
+    if (pendingStartId) requirePendingStart(workspace.id, pendingStartId);
+    try {
+      const bridge = await startBridgeUnlocked(opts, workspace);
+      if (pendingStartId) completePendingStart(workspace.id, pendingStartId);
+      return bridge;
+    } catch (error) {
+      if (pendingStartId) cancelPendingStart(workspace.id, pendingStartId);
+      throw error;
+    }
+  });
+}
+
+async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): Promise<Bridge> {
+  // Verify exact termination support before reading or creating any OAuth/tunnel
+  // credential. A host that cannot safely stop a wedged Bridge cannot start one.
+  requireProcessSafetyRuntime();
+
+  const persistRuntimeEnabled = opts.persistRuntime !== false;
+  if (persistRuntimeEnabled) await assertNoActivePersistedBridge(workspace);
+
+  const logger = opts.logger ?? nullLogger;
   const host = opts.host ?? DEFAULT_HOST;
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
@@ -100,6 +217,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
   const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
+  const processGeneration = requireCurrentProcessGeneration();
 
   let publicBaseUrl: string | null = null;
 
@@ -114,15 +232,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     return `${proto}://${hostHeader}`;
   };
 
-  // ---- Health (public but minimal; listener itself is loopback-only) --------
-
   app.get("/health", (_req, res) => {
     res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok" });
   });
-
-  // ---- OAuth + discovery ---------------------------------------------------
-  // Retained for the explicit Cloudflare fallback. In OpenAI mode the MCP
-  // endpoint uses a private per-workspace tunnel token instead.
 
   app.use(
     createOAuthRouter({
@@ -133,8 +245,6 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       logger,
     })
   );
-
-  // ---- MCP endpoint ---------------------------------------------------------
 
   const mcpHandler = createMcpHttpHandler(() => createMcpServer({ workspace, logger }), logger);
   const mcpAuth =
@@ -150,10 +260,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     }
   );
 
-  // ---- Admin API (loopback + admin token only; used by the CLI/Skill) --------
-
   const adminGuard = (req: Request, res: Response, next: NextFunction): void => {
-    // Defense in depth: reject anything that arrived through a proxy/tunnel.
     const remote = req.socket.remoteAddress ?? "";
     const isLoopback = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
     const viaProxy = Boolean(
@@ -165,7 +272,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     const header = req.headers.authorization ?? "";
     const token = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
     if (!isLoopback || viaProxy || token !== adminToken) {
-      res.status(404).end(); // do not advertise the admin surface
+      res.status(404).end();
       return;
     }
     next();
@@ -191,6 +298,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       tokenCount: authStore.tokenCount(),
       pairingActive: pairing.hasActiveSession(),
       pid: process.pid,
+      processGeneration,
       startedAt,
     });
   });
@@ -227,7 +335,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   app.post("/admin/revoke-all", adminGuard, (_req, res) => {
     const count = authStore.revokeAll();
     pairing.invalidateAll();
-    logger.info(`Revoked all tokens (${count})`);
+    logger.info("Revoked all tokens", { count });
     res.json({ revoked: count });
   });
 
@@ -242,30 +350,43 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const startedAt = new Date().toISOString();
   logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
+  const runtimeState = (): RuntimeState => ({
+    service: SERVICE_NAME,
+    version: VERSION,
+    workspaceId: workspace.id,
+    workspaceRoot: workspace.root,
+    pid: process.pid,
+    processGeneration,
+    port,
+    adminToken,
+    publicUrl: publicBaseUrl,
+    startedAt,
+  });
+
   const persistRuntime = (): void => {
-    if (opts.persistRuntime === false) return;
-    const state: RuntimeState = {
-      service: SERVICE_NAME,
-      version: VERSION,
-      workspaceId: workspace.id,
-      workspaceRoot: workspace.root,
-      pid: process.pid,
-      port,
-      adminToken,
-      publicUrl: publicBaseUrl,
-      startedAt,
-    };
-    writeRuntimeState(state);
+    if (!persistRuntimeEnabled) return;
+    writeRuntimeState(runtimeState());
   };
-  persistRuntime();
+
+  try {
+    persistRuntime();
+  } catch (error) {
+    await tunnel.stop().catch(() => undefined);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (persistRuntimeEnabled) removeRuntimeStateGeneration(runtimeState());
+    throw error;
+  }
+
+  if (persistRuntimeEnabled) activePersistedBridges.add(workspace.id);
 
   let closed = false;
   const shutdown = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    if (persistRuntimeEnabled) activePersistedBridges.delete(workspace.id);
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
+    if (persistRuntimeEnabled) removeRuntimeStateGeneration(runtimeState());
     logger.info("Bridge stopped");
   };
 
