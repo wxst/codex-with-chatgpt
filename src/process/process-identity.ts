@@ -66,7 +66,7 @@ public static class C2CGenerationNative {
 }
 '@
 Add-Type -TypeDefinition $source -Language CSharp
-$pidValue=[uint32]$args[0]
+$pidValue=[uint32]$env:C2C_PROCESS_PID
 $PROCESS_QUERY_LIMITED_INFORMATION=0x1000
 $handle=[C2CGenerationNative]::OpenProcess($PROCESS_QUERY_LIMITED_INFORMATION,$false,$pidValue)
 if ($handle -eq [IntPtr]::Zero) { exit 21 }
@@ -85,11 +85,15 @@ try {
 `;
     const result = spawnSync(
       powershell,
-      ["-NoProfile", "-NonInteractive", "-Command", script, String(pid)],
+      ["-NoProfile", "-NonInteractive", "-Command", script],
       {
         encoding: "utf8",
         timeout: WINDOWS_GENERATION_TIMEOUT_MS,
         windowsHide: true,
+        env: {
+          ...process.env,
+          C2C_PROCESS_PID: String(pid),
+        },
       }
     );
     if (result.status !== 0) return null;
@@ -399,8 +403,8 @@ public static class C2CProcessNative {
 }
 '@
 Add-Type -TypeDefinition $source -Language CSharp
-$pidValue=[uint32]$args[0]
-$expected=$args[1]
+$pidValue=[uint32]$env:C2C_PROCESS_PID
+$expected=$env:C2C_EXPECTED_GENERATION
 $PROCESS_TERMINATE=0x0001
 $PROCESS_QUERY_LIMITED_INFORMATION=0x1000
 $handle=[C2CProcessNative]::OpenProcess($PROCESS_TERMINATE -bor $PROCESS_QUERY_LIMITED_INFORMATION,$false,$pidValue)
@@ -427,8 +431,17 @@ function signalWindowsProcessHandle(pid: number, expectedGeneration: string): bo
     const powershell = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
     const result = spawnSync(
       powershell,
-      ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_HANDLE_SIGNAL_SCRIPT, String(pid), expectedGeneration],
-      { encoding: "utf8", timeout: WINDOWS_NATIVE_SIGNAL_TIMEOUT_MS, windowsHide: true }
+      ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_HANDLE_SIGNAL_SCRIPT],
+      {
+        encoding: "utf8",
+        timeout: WINDOWS_NATIVE_SIGNAL_TIMEOUT_MS,
+        windowsHide: true,
+        env: {
+          ...process.env,
+          C2C_PROCESS_PID: String(pid),
+          C2C_EXPECTED_GENERATION: expectedGeneration,
+        },
+      }
     );
     return result.status === 0;
   } catch {
