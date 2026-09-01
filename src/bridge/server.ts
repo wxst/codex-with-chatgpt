@@ -15,7 +15,11 @@ import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { ensureOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
-import { requireCurrentProcessGeneration, requireProcessSafetyRuntime } from "../process/process-identity.js";
+import {
+  processGenerationStatus,
+  requireCurrentProcessGeneration,
+  requireProcessSafetyRuntime,
+} from "../process/process-identity.js";
 import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
 import {
   cancelPendingStart,
@@ -71,6 +75,15 @@ function exactRuntimeIdentityMatches(runtime: RuntimeState, info: RuntimeIdentit
   );
 }
 
+function numericPidExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
 async function persistedRuntimeIsLiveBridge(runtime: RuntimeState): Promise<boolean> {
   const base = `http://127.0.0.1:${runtime.port}`;
   const info = await fetchLocalJson<RuntimeIdentityPayload>(`${base}/admin/info`, 1500, {
@@ -82,12 +95,33 @@ async function persistedRuntimeIsLiveBridge(runtime: RuntimeState): Promise<bool
   return health?.service === SERVICE_NAME && health.workspaceId === runtime.workspaceId;
 }
 
+/**
+ * Refuse a second persisted Bridge whenever an existing runtime may still own
+ * credentials. Process-generation evidence is consulted before endpoint health:
+ * an exact match proves the process is active, while an unavailable lookup with
+ * the numeric PID still present is `unknown` and must also fail closed. Legacy
+ * generationless snapshots use the same conservative PID rule. Only a confirmed
+ * dead generation may fall through to endpoint checks for a replacement Bridge
+ * on the recorded port.
+ */
 async function assertNoActivePersistedBridge(workspace: Workspace): Promise<void> {
   if (activePersistedBridges.has(workspace.id)) {
     throw new Error(`A persisted bridge is already running for workspace ${workspace.id}`);
   }
 
   for (const existing of listRuntimeStates(workspace.id)) {
+    if (existing.processGeneration) {
+      const generation = processGenerationStatus(existing.pid, existing.processGeneration);
+      if (generation === "match") {
+        throw new Error(`A persisted bridge process is already active for workspace ${workspace.id}`);
+      }
+      if (generation === "unknown") {
+        throw new Error(`A persisted bridge process may still be active for workspace ${workspace.id}`);
+      }
+    } else if (numericPidExists(existing.pid)) {
+      throw new Error(`A legacy persisted bridge process may still be active for workspace ${workspace.id}`);
+    }
+
     if (await persistedRuntimeIsLiveBridge(existing)) {
       throw new Error(`A persisted bridge runtime is already active for workspace ${workspace.id}`);
     }
@@ -174,9 +208,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 }
 
 async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): Promise<Bridge> {
-  // On Linux, verify the declared pidfd helper runtime before reading or
-  // creating any OAuth/tunnel credential. A host that cannot safely terminate
-  // a wedged Bridge is not allowed to start one.
+  // Verify exact termination support before reading or creating any OAuth/tunnel
+  // credential. A host that cannot safely stop a wedged Bridge cannot start one.
   requireProcessSafetyRuntime();
 
   const persistRuntimeEnabled = opts.persistRuntime !== false;
