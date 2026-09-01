@@ -17,7 +17,12 @@ import {
   signalExactProcessGeneration,
 } from "./process-identity.js";
 import { acquireWorkspaceLifecycleLock } from "./workspace-lock.js";
-import { cancelPendingStart, createPendingStart } from "./startup-registry.js";
+import {
+  cancelPendingStart,
+  cancelPendingStarts,
+  createPendingStart,
+  listPendingStarts,
+} from "./startup-registry.js";
 import { SERVICE_NAME } from "../version.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -285,18 +290,23 @@ export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeS
 /**
  * Stop every persisted Bridge generation for one workspace, including exact
  * generations whose admin endpoint is paused or wedged. The lifecycle lock
- * prevents a new pending start from being published while the registry is
- * enumerated and drained. A stale/dead exact generation may be removed, but an
- * unknown generation or a still-responsive workspace endpoint keeps the result
- * fail-closed instead of being reported as stopped.
+ * prevents a new pending start from being published while pending intents are
+ * cancelled and the runtime registry is drained. A stale/dead exact generation
+ * may be removed, but an unknown generation, surviving pending intent, or a
+ * still-responsive workspace endpoint keeps the result fail-closed.
  */
 export async function stopBridge(workspaceRoot: string): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
   const lock = await acquireWorkspaceLifecycleLock(workspace.id);
 
   try {
+    const cancelledPending = cancelPendingStarts(workspace.id);
+    if (listPendingStarts(workspace.id).length !== 0) {
+      throw new Error(`Pending bridge starts remain after cancellation for workspace ${workspace.id}`);
+    }
+
     const runtimes = listRuntimeStates(workspace.id);
-    if (runtimes.length === 0) return false;
+    if (runtimes.length === 0) return cancelledPending > 0;
 
     let allStopped = true;
     const observedPorts = new Set<number>();
@@ -357,6 +367,7 @@ export async function stopBridge(workspaceRoot: string): Promise<boolean> {
       }
     }
 
+    if (listPendingStarts(workspace.id).length !== 0) allStopped = false;
     return allStopped;
   } finally {
     lock.release();
