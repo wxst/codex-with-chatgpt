@@ -1,0 +1,77 @@
+name: Apply installation-readiness CLI patch
+
+on:
+  push:
+    branches:
+      - fix/review-findings
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/review-findings
+          fetch-depth: 0
+
+      - name: Wire transactional transport helper
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cli = Path("src/cli/index.ts")
+          text = cli.read_text(encoding="utf-8")
+
+          old_import = '''import {
+            ensureOpenAITunnelToken,
+            openAITunnelTokenFile,
+            readTransportMode,
+            writeTransportMode,
+            type TransportMode,
+          } from "../tunnel/transport-mode.js";'''
+          new_import = '''import {
+            ensureOpenAITunnelToken,
+            openAITunnelTokenFile,
+            readTransportMode,
+            type TransportMode,
+          } from "../tunnel/transport-mode.js";
+          import { switchWorkspaceTransport } from "../tunnel/switch-transport.js";'''
+
+          old_block = '''        const next = requested as TransportMode;
+                  const previous = readTransportMode(workspace.id);
+                  writeTransportMode(workspace.id, next);
+                  if (previous !== next) {
+                    await stopBridge(root);
+                  }'''
+          new_block = '''        const next = requested as TransportMode;
+                  await switchWorkspaceTransport(root, next);'''
+
+          if text.count(old_import) != 1:
+              raise SystemExit(f"expected one transport import block, found {text.count(old_import)}")
+          if text.count(old_block) != 1:
+              raise SystemExit(f"expected one transport switch block, found {text.count(old_block)}")
+
+          cli.write_text(text.replace(old_import, new_import).replace(old_block, new_block), encoding="utf-8")
+
+          for temporary in (
+              Path(".github/workflows/update-stop-tests.yml"),
+              Path(".github/workflows/apply-install-readiness.yml"),
+          ):
+              if temporary.exists():
+                  temporary.unlink()
+          PY
+
+      - name: Commit patch and remove temporary workflows
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/cli/index.ts .github/workflows
+          git commit -m "fix: roll back failed transport transitions"
+          git push origin HEAD:fix/review-findings
