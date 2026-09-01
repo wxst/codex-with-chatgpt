@@ -73,10 +73,57 @@ export function openPrivateAppendFile(file: string): number {
   }
 }
 
+export interface BridgeStartupWaitOptions {
+  timeoutMs?: number;
+  pollMs?: number;
+  findLive?: (workspaceId: string) => Promise<RuntimeState | null>;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Wait for one detached daemon launch to publish a usable runtime. The one-shot
+ * pending intent is retained only while the launch can still legitimately
+ * complete. Every unsuccessful path—timeout, child failure, probe exception, or
+ * cancellation—removes the intent so a delayed child cannot start after the
+ * caller has already observed failure.
+ */
+export async function waitForBridgeStartup(
+  workspace: Workspace,
+  child: Pick<ChildProcess, "exitCode">,
+  pendingStartId: string,
+  logFile: string,
+  options: BridgeStartupWaitOptions = {}
+): Promise<RuntimeState> {
+  const timeoutMs = options.timeoutMs ?? 20_000;
+  const pollMs = options.pollMs ?? 300;
+  const findLive = options.findLive ?? findLiveBridge;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let succeeded = false;
+
+  try {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await sleep(pollMs);
+      const runtime = await findLive(workspace.id);
+      if (runtime) {
+        succeeded = true;
+        return runtime;
+      }
+      if (child.exitCode !== null && child.exitCode !== 0) {
+        throw new Error(`Bridge process exited with code ${child.exitCode}. See ${logFile}`);
+      }
+    }
+    throw new Error(`Bridge did not become healthy within ${Math.ceil(timeoutMs / 1000)}s. See ${logFile}`);
+  } finally {
+    if (!succeeded) cancelPendingStart(workspace.id, pendingStartId);
+  }
+}
+
 export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: RuntimeState; spawned: boolean }> {
   const workspace = new Workspace(workspaceRoot);
   const lock = await acquireWorkspaceLifecycleLock(workspace.id);
   let child: ChildProcess | null = null;
+  let pendingStartId: string | null = null;
   const logFile = daemonLogFile(workspace.id);
 
   try {
@@ -84,6 +131,7 @@ export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: Ru
     if (existing) return { runtime: existing, spawned: false };
 
     const pending = createPendingStart(workspace.id);
+    pendingStartId = pending.startId;
     const logFd = openPrivateAppendFile(logFile);
     const entry = cliEntry();
     try {
@@ -103,18 +151,13 @@ export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: Ru
     lock.release();
   }
 
-  if (!child) throw new Error(`Bridge process could not be spawned. See ${logFile}`);
-
-  const deadline = Date.now() + 20_000;
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    const runtime = await findLiveBridge(workspace.id);
-    if (runtime) return { runtime, spawned: true };
-    if (child.exitCode !== null && child.exitCode !== 0) {
-      throw new Error(`Bridge process exited with code ${child.exitCode}. See ${logFile}`);
-    }
+  if (!child || !pendingStartId) {
+    if (pendingStartId) cancelPendingStart(workspace.id, pendingStartId);
+    throw new Error(`Bridge process could not be spawned. See ${logFile}`);
   }
-  throw new Error(`Bridge did not become healthy within 20s. See ${logFile}`);
+
+  const runtime = await waitForBridgeStartup(workspace, child, pendingStartId, logFile);
+  return { runtime, spawned: true };
 }
 
 export async function adminFetch<T = unknown>(
