@@ -78,6 +78,28 @@ describe("pending bridge start fencing", () => {
 });
 
 describe("per-generation runtime registry", () => {
+  it("never overwrites the only canonical record of a pre-registry Bridge", () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("legacy-canonical-preservation");
+    const legacy: RuntimeState = {
+      ...runtimeFor(workspace, 101010, 48765, "legacy"),
+      service: "codex-with-chatgpt",
+      processGeneration: undefined,
+    };
+    const hardened = runtimeFor(workspace, 202020, 49001, "hardened");
+    const canonical = runtimeFile(workspace.id);
+    const legacyBytes = JSON.stringify(legacy, null, 2);
+
+    fs.writeFileSync(canonical, legacyBytes, { mode: 0o600 });
+    writeRuntimeState(hardened);
+
+    expect(fs.readFileSync(canonical, "utf8")).toBe(legacyBytes);
+    expect(fs.existsSync(runtimeGenerationFile(hardened))).toBe(true);
+    expect(new Set(listRuntimeStates(workspace.id).map((state) => state.port))).toEqual(
+      new Set([legacy.port, hardened.port])
+    );
+  });
+
   it("keeps multiple ports authoritative even when the legacy canonical snapshot is overwritten", () => {
     isolateStateDir();
     const workspace = makeWorkspace("multi-runtime");
