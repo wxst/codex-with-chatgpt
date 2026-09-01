@@ -5,8 +5,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { revokeWorkspaceAccess } from "../src/auth/revoke.js";
 import {
+  listRuntimeStates,
   readRuntimeState,
   runtimeFile,
+  runtimeGenerationFile,
   writeRuntimeState,
   type RuntimeState,
 } from "../src/bridge/runtime.js";
@@ -55,7 +57,7 @@ afterEach(() => {
 });
 
 describe("runtime snapshot publication", () => {
-  it("publishes runtime JSON through a same-directory atomic rename", () => {
+  it("publishes authoritative runtime JSON through a same-directory atomic rename", () => {
     isolateStateDir();
     const workspace = makeWorkspace("runtime-atomic");
     const runtime = { ...runtimeFor(workspace), pid: process.pid, port: 49001 };
@@ -63,17 +65,27 @@ describe("runtime snapshot publication", () => {
 
     writeRuntimeState(runtime);
 
-    const destination = runtimeFile(workspace.id);
-    expect(rename).toHaveBeenCalled();
-    const [source, target] = rename.mock.calls.at(-1)!;
-    expect(target).toBe(destination);
-    expect(path.dirname(String(source))).toBe(path.dirname(destination));
+    const listed = listRuntimeStates(workspace.id);
+    const authoritativeState = listed.find(
+      (state) => state.pid === process.pid && state.port === runtime.port && state.workspaceId === workspace.id
+    );
+    expect(authoritativeState).toBeTruthy();
+    const authoritative = runtimeGenerationFile(authoritativeState!);
+    const atomicRename = rename.mock.calls.find(([, target]) => String(target) === authoritative);
+    expect(atomicRename).toBeTruthy();
+    const [source, target] = atomicRename!;
+    expect(target).toBe(authoritative);
+    expect(path.dirname(String(source))).toBe(path.dirname(authoritative));
     expect(String(source)).toMatch(/\.tmp$/);
+
+    const canonical = runtimeFile(workspace.id);
+    expect(fs.existsSync(canonical)).toBe(true);
     expect(readRuntimeState(workspace.id)?.workspaceId).toBe(workspace.id);
-    expect(readRuntimeState(workspace.id)?.processGeneration).toBeTruthy();
-    expect(fs.readdirSync(path.dirname(destination)).some((name) => name.endsWith(".tmp"))).toBe(false);
+    expect(authoritativeState!.processGeneration).toBeTruthy();
+    expect(fs.readdirSync(path.dirname(authoritative)).some((name) => name.endsWith(".tmp"))).toBe(false);
     if (process.platform !== "win32") {
-      expect(fs.statSync(destination).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(authoritative).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(canonical).mode & 0o777).toBe(0o600);
     }
   });
 });
