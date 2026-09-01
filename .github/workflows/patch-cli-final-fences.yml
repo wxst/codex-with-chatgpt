@@ -1,0 +1,141 @@
+name: Patch final CLI lifecycle fences
+
+on:
+  push:
+    branches:
+      - fix/review-findings
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/review-findings
+          fetch-depth: 0
+
+      - name: Serialize token status, unpair JSON, and Cloudflare choices
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          file = Path("src/cli/index.ts")
+          text = file.read_text(encoding="utf-8")
+
+          old_transport_import = '''import {
+            ensureOpenAITunnelToken,
+            openAITunnelTokenFile,
+            readTransportMode,
+            type TransportMode,
+          } from "../tunnel/transport-mode.js";
+          import { switchWorkspaceTransport } from "../tunnel/switch-transport.js";'''
+          new_transport_import = '''import {
+            openAITunnelTokenFile,
+            readTransportMode,
+            type TransportMode,
+          } from "../tunnel/transport-mode.js";
+          import {
+            ensureWorkspaceOpenAITunnelToken,
+            switchWorkspaceTransport,
+          } from "../tunnel/switch-transport.js";'''
+          if text.count(old_transport_import) != 1:
+              raise SystemExit(f"expected one transport import block, found {text.count(old_transport_import)}")
+          text = text.replace(old_transport_import, new_transport_import)
+
+          old_status_token = '''      const mode = readTransportMode(workspace.id);
+                if (mode === "openai") ensureOpenAITunnelToken(workspace.id);'''
+          new_status_token = '''      const mode = readTransportMode(workspace.id);
+                if (mode === "openai" && !opts.mode) await ensureWorkspaceOpenAITunnelToken(root);'''
+          if text.count(old_status_token) != 1:
+              raise SystemExit(f"expected one transport token status block, found {text.count(old_status_token)}")
+          text = text.replace(old_status_token, new_status_token)
+
+          old_unpair = '''program
+            .command("unpair")
+            .description("Revoke ChatGPT's access to this workspace immediately")
+            .option("-w, --workspace <path>")
+            .action(async (opts: { workspace?: string }) => {
+              const root = resolveWorkspace(opts.workspace);
+              try {
+                const result = await revokeWorkspaceAccess(root);
+                if (result.transportMode === "openai") {
+                  check("已断开 ChatGPT 对当前项目的访问（Tunnel 凭证已撤销，Bridge 已停止）");
+                } else {
+                  check("已断开 ChatGPT 对当前项目的访问（OAuth 令牌已吊销）");
+                }
+              } catch (error) {
+                handleCliError(error, false);
+              }
+            });'''
+          new_unpair = '''program
+            .command("unpair")
+            .description("Revoke ChatGPT's access to this workspace immediately")
+            .option("-w, --workspace <path>")
+            .option("--json", "machine-readable output", false)
+            .action(async (opts: { workspace?: string; json: boolean }) => {
+              const root = resolveWorkspace(opts.workspace);
+              try {
+                const result = await revokeWorkspaceAccess(root);
+                if (opts.json) {
+                  say(JSON.stringify({ ok: true, ...result }));
+                } else if (result.transportMode === "openai") {
+                  check("已断开 ChatGPT 对当前项目的访问（Tunnel 凭证已撤销，Bridge 已停止）");
+                } else {
+                  check("已断开 ChatGPT 对当前项目的访问（OAuth 令牌已吊销）");
+                }
+              } catch (error) {
+                handleCliError(error, opts.json);
+              }
+            });'''
+          if text.count(old_unpair) != 1:
+              raise SystemExit(f"expected one unpair command block, found {text.count(old_unpair)}")
+          text = text.replace(old_unpair, new_unpair)
+
+          old_choose_switch = '      await switchWorkspaceTransport(root, "cloudflare");'
+          new_choose_switch = '      await switchWorkspaceTransport(root, "cloudflare", { forceFence: true });'
+          if text.count(old_choose_switch) != 1:
+              raise SystemExit(f"expected one Cloudflare choice transport call, found {text.count(old_choose_switch)}")
+          text = text.replace(old_choose_switch, new_choose_switch)
+
+          old_quick_stop = '''        const state = chooseQuickTunnel(workspace.id);
+                  if (await findLiveBridge(workspace.id)) {
+                    if (previous.preference === "named") await stopBridge(root);
+                  }'''
+          new_quick_stop = '''        const state = chooseQuickTunnel(workspace.id);
+                  await stopBridge(root);'''
+          if text.count(old_quick_stop) != 1:
+              raise SystemExit(f"expected one quick-choice conditional stop, found {text.count(old_quick_stop)}")
+          text = text.replace(old_quick_stop, new_quick_stop)
+
+          redundant_named = '''      if (mode !== "named") {
+                throw new Error("mode must be quick or named");
+              }
+          '''
+          if text.count(redundant_named) != 1:
+              raise SystemExit(f"expected one redundant named validation, found {text.count(redundant_named)}")
+          text = text.replace(redundant_named, "")
+
+          old_named_stop = '      if (await findLiveBridge(workspace.id)) await stopBridge(root);'
+          new_named_stop = '      await stopBridge(root);'
+          if text.count(old_named_stop) != 1:
+              raise SystemExit(f"expected one named-choice conditional stop, found {text.count(old_named_stop)}")
+          text = text.replace(old_named_stop, new_named_stop)
+
+          file.write_text(text, encoding="utf-8")
+          Path(".github/workflows/patch-cli-final-fences.yml").unlink()
+          PY
+
+      - name: Commit patch and remove temporary workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/cli/index.ts .github/workflows/patch-cli-final-fences.yml
+          git commit -m "fix: fence CLI transport and recovery paths"
+          git push origin HEAD:fix/review-findings
