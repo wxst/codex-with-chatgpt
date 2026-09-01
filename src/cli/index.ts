@@ -29,9 +29,9 @@ import {
   ensureOpenAITunnelToken,
   openAITunnelTokenFile,
   readTransportMode,
-  writeTransportMode,
   type TransportMode,
 } from "../tunnel/transport-mode.js";
+import { switchWorkspaceTransport } from "../tunnel/switch-transport.js";
 import { Logger } from "../logger/index.js";
 import { getStateDir } from "../config/paths.js";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
@@ -358,11 +358,7 @@ program
           throw new Error("mode must be openai or cloudflare");
         }
         const next = requested as TransportMode;
-        const previous = readTransportMode(workspace.id);
-        writeTransportMode(workspace.id, next);
-        if (previous !== next) {
-          await stopBridge(root);
-        }
+        await switchWorkspaceTransport(root, next);
       }
 
       const mode = readTransportMode(workspace.id);
