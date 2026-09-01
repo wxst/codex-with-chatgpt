@@ -1,0 +1,54 @@
+name: Update stop semantics tests
+
+on:
+  push:
+    branches:
+      - fix/review-findings
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/review-findings
+          fetch-depth: 0
+
+      - name: Update fail-closed assertions
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          replacements = {
+              Path("tests/revocation-safety.test.ts"): (
+                  '    expect(await stopBridge(workspace.root)).toBe(false);\n    expect(kill).not.toHaveBeenCalled();',
+                  '    await expect(stopBridge(workspace.root)).rejects.toThrow(/could not be fully stopped/);\n    expect(kill).not.toHaveBeenCalled();',
+              ),
+              Path("tests/final-review-findings.test.ts"): (
+                  '    expect(await stopBridge(workspace.root)).toBe(false);\n    expect(kill).not.toHaveBeenCalled();',
+                  '    await expect(stopBridge(workspace.root)).rejects.toThrow(/could not be fully stopped/);\n    expect(kill).not.toHaveBeenCalled();',
+              ),
+          }
+
+          for file, (old, new) in replacements.items():
+              text = file.read_text(encoding="utf-8")
+              if text.count(old) != 1:
+                  raise SystemExit(f"expected exactly one stale assertion in {file}, found {text.count(old)}")
+              file.write_text(text.replace(old, new), encoding="utf-8")
+
+          Path(".github/workflows/update-stop-tests.yml").unlink()
+          PY
+
+      - name: Commit test updates and remove one-shot workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tests/revocation-safety.test.ts tests/final-review-findings.test.ts .github/workflows/update-stop-tests.yml
+          git commit -m "test: expect fail-closed stop errors"
+          git push origin HEAD:fix/review-findings
