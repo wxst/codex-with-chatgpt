@@ -37,20 +37,22 @@ OpenAI mode also rejects proxy-marker headers such as `X-Forwarded-For`, `Forwar
 The upstream OAuth + Cloudflare Quick/Named Tunnel path remains available for compatibility, but a workspace must be explicitly switched to it:
 
 ```text
-c2c transport -w <workspace> --mode cloudflare --json
+node bin/c2c.js transport -w <workspace> --mode cloudflare --json
 ```
 
 Return to the hardened default with:
 
 ```text
-c2c transport -w <workspace> --mode openai --json
+node bin/c2c.js transport -w <workspace> --mode openai --json
 ```
 
 The bridge refuses `/admin/tunnel/start` while OpenAI mode is active.
 
-Transport changes are lifecycle-fenced. The new mode is persisted first, then the workspace stop path runs unconditionally to cancel every pending daemon start and drain every tracked runtime generation before the command returns. This prevents a delayed child from starting with the previous transport after the user has switched modes.
+Transport changes are lifecycle-fenced. The requested mode is published before the workspace stop path runs so a delayed child cannot start under the old policy. The stop path then cancels every pending daemon start and drains every tracked runtime generation before the command returns. If that fence fails, C2C restores the previous persisted mode before surfacing the error. Credentials for the requested mode are provisioned only after the transition commits successfully.
 
-The stop path returns `false` only when no pending start or runtime generation exists. If any discovered generation cannot be safely terminated or conclusively shown dead, it throws instead of letting `stop`, `restart`, or a transport switch misreport the workspace as stopped.
+The same transactional helper is used by both `transport --mode ...` and the explicit Cloudflare `tunnel choose` flow. A retry after a failed transition therefore cannot mistake an uncommitted mode for a completed switch.
+
+The stop path returns `false` only when no pending start or runtime generation exists. If any discovered generation cannot be safely terminated or conclusively shown dead, it throws instead of letting `stop`, `restart`, failed-start cleanup, or a transport switch misreport the workspace as stopped.
 
 ## Read-only MCP invariant
 
@@ -101,15 +103,22 @@ Upstream flow:
 5. A human/agent reviews the diff and resolves any hardening conflicts.
 6. Only then is the PR merged manually.
 
+## Installation-trial gate
+
+The documented installation path runs the verified checkout directly through `node bin/c2c.js`; it does not assume a globally installed command. The installed Codex Skill receives the absolute checkout path by replacing `__C2C_CHECKOUT__` only in the installed copy.
+
+CI validates the checkout and CLI entrypoint on both Linux and Windows. The smoke test uses an isolated temporary workspace and state directory, exercises version/help output and transactional OpenAI ↔ Cloudflare transport selection, and removes all temporary data afterward. It does not start a public tunnel or use real account credentials.
+
 ## Regression requirements
 
 Before merging hardening or upstream changes, CI must pass:
 
 ```text
-pnpm install --frozen-lockfile
-pnpm typecheck
-pnpm test
-pnpm build
+corepack pnpm install --frozen-lockfile
+corepack pnpm typecheck
+corepack pnpm test
+corepack pnpm build
+corepack pnpm smoke:install
 ```
 
-Security regressions covered by tests include path traversal/symlink boundaries, sensitive file leakage, sensitive git-diff renames, transport state, OpenAI tunnel token handling, proxy-header rejection, read-only tool exposure, prevention of Cloudflare tunnel startup in OpenAI mode, workspace lifecycle serialization, pending-start fencing, multi-generation runtime discovery, legacy revocation behavior, generation-bound process termination, and fail-closed stop semantics.
+Security regressions covered by tests include path traversal/symlink boundaries, sensitive file leakage, sensitive git-diff renames, transport rollback, OpenAI tunnel token handling, proxy-header rejection, read-only tool exposure, prevention of Cloudflare tunnel startup in OpenAI mode, workspace lifecycle serialization, pending-start fencing, multi-generation runtime discovery, legacy revocation behavior, generation-bound process termination, failed-start cleanup, and fail-closed stop semantics.
