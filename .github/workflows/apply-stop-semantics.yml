@@ -1,0 +1,78 @@
+name: Apply stop semantics fix
+
+on:
+  push:
+    branches:
+      - fix/review-findings
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/review-findings
+          fetch-depth: 0
+
+      - name: Apply reviewed one-shot patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          daemon = Path("src/process/daemon.ts")
+          text = daemon.read_text(encoding="utf-8")
+          old = '''    if (listPendingStarts(workspace.id).length !== 0) allStopped = false;
+              return allStopped;'''
+          new = '''    if (listPendingStarts(workspace.id).length !== 0) allStopped = false;
+              if (!allStopped) {
+                throw new Error(`One or more Bridge generations for workspace ${workspace.id} could not be fully stopped`);
+              }
+              return true;'''
+          if text.count(old) != 1:
+              raise SystemExit(f"expected exactly one stop return block, found {text.count(old)}")
+          daemon.write_text(text.replace(old, new), encoding="utf-8")
+
+          test = Path("tests/latest-review-findings.test.ts")
+          test_text = test.read_text(encoding="utf-8")
+          marker = '''  it("cancels a pending detached start before reporting the workspace stopped", async () => {'''
+          regression = '''  it("throws instead of reporting no Bridge when a discovered generation cannot be stopped", async () => {
+              isolateStateDir();
+              const workspace = makeWorkspace("stop-failure-is-error");
+              const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+              children.push(child);
+              if (!child.pid) throw new Error("child pid unavailable");
+          
+              writeRuntimeState({
+                ...runtimeFor(workspace, child.pid, "", 49105, "unstoppable-legacy"),
+                service: "codex-with-chatgpt",
+                processGeneration: undefined,
+              });
+              vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("legacy endpoint unavailable"));
+          
+              await expect(stopBridge(workspace.root)).rejects.toThrow(/could not be fully stopped/);
+              expect(child.exitCode).toBeNull();
+              expect(child.signalCode).toBeNull();
+            });
+          
+          '''
+          if regression not in test_text:
+              if marker not in test_text:
+                  raise SystemExit("test insertion marker not found")
+              test.write_text(test_text.replace(marker, regression + marker, 1), encoding="utf-8")
+
+          Path(".github/workflows/apply-stop-semantics.yml").unlink()
+          PY
+
+      - name: Commit patch and remove one-shot workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/process/daemon.ts tests/latest-review-findings.test.ts .github/workflows/apply-stop-semantics.yml
+          git commit -m "fix: distinguish stop failure from no running bridge"
+          git push origin HEAD:fix/review-findings
