@@ -171,17 +171,27 @@ function readRuntimeStrict(file: string, workspaceId: string): RuntimeState {
 }
 
 /**
- * Publish one exact authoritative runtime generation. The canonical legacy
- * mirror is first-writer-wins and immutable from hardened writers. This is
- * deliberate: an old pre-registry Bridge may use that pathname as its only
- * discoverability record, so replacing it could hide a still-live legacy
- * generation on another port.
+ * Publish one authoritative runtime record. Hardened Bridge records are stamped
+ * with the current service and an OS process-generation identity. A caller that
+ * deliberately supplies the pre-registry legacy service remains generationless:
+ * inventing the currently reused PID's generation would falsely turn an
+ * unrelated process into proof of legacy Bridge ownership.
+ *
+ * The canonical legacy mirror is first-writer-wins and immutable from hardened
+ * writers. This preserves the only discoverability record of any concurrently
+ * running pre-registry Bridge.
  */
 export function writeRuntimeState(state: RuntimeState): void {
-  const processGeneration = state.processGeneration ?? getProcessGeneration(state.pid);
+  const legacyInput = state.service === LEGACY_SERVICE_NAME;
+  const processGeneration =
+    state.processGeneration !== undefined
+      ? state.processGeneration
+      : legacyInput
+        ? undefined
+        : getProcessGeneration(state.pid);
   const normalized: RuntimeState = {
     ...state,
-    service: SERVICE_NAME,
+    service: legacyInput ? LEGACY_SERVICE_NAME : SERVICE_NAME,
     version: state.version || VERSION,
     processGeneration,
   };
