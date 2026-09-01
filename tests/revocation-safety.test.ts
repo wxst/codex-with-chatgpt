@@ -99,7 +99,7 @@ describe("revocation process identity", () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("connection refused"));
     const kill = vi.spyOn(process, "kill").mockReturnValue(true);
 
-    expect(await stopBridge(workspace.root)).toBe(false);
+    await expect(stopBridge(workspace.root)).rejects.toThrow(/could not be fully stopped/);
     expect(kill).not.toHaveBeenCalled();
   });
 
