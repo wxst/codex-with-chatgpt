@@ -9,7 +9,10 @@ import {
   type RuntimeState,
 } from "../bridge/runtime.js";
 import { adminFetch, stopBridgeRuntime } from "../process/daemon.js";
-import { processGenerationMatches } from "../process/process-identity.js";
+import {
+  processGenerationStatus,
+  type ProcessGenerationStatus,
+} from "../process/process-identity.js";
 import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
 import { cancelPendingStarts, listPendingStarts } from "../process/startup-registry.js";
 import { readTransportMode, revokeOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
@@ -29,6 +32,8 @@ type RevokeTunnelToken = (workspaceId: string) => boolean;
 type IsProcessAlive = (pid: number) => boolean;
 type ProbeBridge = (port: number, timeoutMs?: number) => Promise<HealthPayload | null>;
 type RevocableAuthStore = Pick<AuthStore, "revokeAll">;
+
+type ProcessGenerationStatusFn = (pid: number, expectedGeneration: string) => ProcessGenerationStatus;
 
 interface RuntimeIdentityPayload {
   service?: string;
@@ -51,6 +56,8 @@ export interface RevokeWorkspaceAccessDeps {
   revokeTunnelToken?: RevokeTunnelToken;
   /** Test/compatibility override. Production uses process-generation identity. */
   isProcessAlive?: IsProcessAlive;
+  /** Test override for deterministic match/mismatch/unknown generation behavior. */
+  processGenerationStatus?: ProcessGenerationStatusFn;
   probeBridge?: ProbeBridge;
   /** Retained for compatibility with older callers; revocation never calls it. */
   clearRuntimeState?: (workspaceId: string) => void;
@@ -94,12 +101,6 @@ function dedupeRuntimes(states: RuntimeState[]): RuntimeState[] {
   return unique;
 }
 
-/**
- * Numeric PID existence is intentionally only conservative evidence for legacy
- * runtimes that predate process-generation stamping. PID reuse means this can
- * never authorize a signal or prove exact ownership; it can only prevent an
- * unsafe false "dead" classification when a generationless Bridge is paused.
- */
 function numericPidExists(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
@@ -125,6 +126,7 @@ async function revokeWorkspaceAccessLocked(
   const transportMode = readTransportMode(workspace.id);
   const requestAdmin = deps.adminFetch ?? adminFetch;
   const stopExact = deps.stopBridge ?? stopBridgeRuntime;
+  const generationStatus = deps.processGenerationStatus ?? processGenerationStatus;
   const healthProbe = deps.probeBridge ?? probeBridge;
   const revokeTunnel = deps.revokeTunnelToken ?? revokeOpenAITunnelToken;
   const makeStore = deps.authStoreFactory ?? ((workspaceId: string) => new AuthStore(workspaceId));
@@ -178,8 +180,14 @@ async function revokeWorkspaceAccessLocked(
   const runtimeLiveness = async (runtime: RuntimeState): Promise<RuntimeLiveness> => {
     if (deps.isProcessAlive) return deps.isProcessAlive(runtime.pid) ? "exact-live" : "dead";
 
-    if (runtime.processGeneration && processGenerationMatches(runtime.pid, runtime.processGeneration)) {
-      return "exact-live";
+    if (runtime.processGeneration) {
+      const status = generationStatus(runtime.pid, runtime.processGeneration);
+      if (status === "match") return "exact-live";
+      // A transient identity-query failure while the numeric PID still exists is
+      // not evidence of process exit. Do not fall through to endpoint timeouts,
+      // remove the generation, or report quiescence. This mirrors lifecycle-lock
+      // fencing: unknown identity always fails closed.
+      if (status === "unknown") return "unknown-live";
     }
 
     try {
@@ -203,10 +211,6 @@ async function revokeWorkspaceAccessLocked(
       // Continue to the generationless PID fallback below.
     }
 
-    // Pre-hardening runtimes have no process generation. If both application
-    // probes time out while the recorded numeric PID still exists, the Bridge
-    // may simply be paused/wedged. Treat it as potentially live and fail closed.
-    // A reused PID can cause a conservative false positive, but is never signaled.
     if (!runtime.processGeneration && numericPidExists(runtime.pid)) {
       return "unknown-live";
     }
