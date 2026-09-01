@@ -13,6 +13,7 @@ import {
   type RuntimeState,
 } from "../bridge/runtime.js";
 import {
+  processExists,
   processGenerationStatus,
   signalExactProcessGeneration,
 } from "./process-identity.js";
@@ -349,83 +350,79 @@ export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeS
  * may be removed, but an unknown generation, surviving pending intent, or a
  * still-responsive workspace endpoint keeps the result fail-closed.
  */
+export async function stopBridgeWithinLifecycleLock(workspaceRoot: string): Promise<boolean> {
+  const workspace = new Workspace(workspaceRoot);
+  const cancelledPending = cancelPendingStarts(workspace.id);
+  if (listPendingStarts(workspace.id).length !== 0) {
+    throw new Error(`Pending bridge starts remain after cancellation for workspace ${workspace.id}`);
+  }
+
+  const runtimes = listRuntimeStates(workspace.id);
+  if (runtimes.length === 0) return cancelledPending > 0;
+
+  let allStopped = true;
+  const observedPorts = new Set<number>();
+  const stoppedLegacy = new Set<string>();
+
+  for (const runtime of runtimes) {
+    observedPorts.add(runtime.port);
+    let stopped = false;
+
+    if (runtime.processGeneration) {
+      const status = processGenerationStatus(runtime.pid, runtime.processGeneration);
+      if (status === "mismatch") {
+        // The exact recorded generation is positively gone. Do not signal a
+        // recycled PID; endpoint verification still catches a replacement.
+        stopped = true;
+      } else {
+        stopped = await stopBridgeRuntime(workspace.root, runtime);
+      }
+    } else {
+      // A generationless runtime can be considered dead only when the
+      // numeric PID is positively absent. A reused/live PID remains
+      // conservative and is never signalled without authenticated identity.
+      stopped = await stopBridgeRuntime(workspace.root, runtime);
+      if (!stopped && !processExists(runtime.pid)) stopped = true;
+    }
+
+    if (stopped) {
+      if (!runtime.processGeneration) stoppedLegacy.add(runtimeIdentity(runtime));
+      removeRuntimeStateGeneration(runtime);
+    } else {
+      allStopped = false;
+    }
+  }
+
+  for (const port of observedPorts) {
+    const health = await probeBridge(port, 1000);
+    if (health?.service === SERVICE_NAME && health.workspaceId === workspace.id && health.status === "ok") {
+      allStopped = false;
+    }
+  }
+
+  for (const runtime of listRuntimeStates(workspace.id)) {
+    observedPorts.add(runtime.port);
+    if (runtime.processGeneration) {
+      if (processGenerationStatus(runtime.pid, runtime.processGeneration) !== "mismatch") {
+        allStopped = false;
+      }
+    } else if (!stoppedLegacy.has(runtimeIdentity(runtime)) && processExists(runtime.pid)) {
+      allStopped = false;
+    }
+  }
+
+  if (listPendingStarts(workspace.id).length !== 0) allStopped = false;
+  if (!allStopped) {
+    throw new Error(`One or more Bridge generations for workspace ${workspace.id} could not be fully stopped`);
+  }
+  return true;
+}
+
 export async function stopBridge(workspaceRoot: string): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
   const lock = await acquireWorkspaceLifecycleLock(workspace.id);
-
   try {
-    const cancelledPending = cancelPendingStarts(workspace.id);
-    if (listPendingStarts(workspace.id).length !== 0) {
-      throw new Error(`Pending bridge starts remain after cancellation for workspace ${workspace.id}`);
-    }
-
-    const runtimes = listRuntimeStates(workspace.id);
-    if (runtimes.length === 0) return cancelledPending > 0;
-
-    let allStopped = true;
-    const observedPorts = new Set<number>();
-    const stoppedLegacy = new Set<string>();
-
-    for (const runtime of runtimes) {
-      observedPorts.add(runtime.port);
-      let stopped = false;
-
-      if (runtime.processGeneration) {
-        const status = processGenerationStatus(runtime.pid, runtime.processGeneration);
-        if (status === "mismatch") {
-          // The exact recorded generation is positively gone. Do not signal a
-          // recycled PID; the port-level verification below still catches an
-          // untracked replacement Bridge using the stale snapshot's endpoint.
-          stopped = true;
-        } else {
-          stopped = await stopBridgeRuntime(workspace.root, runtime);
-        }
-      } else {
-        // A generationless legacy runtime is stopped only through its exact
-        // authenticated endpoint. We deliberately do not use a bare PID probe
-        // here: PID reuse must neither authorize signaling nor turn an unrelated
-        // process into a Bridge identity.
-        stopped = await stopBridgeRuntime(workspace.root, runtime);
-      }
-
-      if (stopped) {
-        if (!runtime.processGeneration) stoppedLegacy.add(runtimeIdentity(runtime));
-        removeRuntimeStateGeneration(runtime);
-      } else {
-        allStopped = false;
-      }
-    }
-
-    // A stale snapshot can point at a different Bridge generation on the same
-    // port. Never report success while any observed endpoint still identifies
-    // this workspace, even when the stale admin token cannot authenticate it.
-    for (const port of observedPorts) {
-      const health = await probeBridge(port, 1000);
-      if (health?.service === SERVICE_NAME && health.workspaceId === workspace.id && health.status === "ok") {
-        allStopped = false;
-      }
-    }
-
-    // Re-list after every stop attempt. New generation-bearing entries are
-    // allowed to disappear only on a confirmed mismatch. A generationless
-    // compatibility mirror is ignored only when this invocation already
-    // completed its sustained authenticated shutdown proof.
-    for (const runtime of listRuntimeStates(workspace.id)) {
-      observedPorts.add(runtime.port);
-      if (runtime.processGeneration) {
-        if (processGenerationStatus(runtime.pid, runtime.processGeneration) !== "mismatch") {
-          allStopped = false;
-        }
-      } else if (!stoppedLegacy.has(runtimeIdentity(runtime))) {
-        allStopped = false;
-      }
-    }
-
-    if (listPendingStarts(workspace.id).length !== 0) allStopped = false;
-    if (!allStopped) {
-      throw new Error(`One or more Bridge generations for workspace ${workspace.id} could not be fully stopped`);
-    }
-    return true;
+    return await stopBridgeWithinLifecycleLock(workspace.root);
   } finally {
     lock.release();
   }

@@ -96,7 +96,7 @@ export function getProcessGeneration(pid: number): string | null {
   return generation;
 }
 
-function numericPidExists(pid: number): boolean {
+export function processExists(pid: number): boolean {
   if (!validPid(pid)) return false;
   try {
     process.kill(pid, 0);
@@ -121,7 +121,7 @@ export function classifyProcessGeneration(
 export function processGenerationStatus(pid: number, expectedGeneration: string): ProcessGenerationStatus {
   if (!validPid(pid) || !expectedGeneration) return "mismatch";
   const observed = getProcessGeneration(pid);
-  return classifyProcessGeneration(observed, observed === null && numericPidExists(pid), expectedGeneration);
+  return classifyProcessGeneration(observed, observed === null && processExists(pid), expectedGeneration);
 }
 
 export function processGenerationMatches(pid: number, expectedGeneration: string): boolean {
