@@ -6,7 +6,7 @@ import { Workspace } from "../workspace/manager.js";
 import { stateSubdir } from "../config/paths.js";
 import { findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import {
-  processGenerationMatches,
+  processGenerationStatus,
   signalExactProcessGeneration,
 } from "./process-identity.js";
 import { acquireWorkspaceLifecycleLock } from "./workspace-lock.js";
@@ -156,10 +156,6 @@ function exactGeneration(runtime: RuntimeState, fallbackGeneration?: string | nu
   return runtime.processGeneration ?? fallbackGeneration ?? null;
 }
 
-function exactGenerationIsAlive(runtime: RuntimeState, generation: string | null): boolean {
-  return Boolean(generation && processGenerationMatches(runtime.pid, generation));
-}
-
 function numericPidExists(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -169,28 +165,24 @@ function numericPidExists(pid: number): boolean {
   }
 }
 
-async function waitForExactGenerationExit(
+/**
+ * Return true only after the exact recorded process generation is positively
+ * confirmed gone. A temporary identity-query failure (`unknown`) must never be
+ * accepted as exit; it simply keeps the wait alive until the deadline.
+ */
+export async function waitForExactGenerationExit(
   runtime: RuntimeState,
   generation: string,
   timeoutMs: number
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!processGenerationMatches(runtime.pid, generation)) return true;
+    if (processGenerationStatus(runtime.pid, generation) === "mismatch") return true;
     await new Promise((resolve) => setTimeout(resolve, STOP_POLL_MS));
   }
-  return !processGenerationMatches(runtime.pid, generation);
+  return processGenerationStatus(runtime.pid, generation) === "mismatch";
 }
 
-/**
- * Legacy runtimes predate process-generation stamping. Once the exact admin
- * token has authenticated the recorded workspace/pid/port/start identity and
- * `/admin/shutdown` has acknowledged the request, we still cannot safely signal
- * the numeric PID. Confirm exit only after BOTH the authenticated endpoint is
- * continuously absent and that numeric PID is continuously absent for a
- * sustained window. A paused bridge keeps its PID and therefore never looks
- * exited; a recycled PID is conservatively treated as still live.
- */
 async function waitForAuthenticatedLegacyExit(runtime: RuntimeState, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   let absenceSince: number | null = null;
@@ -233,20 +225,25 @@ async function terminateExactGeneration(
   firstSignal: NodeJS.Signals | null
 ): Promise<boolean> {
   if (!generation) return false;
-  if (!exactGenerationIsAlive(runtime, generation)) return true;
+
+  // Only a confirmed mismatch means this exact process generation is gone.
+  // Both `match` and `unknown` remain potentially live. Atomic signaling is
+  // safe to attempt in either case because the pidfd/native-handle helper
+  // independently binds and validates the exact generation before signaling.
+  if (processGenerationStatus(runtime.pid, generation) === "mismatch") return true;
 
   if (firstSignal) {
     if (!signalExactGeneration(runtime, generation, firstSignal)) {
-      return !exactGenerationIsAlive(runtime, generation);
+      return processGenerationStatus(runtime.pid, generation) === "mismatch";
     }
     if (await waitForExactGenerationExit(runtime, generation, SIGNAL_STOP_MS)) return true;
   } else if (await waitForExactGenerationExit(runtime, generation, GRACEFUL_STOP_MS)) {
     return true;
   }
 
-  if (!exactGenerationIsAlive(runtime, generation)) return true;
+  if (processGenerationStatus(runtime.pid, generation) === "mismatch") return true;
   if (!signalExactGeneration(runtime, generation, "SIGKILL")) {
-    return !exactGenerationIsAlive(runtime, generation);
+    return processGenerationStatus(runtime.pid, generation) === "mismatch";
   }
   return waitForExactGenerationExit(runtime, generation, FORCE_STOP_MS);
 }
