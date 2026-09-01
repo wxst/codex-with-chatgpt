@@ -1,259 +1,202 @@
-# Codex with ChatGPT
+# Codex with ChatGPT — Hardened Fork
 
-> ChatGPT thinks. Codex works.
-> ChatGPT 负责思考，Codex 负责干活。
+[简体中文](README.zh-CN.md)
 
-> [!IMPORTANT]
-> **遇到问题？** 请先向 Codex 发送 **「更新 Codex with ChatGPT」** 并重试。更新到最新版本可以解决大多数已知问题。  
-> **Having trouble?** First ask Codex to **“Update Codex with ChatGPT”** and try again. Updating to the latest version resolves most known issues.
+> ChatGPT plans and reviews. Codex edits, runs commands, tests, and fixes.
 
-## The problem · 解决什么问题
+This fork keeps the ChatGPT-web planning workflow while hardening the local
+Bridge, credential lifecycle, process shutdown, dependency policy, and upstream
+update path. The ChatGPT-facing MCP surface is read-only.
 
-**中文** — ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的
-API 额度做规划和 Review。本项目把"思考"交给你已付费的网页版 ChatGPT，
-Codex 只负责执行。不用 API Key、不搞逆向代理——官方网页 + 只读 MCP 桥接。
+## Installation-trial scope
 
-**EN** — ChatGPT Plus/Pro web quota sits idle while your coding agent burns
-scarce API/Codex tokens on planning and review. This project moves the
-thinking to the subscription you already pay for; Codex only executes.
-No API keys, no reverse proxy — official web UI plus a read-only MCP bridge.
+This branch is prepared for a first controlled installation trial on:
 
-## What it is · 这是什么
+- Windows with Node.js 20 or newer;
+- compatible Linux systems with Node.js 20 or newer and Python 3.9+ providing
+  `os.pidfd_open` and `signal.pidfd_send_signal`.
 
-**中文** — 把 ChatGPT 网页版变成 Codex 编码会话的"规划与审查大脑"，执行权
-完全保留在 Codex 手里。你的仓库永远不会被上传：ChatGPT 通过一条安全的、
-OAuth 保护的**只读** MCP 连接，按需读取当前工作区里它真正需要的那几行代码。
+The Linux capability is executed and verified before the Bridge reads or creates
+credentials. Unsupported environments fail closed instead of weakening the
+process-safety boundary.
 
-**EN** — Use the ChatGPT web app as the planning and review brain for your
-Codex coding sessions, while Codex keeps full ownership of execution. Your
-repository is never uploaded: ChatGPT reads exactly the lines it needs through
-a secure, OAuth-protected, **read-only** MCP connection to your current
-workspace.
+The hardened default is **OpenAI Secure MCP Tunnel**. Cloudflare remains an
+**explicit** compatibility fallback and is never enabled automatically.
 
-Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](README.zh-CN.md)**
+## Give this prompt to Codex
 
-## One-paste install · 一段话安装
-
-**中文** — 不懂 git、Node、终端？完全不需要懂。把下面这段话原样复制给你的
-编码 Agent（Codex），然后去倒杯咖啡：
+Copy the following request into Codex. It is deliberately strict: it targets
+this fork, builds a pinned checkout, verifies the real CLI entrypoint, and does
+not perform runtime self-updates.
 
 ```text
-请帮我完整安装并配置 Codex with ChatGPT，全程自动，我是不懂技术的小白，
-所有事情你自己做：
+Install and prepare the hardened Codex with ChatGPT fork for a controlled trial.
+Do the technical work yourself and interrupt me only for an account login,
+CAPTCHA, two-factor authentication, or a required OpenAI Tunnel credential.
 
-1. 环境自检：需要 git 和 Node.js ≥ 20；Linux 还必须有 Python ≥ 3.9，
-   并确认该 Python 提供 os.pidfd_open 和 signal.pidfd_send_signal。
-   如果系统有多个 Python，可设置 C2C_PYTHON 指向合适的解释器。
-   缺什么就自动安装（macOS 用 Homebrew，Windows 用 winget，Linux 用系统包管理器），
-   同时安装 cloudflared。
-2. 下载：把 https://github.com/XiaoDuoYa/codex-with-chatgpt 克隆到
-   ~/codex-with-chatgpt（已存在就 git pull 更新）。
-3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
-4. 安装 Skill：把仓库里的 skill/SKILL.md 复制到
-   ~/.codex/skills/codex-with-chatgpt/SKILL.md，并把文件中
-   "The codex-with-chatgpt checkout lives at:" 那一行的路径改成实际克隆路径。
-5. 首次配置：按 SKILL.md 里的 first-time setup 流程执行
-  （运行 c2c setup，用内置浏览器打开 ChatGPT 配置连接器并输入配对码）。
-   全程只用内置浏览器，禁止打开任何第三方浏览器。
-6. 只有遇到需要我登录（ChatGPT / Cloudflare）、验证码或两步验证时才叫我，
-   而且一次只告诉我一个动作。
-7. 完成后给我看 ✓ 清单，并确认文件读取测试通过。我不懂 MCP、OAuth、
-   Tunnel、端口这些词，不要向我解释；出了问题先自己修。
+1. Verify that this machine is Windows or a compatible Linux system. Require
+   git and Node.js >= 20. On Linux also require Python >= 3.9 with
+   os.pidfd_open and signal.pidfd_send_signal; set C2C_PYTHON when a specific
+   interpreter is needed. Stop if the hardened process-safety prerequisite
+   cannot be verified.
+2. Clone only https://github.com/wxst/codex-with-chatgpt at branch main into a
+   dedicated local folder. If that folder already exists, verify its remote,
+   branch, and working-tree state; do not run git pull or overwrite local work.
+3. In the checkout run:
+   corepack enable
+   corepack pnpm install --frozen-lockfile
+   corepack pnpm typecheck
+   corepack pnpm test
+   corepack pnpm build
+   corepack pnpm smoke:install
+4. Verify the actual checkout CLI with:
+   node bin/c2c.js --version
+   node bin/c2c.js --help
+   Never assume a globally installed c2c command.
+5. Copy skill/SKILL.md to the Codex skills directory as
+   codex-with-chatgpt/SKILL.md. In the installed copy only, replace every
+   __C2C_CHECKOUT__ placeholder with the absolute checkout path. Do not modify
+   the repository copy for a machine-specific path.
+6. For the target workspace run the installed Skill's first-time checks using
+   node bin/c2c.js. Keep transport mode openai. Verify the official OpenAI
+   tunnel client and the CONTROL_PLANE_TUNNEL_ID and CONTROL_PLANE_API_KEY
+   runtime environment without printing their values. Follow the installed
+   client's current help output rather than guessing flags.
+7. If OpenAI Secure MCP Tunnel is unavailable for this account or environment,
+   stop and explain the exact blocker. Do not enable Cloudflare unless I give
+   explicit approval.
+8. Use only the built-in ChatGPT browser surface for ChatGPT setup. Never paste
+   repository files, diffs, secrets, tokens, cookies, or long logs into ChatGPT;
+   ChatGPT must read workspace context through the read-only MCP tools.
+9. Do not run git pull, dependency upgrades, automatic updater commands, or
+   upstream synchronization during installation or normal use.
+10. Finish with an evidence checklist showing the exact checkout commit,
+    dependency install, typecheck, tests, build, install smoke test, CLI version,
+    selected transport, Bridge status, and MCP file-read verification.
 ```
 
-
-**EN** — Don't know git, Node, or terminals? You don't need to. Copy the
-paragraph below, paste it to your coding agent (Codex), and go grab a coffee:
-
-```text
-Please install and configure "Codex with ChatGPT" for me, fully automatically.
-I am a non-technical user — do everything yourself:
-
-1. Check the environment: git and Node.js >= 20 must be available. On Linux,
-   Python >= 3.9 is also required and must expose os.pidfd_open and
-   signal.pidfd_send_signal; if multiple interpreters exist, set C2C_PYTHON to
-   the suitable executable. Install anything missing yourself (macOS: Homebrew,
-   Windows: winget, Linux: the system package manager). Also install cloudflared.
-2. Download: clone https://github.com/XiaoDuoYa/codex-with-chatgpt into
-   ~/codex-with-chatgpt (if it already exists, git pull to update).
-3. Build: inside that folder run `corepack pnpm install` then `corepack pnpm build`.
-4. Install the Skill: copy skill/SKILL.md to
-   ~/.codex/skills/codex-with-chatgpt/SKILL.md, and update the line
-   "The codex-with-chatgpt checkout lives at:" to the actual clone path.
-5. First-time setup: follow the SKILL.md "first-time setup" workflow
-   (run c2c setup, configure the ChatGPT connector in the BUILT-IN browser,
-   enter the pairing code). Never open a third-party browser.
-6. Only interrupt me for logins (ChatGPT / Cloudflare), CAPTCHAs or 2FA —
-   and give me exactly ONE action at a time.
-7. When done, show me the ✓ checklist and confirm the file-read test passed.
-   I don't know what MCP, OAuth, tunnels or ports are. Don't explain them.
-   If anything breaks, fix it yourself first.
-```
-
-> [!IMPORTANT]
-> **Linux safety runtime requirement:** before the Bridge reads or creates any
-> OAuth/tunnel credential, it requires Python 3.9+ with `os.pidfd_open` and
-> `signal.pidfd_send_signal`. This is a required safety dependency used to
-> terminate a wedged Bridge through a generation-bound pidfd without risking PID
-> reuse. The Bridge fails closed if the capability is unavailable. Set
-> `C2C_PYTHON=/path/to/python3` to select a specific interpreter.
-
-
-**Updates · 更新** — The Skill checks GitHub once a day and updates itself when a
-new version is released; no action needed. You can also say "更新 Codex with ChatGPT"
-anytime. / Skill 每天自动检查一次 GitHub，有新版本会自动更新，无需任何操作；
-也可以随时对 Codex 说"更新 Codex with ChatGPT"。
-
----
-
-*The sections below are in English. 以下详细内容为英文，中文完整版见
-[README.zh-CN.md](README.zh-CN.md)。*
-
-## Install → Setup → Use (manual)
-
-1. Install the Codex Skill: copy `skill/` to `~/.codex/skills/codex-with-chatgpt/`.
-2. Tell Codex: **"Set up Codex with ChatGPT."** (中文: "使用 Codex with ChatGPT 完成首次配置。")
-3. Use Codex normally: **"Use Codex with ChatGPT to implement XXX."**
-
-That's the whole manual. You don't need to know what MCP, OAuth, tunnels,
-ports or localhost are — Codex configures everything automatically and you
-just see:
-
-```
-Codex with ChatGPT
-
-✓ Project detected
-✓ Workspace Bridge started
-✓ Secure connection established
-✓ ChatGPT connected
-✓ File read test passed
-
-Ready.
-```
-
-The only steps that may need you: logging into ChatGPT (and, if you want a
-stable hostname, logging into Cloudflare once). A **new** workspace also asks
-you to create a ChatGPT Project (collection) once — pick **project-only
-memory**, name it after the workspace. If the sidebar has no Projects row,
-hover **Chats**, open the … menu, and choose **Organize by project**. Codex
-then saves that collection link and starts chats from that page. Existing
-workspaces that already have a C2C chat stay on the old one-conversation
-style until you ask to switch.
-
-### Optional stable hostname
-
-The default public address is a temporary Cloudflare URL. It changes when the
-bridge restarts, and Codex repairs ChatGPT by deleting that workspace's
-connector and adding it again.
-
-If you have a Cloudflare account and a domain already on Cloudflare, first-time
-setup (and the next coding session, once) will ask whether you want a stable
-hostname such as `c2c-<project>.your-domain.com`. That path opens a browser so
-you can authorize Cloudflare. After that, the ChatGPT connector keeps working
-across restarts. If you skip it, or login fails, Codex stays on the temporary
-address — same features, just a slower repair.
-
-Credentials stay in the OS app state directory, not in the project.
-
-## How it works
-
-```
-             ┌───────────────────────────┐
-             │       ChatGPT Web         │
-             │  Reason / Plan / Review   │
-             └──────────┬──────────▲─────┘
-                        │          │
-               MCP      │          │ Computer Use
-            Data Plane  │          │ Control Plane (<1 KB messages)
-                        ▼          │
-             ┌─────────────────────┐
-             │      C2C Bridge     │   loopback-only HTTP server
-             │  read-only MCP      │   OAuth 2.1 + one-time pairing code
-             │  OAuth + Pairing    │   Cloudflare Quick Tunnel
-             │  Tunnel Manager     │
-             └──────────┬──────────┘
-                        │  read-only
-                        ▼
-             ┌─────────────────────┐          ┌─────────────────────┐
-             │   Local Workspace   │◀─────────│    Codex Harness    │
-             └─────────────────────┘ edit/git │ shell / tests / fix │
-                                              └─────────────────────┘
-```
-
-- **Control plane (Computer Use)**: Codex and ChatGPT exchange tiny structured
-  `[C2C]` state messages — `INIT → PLAN → EXECUTED → REVIEW → DONE`. No diffs,
-  no logs, no file bodies are ever pasted.
-- **Data plane (MCP)**: ChatGPT pulls what it needs itself through 8 read-only
-  tools: `workspace_info`, `list_directory`, `read_file`, `search_workspace`,
-  `git_status`, `git_diff`, `test_status`, `execution_summary`.
-- **Independent review**: after Codex executes, ChatGPT inspects the actual
-  git diff and test records through MCP — it never trusts "all tests passed"
-  claims blindly.
-
-## Security model (short version)
-
-- **Read-only by construction**: write/delete/shell/commit tools simply do not
-  exist on the server. No prompt injection can enable them.
-- **One workspace = one boundary**: every token is bound to a single workspace;
-  path containment uses canonical realpaths (symlink/`../`/absolute-path escapes
-  are all blocked and tested).
-- **Sensitive files never leave**: `.env*`, keys, SSH, credentials are denied by
-  default (`.env.example` allowed); `.c2cignore` adds your own rules.
-- **Knowing the URL grants nothing**: the public MCP endpoint requires OAuth 2.1
-  (PKCE S256, dynamic client registration, rotating refresh tokens). Without a
-  token: 401. Wrong workspace: 403.
-- **The model never sees long-lived credentials**: the only secret that ever
-  touches a browser is a one-time pairing code (5-minute TTL, 5 attempts,
-  rate-limited, destroyed on use).
-
-Full threat model: [docs/security.md](docs/security.md)
-
-## For developers
+## Manual checkout and verification
 
 ```bash
-pnpm install
-pnpm build          # -> dist/, exposes the `c2c` bin
-pnpm test           # vitest: 76 tests (path security, OAuth, pairing, MCP e2e)
-
-c2c setup           # bridge + tunnel + pairing code, all in one
-c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
-c2c status / doctor / pair / unpair / logs / stop
+git clone --branch main --single-branch https://github.com/wxst/codex-with-chatgpt
+cd codex-with-chatgpt
+corepack enable
+corepack pnpm install --frozen-lockfile
+corepack pnpm typecheck
+corepack pnpm test
+corepack pnpm build
+corepack pnpm smoke:install
+node bin/c2c.js --version
+node bin/c2c.js --help
 ```
 
-Requirements: Node.js >= 20 and git. `cloudflared` is required for the public
-connection (auto-detected; the Skill installs it for you). **Linux additionally
-requires Python >= 3.9 with `os.pidfd_open` and `signal.pidfd_send_signal`; use
-`C2C_PYTHON` to select the interpreter if needed.** The Bridge checks this
-safety capability before reading credentials and refuses to start if it is not
-available.
+Do not treat the checkout as a global package. All documented commands use the
+repository entrypoint:
 
-Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
-[security](docs/security.md) · [troubleshooting](docs/troubleshooting.md)
-
-## Project layout
-
-```
-src/
-  bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        8 read-only tools, stateless Streamable HTTP
-  auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
-  pairing/    one-time pairing codes (CSPRNG, TTL, rate limits)
-  workspace/  path containment, sensitive-file policy, search, git
-  tunnel/     TunnelProvider abstraction + Cloudflare Quick/Named Tunnel
-  execution/  execution records for the review loop
-  process/    daemon lifecycle
-  cli/        the c2c CLI
-skill/        the Codex Skill (the real UX layer)
-tests/        unit + integration tests
-docs/         architecture / protocol / security / troubleshooting
+```bash
+node bin/c2c.js <command>
 ```
 
-## Status & disclaimer
+## Install the Codex Skill
 
-V1. Verified end-to-end: bridge, OAuth + pairing, public tunnel, ChatGPT
-connector setup, zero-touch first-run experience.
+Copy `skill/SKILL.md` into:
 
-**Unofficial community project. Not affiliated with or endorsed by OpenAI.**
+```text
+~/.codex/skills/codex-with-chatgpt/SKILL.md
+```
+
+In the installed copy, replace `__C2C_CHECKOUT__` with the absolute path to this
+checkout. Keep the repository template unchanged so it remains portable and
+reviewable.
+
+## First-time workspace setup
+
+From the C2C checkout, substitute the real target workspace path:
+
+```bash
+node bin/c2c.js sandbox-allow --json
+node bin/c2c.js transport -w <workspace> --mode openai --json
+node bin/c2c.js setup -w <workspace> --json
+```
+
+The setup result provides the loopback MCP URL, the owner-only local token-file
+path, and the runtime alias expected by the official OpenAI tunnel client. The
+OpenAI control-plane credentials stay in environment variables and must never
+be printed, committed, or pasted into ChatGPT.
+
+If the official Tunnel connection is unavailable, the safe result is a clear
+blocker. Cloudflare may be selected only after explicit approval:
+
+```bash
+node bin/c2c.js transport -w <workspace> --mode cloudflare --json
+```
+
+Return to the hardened default with:
+
+```bash
+node bin/c2c.js transport -w <workspace> --mode openai --json
+```
+
+Transport changes are lifecycle-fenced. A failed transition restores the
+previous persisted mode and does not provision credentials for the uncommitted
+mode.
+
+## Normal use
+
+After the Skill is installed and the workspace connection is verified, ask
+Codex:
+
+```text
+Use Codex with ChatGPT to implement <task>.
+```
+
+Codex owns all execution. ChatGPT plans and reviews through these eight
+read-only MCP tools:
+
+- `workspace_info`
+- `list_directory`
+- `read_file`
+- `search_workspace`
+- `git_status`
+- `git_diff`
+- `test_status`
+- `execution_summary`
+
+There is no ChatGPT-facing file-write, delete, shell, package-install, or git
+commit tool.
+
+## Security and maintenance model
+
+- The Bridge binds to loopback in OpenAI mode and requires a random
+  per-workspace local tunnel token.
+- Sensitive paths and common credential files are blocked; add project-specific
+  exclusions with `.c2cignore`.
+- `unpair`, `stop`, restart, failed-start cleanup, and transport switching share
+  lifecycle fencing and track every pending/runtime generation.
+- Dependencies and GitHub Actions are pinned.
+- Runtime self-update is disabled.
+- `main` is the runnable hardened branch.
+- `upstream-main` mirrors the original upstream snapshot.
+- Upstream changes arrive as review PRs, run in a read-only validation job, and
+  are never auto-merged.
+
+See [HARDENING.md](HARDENING.md), [security](docs/security.md), and
+[troubleshooting](docs/troubleshooting.md).
+
+## Developer verification
+
+```bash
+corepack pnpm install --frozen-lockfile
+corepack pnpm typecheck
+corepack pnpm test
+corepack pnpm build
+corepack pnpm smoke:install
+```
+
+## Status
+
+Hardened installation-trial candidate. The project is an unofficial community
+fork and is not affiliated with or endorsed by OpenAI.
 
 ## License
 
