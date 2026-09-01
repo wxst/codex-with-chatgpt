@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir, readJsonIfExists } from "../config/paths.js";
-import { getProcessGeneration } from "../process/process-identity.js";
+import { getProcessGeneration, processGenerationStatus } from "../process/process-identity.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 
 export interface RuntimeState {
@@ -132,6 +132,73 @@ function createCanonicalMirrorIfAbsent(file: string, payload: string): void {
   }
 }
 
+
+/**
+ * Refresh a compatibility mirror only after proving that the exact
+ * generation currently occupying the pathname is dead. The existing
+ * file is first moved aside atomically, then revalidated. If another
+ * writer wins the pathname or the moved state changed, that writer is
+ * preserved. A generationless legacy mirror is never replaced.
+ */
+function publishCanonicalMirror(file: string, payload: string, workspaceId: string): void {
+  if (!fs.existsSync(file)) {
+    createCanonicalMirrorIfAbsent(file, payload);
+    return;
+  }
+
+  const observed = readRuntimeStrict(file, workspaceId);
+  if (!observed.processGeneration) return;
+  if (processGenerationStatus(observed.pid, observed.processGeneration) !== "mismatch") return;
+
+  const displaced = `${file}.${process.pid}.${randomUUID()}.displaced`;
+  try {
+    try {
+      fs.renameSync(file, displaced);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        createCanonicalMirrorIfAbsent(file, payload);
+        return;
+      }
+      throw error;
+    }
+
+    const moved = readRuntimeStrict(displaced, workspaceId);
+    const sameGeneration = runtimeIdentity(moved) === runtimeIdentity(observed);
+    const movedStillDead =
+      Boolean(moved.processGeneration) &&
+      processGenerationStatus(moved.pid, moved.processGeneration as string) === "mismatch";
+
+    if (sameGeneration && movedStillDead) {
+      createCanonicalMirrorIfAbsent(file, payload);
+    }
+
+    // If the moved file was not the exact dead generation observed,
+    // restore it only when no concurrent writer already owns the path.
+    if (!sameGeneration || !movedStillDead) {
+      try {
+        fs.linkSync(displaced, file);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+    }
+  } finally {
+    // Never leave the compatibility pathname absent because a
+    // filesystem rejected the no-overwrite publication primitive.
+    if (fs.existsSync(displaced) && !fs.existsSync(file)) {
+      try {
+        fs.linkSync(displaced, file);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+    }
+    try {
+      fs.rmSync(displaced, { force: true });
+    } catch {
+      // best effort after the pathname has a complete owner
+    }
+  }
+}
+
 function isRuntimeState(value: unknown, workspaceId: string): value is RuntimeState {
   if (!value || typeof value !== "object") return false;
   const state = value as Partial<RuntimeState>;
@@ -198,7 +265,7 @@ export function writeRuntimeState(state: RuntimeState): void {
   const payload = JSON.stringify(normalized, null, 2);
 
   atomicPrivateWrite(runtimeGenerationFile(normalized), payload);
-  createCanonicalMirrorIfAbsent(runtimeFile(normalized.workspaceId), payload);
+  publishCanonicalMirror(runtimeFile(normalized.workspaceId), payload, normalized.workspaceId);
 }
 
 /** Legacy compatibility read. Security-sensitive callers should use listRuntimeStates(). */
