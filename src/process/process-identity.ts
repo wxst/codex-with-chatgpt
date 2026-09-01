@@ -94,7 +94,7 @@ try {
     );
     if (result.status !== 0) return null;
     const generation = String(result.stdout ?? "").trim();
-    if (!/^win32:\\d{4}-\\d{2}-\\d{2}T/.test(generation)) return null;
+    if (!/^win32:\d{4}-\d{2}-\d{2}T/.test(generation)) return null;
     return generation;
   } catch {
     return null;
