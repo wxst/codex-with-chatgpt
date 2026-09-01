@@ -8,6 +8,7 @@ import { writeRuntimeState, type RuntimeState } from "../src/bridge/runtime.js";
 import { stopBridge, waitForBridgeStartup } from "../src/process/daemon.js";
 import { getProcessGeneration } from "../src/process/process-identity.js";
 import {
+  completePendingStart,
   createPendingStart,
   listPendingStarts,
   requirePendingStart,
@@ -128,6 +129,39 @@ describe("latest automated-review findings", () => {
     ).rejects.toThrow(/exited with code 7/);
 
     expect(listPendingStarts(workspace.id)).toEqual([]);
+  });
+
+  it("stops a runtime when the child consumed its pending intent just before startup timeout cleanup", async () => {
+    if (process.platform !== "linux") return;
+    isolateStateDir();
+    const workspace = makeWorkspace("startup-consumed-timeout");
+    const pending = createPendingStart(workspace.id);
+    completePendingStart(workspace.id, pending.startId);
+
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    children.push(child);
+    if (!child.pid) throw new Error("child pid unavailable");
+    const generation = await processGeneration(child.pid);
+    writeRuntimeState(runtimeFor(workspace, child.pid, generation, 49100, "consumed-timeout"));
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("startup endpoint unavailable"));
+
+    await expect(
+      waitForBridgeStartup(
+        workspace,
+        child,
+        pending.startId,
+        "test-daemon.log",
+        {
+          timeoutMs: 0,
+          pollMs: 0,
+          findLive: async () => null,
+          sleep: async () => undefined,
+        }
+      )
+    ).rejects.toThrow(/did not become healthy/);
+
+    await waitForExit(child);
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
   });
 
   it("cancels a pending detached start before reporting the workspace stopped", async () => {
