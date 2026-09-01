@@ -61,9 +61,54 @@ describe("generationless legacy revocation", () => {
       })
     ).rejects.toThrow(/Failed to fully revoke/);
 
-    // A generationless PID is only conservative liveness evidence. It must
-    // never authorize signaling or a stop attempt when app identity is unknown.
     expect(stopCalls).toBe(0);
+  });
+
+  it("treats a generation-bearing runtime with temporarily unknown identity as live and never removes it", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("generation-unknown-live-pid");
+    const runtime: RuntimeState = {
+      service: SERVICE_NAME,
+      version: "0.1.0",
+      workspaceId: workspace.id,
+      workspaceRoot: workspace.root,
+      pid: process.pid,
+      processGeneration: "expected-generation",
+      port: 49992,
+      adminToken: "hardened-admin-token",
+      publicUrl: null,
+      startedAt: new Date().toISOString(),
+    };
+    let stopCalls = 0;
+    let removeCalls = 0;
+
+    await expect(
+      revokeWorkspaceAccess(workspace.root, {
+        listRuntimeStates: () => [runtime],
+        removeRuntimeStateGeneration: () => {
+          removeCalls += 1;
+        },
+        processGenerationStatus: () => "unknown",
+        adminFetch: async () => {
+          throw new Error("admin endpoint timed out");
+        },
+        probeBridge: async () => null,
+        stopBridge: async () => {
+          stopCalls += 1;
+          return false;
+        },
+        authStoreFactory: () => ({ revokeAll: () => 0 }),
+        revokeTunnelToken: () => false,
+        cancelPendingStarts: () => 0,
+        listPendingStarts: () => [],
+        sleep: async () => undefined,
+        stopTimeoutMs: 0,
+        maxRuntimeGenerations: 1,
+      })
+    ).rejects.toThrow(/Failed to fully revoke/);
+
+    expect(stopCalls).toBe(0);
+    expect(removeCalls).toBe(0);
   });
 });
 
@@ -79,5 +124,16 @@ describe("exact process-termination platform support", () => {
     expect(support!("linux")).toBe(true);
     expect(support!("win32")).toBe(true);
     expect(support!("darwin")).toBe(false);
+  });
+
+  it("probes the real native Windows handle termination chain before credentials can load", () => {
+    const source = fs.readFileSync(path.resolve("src/process/process-identity.ts"), "utf8");
+    expect(source).toContain("WINDOWS_HANDLE_CAPABILITY_SCRIPT");
+    expect(source).toContain("Start-Process");
+    expect(source).toContain("OpenProcess");
+    expect(source).toContain("GetProcessTimes");
+    expect(source).toContain("TerminateProcess");
+    expect(source).toContain("WaitForExit(2000)");
+    expect(source).toContain("probeWindowsExactTermination()");
   });
 });
