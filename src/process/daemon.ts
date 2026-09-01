@@ -417,7 +417,10 @@ export async function stopBridge(workspaceRoot: string): Promise<boolean> {
     }
 
     if (listPendingStarts(workspace.id).length !== 0) allStopped = false;
-    return allStopped;
+    if (!allStopped) {
+      throw new Error(`One or more Bridge generations for workspace ${workspace.id} could not be fully stopped`);
+    }
+    return true;
   } finally {
     lock.release();
   }

@@ -164,6 +164,25 @@ describe("latest automated-review findings", () => {
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
   });
 
+  it("throws instead of reporting no Bridge when a discovered generation cannot be stopped", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("stop-failure-is-error");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    children.push(child);
+    if (!child.pid) throw new Error("child pid unavailable");
+
+    writeRuntimeState({
+      ...runtimeFor(workspace, child.pid, "", 49105, "unstoppable-legacy"),
+      service: "codex-with-chatgpt",
+      processGeneration: undefined,
+    });
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("legacy endpoint unavailable"));
+
+    await expect(stopBridge(workspace.root)).rejects.toThrow(/could not be fully stopped/);
+    expect(child.exitCode).toBeNull();
+    expect(child.signalCode).toBeNull();
+  });
+
   it("cancels a pending detached start before reporting the workspace stopped", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("stop-pending-start");
