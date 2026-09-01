@@ -86,14 +86,31 @@ export function requireCurrentProcessGeneration(): string {
   return generation;
 }
 
+/**
+ * This probe intentionally executes both pidfd syscalls rather than merely
+ * checking that Python exposes their symbols. Signal 0 performs kernel
+ * validation without delivering a real signal, so a kernel/seccomp policy that
+ * rejects pidfd_open or pidfd_send_signal is detected before credentials load.
+ */
 const LINUX_PIDFD_CAPABILITY_SCRIPT = String.raw`
 import os, signal, sys
-ok = (
-    sys.version_info >= (3, 9)
-    and hasattr(os, "pidfd_open")
-    and hasattr(signal, "pidfd_send_signal")
-)
-sys.exit(0 if ok else 20)
+fd = None
+try:
+    if sys.version_info < (3, 9):
+        sys.exit(20)
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        sys.exit(20)
+    fd = os.pidfd_open(os.getpid(), 0)
+    signal.pidfd_send_signal(fd, 0, None, 0)
+    sys.exit(0)
+except (PermissionError, ProcessLookupError, OSError, ValueError, AttributeError):
+    sys.exit(21)
+finally:
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 `;
 
 let cachedLinuxPidfdPython: string | null | undefined;
@@ -123,16 +140,16 @@ function detectLinuxPidfdPython(): string | null {
 
 /**
  * Validate process-safety prerequisites before a Bridge can load credentials.
- * Linux requires Python 3.9+ exposing pidfd_open/pidfd_send_signal so an
- * unresponsive Bridge can be terminated through a generation-bound kernel
- * process handle instead of an unsafe reusable numeric PID.
+ * Linux requires a Python 3.9+ helper whose pidfd syscalls are actually allowed
+ * by the running kernel/container policy. If this cannot be proven, startup
+ * fails closed before tunnel or OAuth credentials are read or created.
  */
 export function requireProcessSafetyRuntime(): void {
   if (process.platform !== "linux") return;
   if (!detectLinuxPidfdPython()) {
     throw new Error(
-      "Linux requires Python 3.9+ with os.pidfd_open and signal.pidfd_send_signal for safe Bridge lifecycle management. " +
-        "Install a suitable Python runtime or set C2C_PYTHON to its executable."
+      "Linux requires Python 3.9+ with working os.pidfd_open and signal.pidfd_send_signal syscalls for safe Bridge lifecycle management. " +
+        "Install a suitable Python runtime, set C2C_PYTHON to it, and ensure the kernel/container seccomp policy allows pidfd operations."
     );
   }
 }
