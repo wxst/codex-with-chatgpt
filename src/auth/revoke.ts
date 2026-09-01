@@ -94,6 +94,22 @@ function dedupeRuntimes(states: RuntimeState[]): RuntimeState[] {
   return unique;
 }
 
+/**
+ * Numeric PID existence is intentionally only conservative evidence for legacy
+ * runtimes that predate process-generation stamping. PID reuse means this can
+ * never authorize a signal or prove exact ownership; it can only prevent an
+ * unsafe false "dead" classification when a generationless Bridge is paused.
+ */
+function numericPidExists(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 export async function revokeWorkspaceAccess(
   workspaceRoot: string,
   deps: RevokeWorkspaceAccessDeps = {}
@@ -170,7 +186,7 @@ async function revokeWorkspaceAccessLocked(
       const info = await requestAdmin<RuntimeIdentityPayload>(runtime, "GET", "/admin/info", 1500);
       if (authenticatedRuntimeMatches(runtime, info)) return "exact-live";
     } catch {
-      // Continue to conservative endpoint detection.
+      // Continue to conservative endpoint/PID detection.
     }
 
     try {
@@ -181,14 +197,20 @@ async function revokeWorkspaceAccessLocked(
         health.workspaceId === runtime.workspaceId &&
         health.status === "ok"
       ) {
-        // Something for this workspace is still live at this tracked port, but
-        // the recorded generation cannot authenticate it. Do not claim success.
         return "unknown-live";
       }
     } catch {
-      // Treat an unreachable stale snapshot as dead unless its exact process or
-      // authenticated application identity proved otherwise above.
+      // Continue to the generationless PID fallback below.
     }
+
+    // Pre-hardening runtimes have no process generation. If both application
+    // probes time out while the recorded numeric PID still exists, the Bridge
+    // may simply be paused/wedged. Treat it as potentially live and fail closed.
+    // A reused PID can cause a conservative false positive, but is never signaled.
+    if (!runtime.processGeneration && numericPidExists(runtime.pid)) {
+      return "unknown-live";
+    }
+
     return "dead";
   };
 
@@ -212,10 +234,6 @@ async function revokeWorkspaceAccessLocked(
     }
   };
 
-  // We hold the lifecycle lock. Any parent that already spawned a delayed child
-  // has published a pending intent; cancelling all of them fences those children
-  // before credentials are scrubbed. No new ensureBridge parent can publish an
-  // intent until this lock is released.
   cancelAllPending("Failed to cancel pending bridge starts");
   scrubPersistedOAuth("Failed to revoke persisted OAuth credentials");
   removeTunnelCredential("Failed to remove OpenAI tunnel credential");
@@ -303,8 +321,6 @@ async function revokeWorkspaceAccessLocked(
     }
 
     if (confirmedLive === 0 && confirmedUnknown === 0 && pendingCount() === 0) {
-      // Require two empty/dead observations while still holding the lifecycle
-      // lock. This closes publication/cleanup timing windows inside a generation.
       await sleep(50);
       cancelAllPending("Failed to cancel pending starts during final confirmation");
       const second = listRuntimes();
