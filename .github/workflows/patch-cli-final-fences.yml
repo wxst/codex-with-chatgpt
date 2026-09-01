@@ -28,14 +28,16 @@ jobs:
           file = Path("src/cli/index.ts")
           text = file.read_text(encoding="utf-8")
 
-          old_transport_import = '''import {
+          replacements = [
+              (
+                  '''import {
             ensureOpenAITunnelToken,
             openAITunnelTokenFile,
             readTransportMode,
             type TransportMode,
           } from "../tunnel/transport-mode.js";
-          import { switchWorkspaceTransport } from "../tunnel/switch-transport.js";'''
-          new_transport_import = '''import {
+          import { switchWorkspaceTransport } from "../tunnel/switch-transport.js";''',
+                  '''import {
             openAITunnelTokenFile,
             readTransportMode,
             type TransportMode,
@@ -43,20 +45,18 @@ jobs:
           import {
             ensureWorkspaceOpenAITunnelToken,
             switchWorkspaceTransport,
-          } from "../tunnel/switch-transport.js";'''
-          if text.count(old_transport_import) != 1:
-              raise SystemExit(f"expected one transport import block, found {text.count(old_transport_import)}")
-          text = text.replace(old_transport_import, new_transport_import)
-
-          old_status_token = '''      const mode = readTransportMode(workspace.id);
-                if (mode === "openai") ensureOpenAITunnelToken(workspace.id);'''
-          new_status_token = '''      const mode = readTransportMode(workspace.id);
-                if (mode === "openai" && !opts.mode) await ensureWorkspaceOpenAITunnelToken(root);'''
-          if text.count(old_status_token) != 1:
-              raise SystemExit(f"expected one transport token status block, found {text.count(old_status_token)}")
-          text = text.replace(old_status_token, new_status_token)
-
-          old_unpair = '''program
+          } from "../tunnel/switch-transport.js";''',
+                  "transport import",
+              ),
+              (
+                  '''      const mode = readTransportMode(workspace.id);
+                if (mode === "openai") ensureOpenAITunnelToken(workspace.id);''',
+                  '''      const mode = readTransportMode(workspace.id);
+                if (mode === "openai" && !opts.mode) await ensureWorkspaceOpenAITunnelToken(root);''',
+                  "transport token status",
+              ),
+              (
+                  '''program
             .command("unpair")
             .description("Revoke ChatGPT's access to this workspace immediately")
             .option("-w, --workspace <path>")
@@ -72,8 +72,8 @@ jobs:
               } catch (error) {
                 handleCliError(error, false);
               }
-            });'''
-          new_unpair = '''program
+            });''',
+                  '''program
             .command("unpair")
             .description("Revoke ChatGPT's access to this workspace immediately")
             .option("-w, --workspace <path>")
@@ -92,40 +92,37 @@ jobs:
               } catch (error) {
                 handleCliError(error, opts.json);
               }
-            });'''
-          if text.count(old_unpair) != 1:
-              raise SystemExit(f"expected one unpair command block, found {text.count(old_unpair)}")
-          text = text.replace(old_unpair, new_unpair)
-
-          old_choose_switch = '      await switchWorkspaceTransport(root, "cloudflare");'
-          new_choose_switch = '      await switchWorkspaceTransport(root, "cloudflare", { forceFence: true });'
-          if text.count(old_choose_switch) != 1:
-              raise SystemExit(f"expected one Cloudflare choice transport call, found {text.count(old_choose_switch)}")
-          text = text.replace(old_choose_switch, new_choose_switch)
-
-          old_quick_stop = '''        const state = chooseQuickTunnel(workspace.id);
+            });''',
+                  "unpair command",
+              ),
+              (
+                  '      await switchWorkspaceTransport(root, "cloudflare");',
+                  '      await switchWorkspaceTransport(root, "cloudflare", { forceFence: true });',
+                  "Cloudflare choice transaction",
+              ),
+              (
+                  '''      const previous = readTunnelState(workspace.id);
+                if (mode === "quick") {
+                  const state = chooseQuickTunnel(workspace.id);
                   if (await findLiveBridge(workspace.id)) {
                     if (previous.preference === "named") await stopBridge(root);
-                  }'''
-          new_quick_stop = '''        const state = chooseQuickTunnel(workspace.id);
-                  await stopBridge(root);'''
-          if text.count(old_quick_stop) != 1:
-              raise SystemExit(f"expected one quick-choice conditional stop, found {text.count(old_quick_stop)}")
-          text = text.replace(old_quick_stop, new_quick_stop)
+                  }''',
+                  '''      if (mode === "quick") {
+                  const state = chooseQuickTunnel(workspace.id);''',
+                  "quick choice stop",
+              ),
+              (
+                  '      if (await findLiveBridge(workspace.id)) await stopBridge(root);',
+                  '',
+                  "named choice stop",
+              ),
+          ]
 
-          redundant_named = '''      if (mode !== "named") {
-                throw new Error("mode must be quick or named");
-              }
-          '''
-          if text.count(redundant_named) != 1:
-              raise SystemExit(f"expected one redundant named validation, found {text.count(redundant_named)}")
-          text = text.replace(redundant_named, "")
-
-          old_named_stop = '      if (await findLiveBridge(workspace.id)) await stopBridge(root);'
-          new_named_stop = '      await stopBridge(root);'
-          if text.count(old_named_stop) != 1:
-              raise SystemExit(f"expected one named-choice conditional stop, found {text.count(old_named_stop)}")
-          text = text.replace(old_named_stop, new_named_stop)
+          for old, new, label in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected one {label} target, found {count}")
+              text = text.replace(old, new)
 
           file.write_text(text, encoding="utf-8")
           Path(".github/workflows/patch-cli-final-fences.yml").unlink()
