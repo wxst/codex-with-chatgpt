@@ -87,6 +87,17 @@ export function requireCurrentProcessGeneration(): string {
 }
 
 /**
+ * Hardened lifecycle safety currently has an atomic, generation-bound external
+ * termination primitive only on Linux (pidfd) and Windows (one Process object).
+ * macOS/BSD can derive a start identity but lack the atomic handle used here to
+ * safely terminate a wedged daemon without a PID-reuse race, so startup must
+ * fail closed there before credentials are loaded.
+ */
+export function supportsExactProcessTermination(platform: NodeJS.Platform = process.platform): boolean {
+  return platform === "linux" || platform === "win32";
+}
+
+/**
  * This probe intentionally executes both pidfd syscalls rather than merely
  * checking that Python exposes their symbols. Signal 0 performs kernel
  * validation without delivering a real signal, so a kernel/seccomp policy that
@@ -140,17 +151,32 @@ function detectLinuxPidfdPython(): string | null {
 
 /**
  * Validate process-safety prerequisites before a Bridge can load credentials.
- * Linux requires a Python 3.9+ helper whose pidfd syscalls are actually allowed
- * by the running kernel/container policy. If this cannot be proven, startup
- * fails closed before tunnel or OAuth credentials are read or created.
+ * Platforms without a generation-bound termination handle are rejected rather
+ * than allowed to run with an access path that `unpair` cannot reliably kill.
  */
 export function requireProcessSafetyRuntime(): void {
-  if (process.platform !== "linux") return;
-  if (!detectLinuxPidfdPython()) {
+  if (!supportsExactProcessTermination(process.platform)) {
     throw new Error(
-      "Linux requires Python 3.9+ with working os.pidfd_open and signal.pidfd_send_signal syscalls for safe Bridge lifecycle management. " +
-        "Install a suitable Python runtime, set C2C_PYTHON to it, and ensure the kernel/container seccomp policy allows pidfd operations."
+      `Hardened Bridge startup is not supported on ${process.platform}: no generation-bound exact process termination handle is implemented. ` +
+        "Refusing to load OAuth or tunnel credentials because a wedged Bridge could not be safely revoked."
     );
+  }
+
+  if (process.platform === "linux") {
+    if (!detectLinuxPidfdPython()) {
+      throw new Error(
+        "Linux requires Python 3.9+ with working os.pidfd_open and signal.pidfd_send_signal syscalls for safe Bridge lifecycle management. " +
+          "Install a suitable Python runtime, set C2C_PYTHON to it, and ensure the kernel/container seccomp policy allows pidfd operations."
+      );
+    }
+    return;
+  }
+
+  // Windows process-generation discovery and termination both use PowerShell's
+  // Process object. Prove that the current process can be identified before any
+  // credential is read; failure here also fails startup closed.
+  if (process.platform === "win32" && !windowsGeneration(process.pid)) {
+    throw new Error("Windows cannot establish a generation-bound process handle for safe Bridge lifecycle management.");
   }
 }
 
