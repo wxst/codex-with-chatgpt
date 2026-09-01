@@ -38,6 +38,15 @@ async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
   ]);
 }
 
+async function waitForGenerationMismatch(pid: number, generation: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (!processGenerationMatches(pid, generation)) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`process generation ${generation} still matched PID ${pid} after exit`);
+}
+
 describe("process generation identity", () => {
   it("returns a stable generation for the current process", () => {
     const first = requireCurrentProcessGeneration();
@@ -81,6 +90,7 @@ describe("process generation identity", () => {
     const generation = await waitForGeneration(child.pid);
     child.kill("SIGTERM");
     await waitForExit(child);
+    await waitForGenerationMismatch(child.pid, generation);
     expect(processGenerationMatches(child.pid, generation)).toBe(false);
   });
 
@@ -111,6 +121,7 @@ describe("process generation identity", () => {
     expect(signalExactProcessGeneration(child.pid, generation, "SIGKILL")).toBe(true);
     await waitForExit(child);
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+    await waitForGenerationMismatch(child.pid, generation);
     expect(processGenerationMatches(child.pid, generation)).toBe(false);
   });
 
@@ -121,6 +132,19 @@ describe("process generation identity", () => {
     expect(source).toContain("TerminateProcess");
     expect(source).toContain("CloseHandle");
     expect(source).not.toContain("$p.Kill()");
+  });
+
+  it("uses a lightweight Windows generation query outside the destructive handle path", () => {
+    const source = fs.readFileSync(path.resolve("src/process/process-identity.ts"), "utf8");
+    const start = source.indexOf("function windowsGeneration");
+    const end = source.indexOf("export function getProcessGeneration", start);
+    const lookup = source.slice(start, end);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    expect(lookup).toContain("Get-Process -Id ([int]$env:C2C_PROCESS_PID)");
+    expect(lookup).not.toContain("Add-Type");
+    expect(lookup).not.toContain("OpenProcess");
   });
 
   it("keeps cold Windows helper startup retryable without weakening fail-closed identity checks", () => {
