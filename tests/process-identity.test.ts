@@ -134,4 +134,14 @@ describe("process generation identity", () => {
     expect(source).toContain(String.raw`if (!/^win32:\d{4}-\d{2}-\d{2}T/.test(generation)) return null;`);
     expect(source).not.toContain(String.raw`if (!/^win32:\\d`);
   });
+
+  it("passes Windows helper inputs through dedicated environment variables", () => {
+    const source = fs.readFileSync(path.resolve("src/process/process-identity.ts"), "utf8");
+    expect(source).toContain("$env:C2C_PROCESS_PID");
+    expect(source).toContain("$env:C2C_EXPECTED_GENERATION");
+    expect(source).toContain("C2C_PROCESS_PID: String(pid)");
+    expect(source).toContain("C2C_EXPECTED_GENERATION: expectedGeneration");
+    expect(source).not.toContain("$pidValue=[uint32]$args[0]");
+    expect(source).not.toContain("$expected=$args[1]");
+  });
 });
