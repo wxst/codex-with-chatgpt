@@ -8,7 +8,10 @@ import {
 } from "../src/bridge/runtime.js";
 import { stopBridge } from "../src/process/daemon.js";
 import { requireCurrentProcessGeneration } from "../src/process/process-identity.js";
-import { acquireWorkspaceLifecycleLock } from "../src/process/workspace-lock.js";
+import {
+  acquireWorkspaceLifecycleLock,
+  type WorkspaceLifecycleLock,
+} from "../src/process/workspace-lock.js";
 import {
   ensureWorkspaceOpenAITunnelToken,
   switchWorkspaceTransport,
@@ -116,6 +119,32 @@ describe("serialized transport transactions", () => {
     expect(result).toEqual({ previous: "cloudflare", mode: "cloudflare", changed: false });
   });
 
+  it("holds the lifecycle lock while a subordinate transport choice is committed", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("choice-lock");
+    writeTransportMode(workspace.id, "cloudflare");
+
+    let contenderSettled = false;
+    let contender: Promise<WorkspaceLifecycleLock> | null = null;
+    await switchWorkspaceTransport(workspace.root, "cloudflare", {
+      forceFence: true,
+      stopBridge: async () => false,
+      afterFence: async () => {
+        contender = acquireWorkspaceLifecycleLock(workspace.id).then((lock) => {
+          contenderSettled = true;
+          return lock;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        expect(contenderSettled).toBe(false);
+      },
+    });
+
+    expect(contender).not.toBeNull();
+    const acquired = await contender!;
+    expect(contenderSettled).toBe(true);
+    acquired.release();
+  });
+
   it("serializes OpenAI token creation with workspace revocation and lifecycle mutation", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("token-lock");
@@ -180,19 +209,23 @@ describe("runtime compatibility cleanup", () => {
 });
 
 describe("CLI recovery contracts", () => {
-  it("supports machine-readable unpair and never documents an unsupported recovery flag", () => {
+  it("supports machine-readable unpair", () => {
     const cli = fs.readFileSync(path.join(process.cwd(), "src", "cli", "index.ts"), "utf8");
     expect(cli).toMatch(/\.command\("unpair"\)[\s\S]*?\.option\("--json"/u);
     expect(cli).toMatch(/handleCliError\(error, opts\.json\)/u);
   });
 
-  it("fences Cloudflare quick/named choice changes even when transport is already Cloudflare", () => {
+  it("fences Cloudflare quick/named choice changes and commits them inside the transaction", () => {
     const cli = fs.readFileSync(path.join(process.cwd(), "src", "cli", "index.ts"), "utf8");
-    const chooseStart = cli.indexOf('tunnelCmd\n  .command("choose")');
-    const chooseEnd = cli.indexOf("await program.parseAsync", chooseStart);
+    const chooseStart = cli.indexOf('tunnelCmd\n  .command("choose")'.replace("\\n", "\n"));
+    const chooseEnd = cli.indexOf('tunnelCmd\n  .command("login")'.replace("\\n", "\n"), chooseStart);
     const choose = cli.slice(chooseStart, chooseEnd);
 
-    expect(choose).toContain('switchWorkspaceTransport(root, "cloudflare", { forceFence: true })');
-    expect(choose).not.toContain("if (await findLiveBridge(workspace.id))");
+    expect(chooseStart).toBeGreaterThanOrEqual(0);
+    expect(chooseEnd).toBeGreaterThan(chooseStart);
+    expect(choose.match(/switchWorkspaceTransport\(root, "cloudflare"/gu)?.length).toBe(2);
+    expect(choose.match(/forceFence: true/gu)?.length).toBe(2);
+    expect(choose.match(/afterFence:/gu)?.length).toBe(2);
+    expect(choose).not.toContain("findLiveBridge");
   });
 });
