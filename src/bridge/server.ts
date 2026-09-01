@@ -75,15 +75,6 @@ function exactRuntimeIdentityMatches(runtime: RuntimeState, info: RuntimeIdentit
   );
 }
 
-function numericPidExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
-}
-
 async function persistedRuntimeIsLiveBridge(runtime: RuntimeState): Promise<boolean> {
   const base = `http://127.0.0.1:${runtime.port}`;
   const info = await fetchLocalJson<RuntimeIdentityPayload>(`${base}/admin/info`, 1500, {
@@ -97,12 +88,12 @@ async function persistedRuntimeIsLiveBridge(runtime: RuntimeState): Promise<bool
 
 /**
  * Refuse a second persisted Bridge whenever an existing runtime may still own
- * credentials. Process-generation evidence is consulted before endpoint health:
- * an exact match proves the process is active, while an unavailable lookup with
- * the numeric PID still present is `unknown` and must also fail closed. Legacy
- * generationless snapshots use the same conservative PID rule. Only a confirmed
- * dead generation may fall through to endpoint checks for a replacement Bridge
- * on the recorded port.
+ * credentials. Generation-bearing runtimes use exact OS identity before any
+ * endpoint probe: `match` proves a live Bridge process and `unknown` fails
+ * closed. A generationless compatibility snapshot cannot safely claim process
+ * ownership from a reusable numeric PID, so it remains governed by exact
+ * authenticated application identity plus the conservative workspace health
+ * fallback. Only positively dead or unrelated state may permit startup.
  */
 async function assertNoActivePersistedBridge(workspace: Workspace): Promise<void> {
   if (activePersistedBridges.has(workspace.id)) {
@@ -118,8 +109,6 @@ async function assertNoActivePersistedBridge(workspace: Workspace): Promise<void
       if (generation === "unknown") {
         throw new Error(`A persisted bridge process may still be active for workspace ${workspace.id}`);
       }
-    } else if (numericPidExists(existing.pid)) {
-      throw new Error(`A legacy persisted bridge process may still be active for workspace ${workspace.id}`);
     }
 
     if (await persistedRuntimeIsLiveBridge(existing)) {
