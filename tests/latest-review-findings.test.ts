@@ -7,6 +7,11 @@ import { startBridge } from "../src/bridge/server.js";
 import { writeRuntimeState, type RuntimeState } from "../src/bridge/runtime.js";
 import { stopBridge } from "../src/process/daemon.js";
 import { getProcessGeneration } from "../src/process/process-identity.js";
+import {
+  createPendingStart,
+  listPendingStarts,
+  requirePendingStart,
+} from "../src/process/startup-registry.js";
 import { openAITunnelTokenFile } from "../src/tunnel/transport-mode.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { SERVICE_NAME } from "../src/version.js";
@@ -72,6 +77,28 @@ afterEach(() => {
 });
 
 describe("latest automated-review findings", () => {
+  it("cancels a pending detached start before reporting the workspace stopped", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("stop-pending-start");
+    const pending = createPendingStart(workspace.id);
+    expect(listPendingStarts(workspace.id).map((entry) => entry.startId)).toContain(pending.startId);
+
+    expect(await stopBridge(workspace.root)).toBe(true);
+    expect(listPendingStarts(workspace.id)).toEqual([]);
+    expect(() => requirePendingStart(workspace.id, pending.startId)).toThrow(/cancelled|no longer valid/);
+
+    process.env.C2C_PENDING_START_ID = pending.startId;
+    await expect(
+      startBridge({
+        workspaceRoot: workspace.root,
+        port: 0,
+        transportMode: "openai",
+        persistRuntime: false,
+      })
+    ).rejects.toThrow(/cancelled|no longer valid/);
+    expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
+  });
+
   it("stops every persisted exact generation even when every admin/health probe is unavailable", async () => {
     if (process.platform !== "linux") return;
     isolateStateDir();
