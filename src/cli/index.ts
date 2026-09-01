@@ -26,12 +26,14 @@ import {
   TUNNEL_CHOICE_PROMPT,
 } from "../tunnel/state.js";
 import {
-  ensureOpenAITunnelToken,
   openAITunnelTokenFile,
   readTransportMode,
   type TransportMode,
 } from "../tunnel/transport-mode.js";
-import { switchWorkspaceTransport } from "../tunnel/switch-transport.js";
+import {
+  ensureWorkspaceOpenAITunnelToken,
+  switchWorkspaceTransport,
+} from "../tunnel/switch-transport.js";
 import { Logger } from "../logger/index.js";
 import { getStateDir } from "../config/paths.js";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
@@ -362,7 +364,7 @@ program
       }
 
       const mode = readTransportMode(workspace.id);
-      if (mode === "openai") ensureOpenAITunnelToken(workspace.id);
+      if (mode === "openai" && !opts.mode) await ensureWorkspaceOpenAITunnelToken(root);
       const payload = {
         ok: true,
         mode,
@@ -767,17 +769,20 @@ program
   .command("unpair")
   .description("Revoke ChatGPT's access to this workspace immediately")
   .option("-w, --workspace <path>")
-  .action(async (opts: { workspace?: string }) => {
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
       const result = await revokeWorkspaceAccess(root);
-      if (result.transportMode === "openai") {
+      if (opts.json) {
+        say(JSON.stringify({ ok: true, ...result }));
+      } else if (result.transportMode === "openai") {
         check("已断开 ChatGPT 对当前项目的访问（Tunnel 凭证已撤销，Bridge 已停止）");
       } else {
         check("已断开 ChatGPT 对当前项目的访问（OAuth 令牌已吊销）");
       }
     } catch (error) {
-      handleCliError(error, false);
+      handleCliError(error, opts.json);
     }
   });
 
@@ -1071,13 +1076,9 @@ tunnelCmd
       if (mode !== "quick" && mode !== "named") {
         throw new Error("mode must be quick or named");
       }
-      await switchWorkspaceTransport(root, "cloudflare");
-      const previous = readTunnelState(workspace.id);
+      await switchWorkspaceTransport(root, "cloudflare", { forceFence: true });
       if (mode === "quick") {
         const state = chooseQuickTunnel(workspace.id);
-        if (await findLiveBridge(workspace.id)) {
-          if (previous.preference === "named") await stopBridge(root);
-        }
         const payload = { ...tunnelChoicePayload(workspace), state };
         if (opts.json) say(JSON.stringify(payload));
         else check("已选用临时地址");
@@ -1108,7 +1109,7 @@ tunnelCmd
         zone,
         hostname: opts.hostname,
       });
-      if (await findLiveBridge(workspace.id)) await stopBridge(root);
+
       const payload = {
         ...tunnelChoicePayload(workspace),
         ok: true,
