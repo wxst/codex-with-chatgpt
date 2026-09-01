@@ -2,6 +2,11 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+const WINDOWS_GENERATION_TIMEOUT_MS = 15_000;
+const WINDOWS_NATIVE_CAPABILITY_TIMEOUT_MS = 20_000;
+const WINDOWS_NATIVE_SIGNAL_TIMEOUT_MS = 15_000;
+let cachedCurrentProcessGeneration: string | undefined;
+
 function validPid(pid: number): boolean {
   return Number.isSafeInteger(pid) && pid > 0;
 }
@@ -51,7 +56,7 @@ function windowsGeneration(pid: number): string | null {
     ].join("; ");
     const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], {
       encoding: "utf8",
-      timeout: 2500,
+      timeout: WINDOWS_GENERATION_TIMEOUT_MS,
       windowsHide: true,
     });
     if (result.status !== 0) return null;
@@ -65,12 +70,22 @@ function windowsGeneration(pid: number): string | null {
 
 export function getProcessGeneration(pid: number): string | null {
   if (!validPid(pid)) return null;
-  if (process.platform === "linux") return linuxGeneration(pid);
-  if (process.platform === "win32") return windowsGeneration(pid);
-  if (process.platform === "darwin" || process.platform === "freebsd" || process.platform === "openbsd") {
-    return unixPsGeneration(pid);
+  if (pid === process.pid && cachedCurrentProcessGeneration) return cachedCurrentProcessGeneration;
+
+  let generation: string | null;
+  if (process.platform === "linux") generation = linuxGeneration(pid);
+  else if (process.platform === "win32") generation = windowsGeneration(pid);
+  else if (process.platform === "darwin" || process.platform === "freebsd" || process.platform === "openbsd") {
+    generation = unixPsGeneration(pid);
+  } else {
+    generation = null;
   }
-  return null;
+
+  // A process cannot change its own creation identity while it remains
+  // alive. Cache only a successful observation; transient lookup
+  // failures remain retryable and never weaken fail-closed behavior.
+  if (pid === process.pid && generation) cachedCurrentProcessGeneration = generation;
+  return generation;
 }
 
 function numericPidExists(pid: number): boolean {
@@ -236,7 +251,7 @@ function probeWindowsExactTermination(): boolean {
     const result = spawnSync(
       powershell,
       ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_HANDLE_CAPABILITY_SCRIPT],
-      { encoding: "utf8", timeout: 8000, windowsHide: true }
+      { encoding: "utf8", timeout: WINDOWS_NATIVE_CAPABILITY_TIMEOUT_MS, windowsHide: true }
     );
     cachedWindowsExactTermination = result.status === 0;
   } catch {
@@ -380,7 +395,7 @@ function signalWindowsProcessHandle(pid: number, expectedGeneration: string): bo
     const result = spawnSync(
       powershell,
       ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_HANDLE_SIGNAL_SCRIPT, String(pid), expectedGeneration],
-      { encoding: "utf8", timeout: 5000, windowsHide: true }
+      { encoding: "utf8", timeout: WINDOWS_NATIVE_SIGNAL_TIMEOUT_MS, windowsHide: true }
     );
     return result.status === 0;
   } catch {
