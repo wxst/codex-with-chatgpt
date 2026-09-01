@@ -30,28 +30,19 @@ jobs:
           old = '''      const workspace = new Workspace(root);
                 writeTransportMode(workspace.id, "cloudflare");
                 const mode = opts.mode.trim().toLowerCase();
-                const previous = readTunnelState(workspace.id);
-                if (mode === "quick") {'''
+                const previous = readTunnelState(workspace.id);'''
           new = '''      const workspace = new Workspace(root);
                 const mode = opts.mode.trim().toLowerCase();
                 if (mode !== "quick" && mode !== "named") {
                   throw new Error("mode must be quick or named");
                 }
                 await switchWorkspaceTransport(root, "cloudflare");
-                const previous = readTunnelState(workspace.id);
-                if (mode === "quick") {'''
-          redundant = '''      if (mode !== "named") {
-                throw new Error("mode must be quick or named");
-              }
-          '''
+                const previous = readTunnelState(workspace.id);'''
 
           if text.count(old) != 1:
-              raise SystemExit(f"expected one fallback selection block, found {text.count(old)}")
-          if text.count(redundant) != 1:
-              raise SystemExit(f"expected one redundant validation block, found {text.count(redundant)}")
+              raise SystemExit(f"expected one direct fallback selection block, found {text.count(old)}")
 
-          text = text.replace(old, new).replace(redundant, "")
-          cli.write_text(text, encoding="utf-8")
+          cli.write_text(text.replace(old, new), encoding="utf-8")
           Path(".github/workflows/patch-fallback-selection.yml").unlink()
           PY
 
