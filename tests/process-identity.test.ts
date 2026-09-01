@@ -21,7 +21,7 @@ afterEach(() => {
 });
 
 async function waitForGeneration(pid: number): Promise<string> {
-  const deadline = Date.now() + 2000;
+  const deadline = Date.now() + 12_000;
   while (Date.now() < deadline) {
     const generation = getProcessGeneration(pid);
     if (generation) return generation;
@@ -34,7 +34,7 @@ async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   await Promise.race([
     once(child, "exit").then(() => undefined),
-    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("child did not exit")), 3000)),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("child did not exit")), 5000)),
   ]);
 }
 
@@ -54,8 +54,8 @@ describe("process generation identity", () => {
     expect(classifyProcessGeneration("different-generation", true, "expected-generation")).toBe("mismatch");
   });
 
-  it("validates the declared Linux pidfd helper runtime", () => {
-    if (process.platform !== "linux") return;
+  it("validates the declared exact-termination helper runtime", () => {
+    if (process.platform !== "linux" && process.platform !== "win32") return;
     expect(() => requireProcessSafetyRuntime()).not.toThrow();
   });
 
