@@ -10,13 +10,25 @@ This fork keeps the upstream `codex-with-chatgpt` workflow while changing the tr
 
 The scheduled upstream workflow runs a test merge in a read-only GitHub Actions job. A separate write-capable job only updates the mirror branch and PR metadata; it does not execute upstream project code.
 
+## Supported hardened runtime platforms
+
+The hardened Bridge currently starts only where it can prove that a wedged daemon can be terminated through a generation-bound OS process handle before any OAuth or tunnel credential is loaded:
+
+- **Linux** — supported when Python 3.9+ is available and the running kernel/container policy permits `os.pidfd_open` and `signal.pidfd_send_signal`. C2C executes both pidfd syscalls safely during startup to verify the capability. `C2C_PYTHON` can select a specific interpreter.
+- **Windows** — supported using a generation-validated Windows `Process` object/handle.
+- **macOS / BSD** — intentionally fail-closed for now. C2C can derive a process start identity there, but this hardened fork does not yet have an atomic generation-bound termination handle suitable for killing a wedged detached Bridge without a PID-reuse race. Startup is rejected before credentials are read or created.
+
+This restriction is a hardening choice, not a claim that Node.js or the upstream project cannot otherwise run on macOS.
+
 ## Transport model
 
 ### Default: OpenAI Secure MCP Tunnel
 
 The C2C bridge stays bound to loopback. The ChatGPT-facing `/mcp` route requires a random per-workspace `X-C2C-Tunnel-Token` stored in the local C2C state directory with owner-only permissions.
 
-The official OpenAI `tunnel-client` is expected to make the outbound connection and forward that token only to the local MCP origin. C2C does not create a public Cloudflare MCP endpoint in this mode.
+The official OpenAI `tunnel-client` is expected to make the outbound connection and forward that token only to the local MCP origin. Running the official tunnel client also requires the OpenAI control-plane tunnel ID/runtime API credential required by that client. This credential is separate from model inference billing and must remain in the local environment; it is not stored in the repository or pasted into ChatGPT.
+
+C2C does not create a public Cloudflare MCP endpoint in this mode.
 
 OpenAI mode also rejects proxy-marker headers such as `X-Forwarded-For`, `Forwarded`, `CF-Connecting-IP`, and `X-Real-IP`. This prevents accidentally putting the local MCP endpoint behind an unrelated public reverse proxy.
 
@@ -96,4 +108,4 @@ pnpm test
 pnpm build
 ```
 
-Security regressions covered by tests include path traversal/symlink boundaries, sensitive file leakage, sensitive git-diff renames, transport state, OpenAI tunnel token handling, proxy-header rejection, read-only tool exposure, and prevention of Cloudflare tunnel startup in OpenAI mode.
+Security regressions covered by tests include path traversal/symlink boundaries, sensitive file leakage, sensitive git-diff renames, transport state, OpenAI tunnel token handling, proxy-header rejection, read-only tool exposure, prevention of Cloudflare tunnel startup in OpenAI mode, workspace lifecycle serialization, pending-start fencing, multi-generation runtime discovery, legacy revocation behavior, and generation-bound process termination.
