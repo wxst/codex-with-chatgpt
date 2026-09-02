@@ -278,7 +278,7 @@ describe("review finding: reused token permissions", () => {
     const token = "c2c_tunnel_" + "b".repeat(43);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, token + "\n", { mode: 0o644 });
-    vi.spyOn(fs, "chmodSync").mockImplementation(() => {
+    vi.spyOn(fs, "fchmodSync").mockImplementation(() => {
       throw new Error("chmod denied");
     });
     expect(() => ensureOpenAITunnelToken(workspace.id)).toThrow(/chmod denied/);

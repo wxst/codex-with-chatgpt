@@ -68,7 +68,7 @@ export function bearerAuth(deps: BearerAuthDeps) {
 }
 
 export interface OpenAITunnelAuthDeps {
-  expectedToken: string;
+  expectedToken: string | (() => string);
   logger: Logger;
 }
 
@@ -103,7 +103,13 @@ export function openAITunnelAuth(deps: OpenAITunnelAuthDeps) {
     const hasProxyMarker = PROXY_MARKER_HEADERS.some((name) => req.headers[name] !== undefined);
     const supplied = req.get(OPENAI_TUNNEL_HEADER) ?? "";
     const loopback = isLoopback(remote);
-    const tokenMatch = secureEqual(supplied, deps.expectedToken);
+    let tokenMatch = false;
+    try {
+      const expectedToken = typeof deps.expectedToken === "function" ? deps.expectedToken() : deps.expectedToken;
+      tokenMatch = supplied.length > 0 && expectedToken.length > 0 && secureEqual(supplied, expectedToken);
+    } catch {
+      // Missing, unreadable, or malformed credential files fail closed.
+    }
 
     if (!loopback || hasProxyMarker || !tokenMatch) {
       deps.logger.warn("Rejected MCP request in OpenAI tunnel mode", {

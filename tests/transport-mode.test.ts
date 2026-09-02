@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  ensureOpenAITunnelToken,
+  isLocalAbsoluteTokenPath,
   loadOpenAITunnelToken,
   openAITunnelTokenFile,
   OPENAI_TUNNEL_TOKEN_FILE_ENV,
@@ -22,6 +24,16 @@ function useTempStateDir(): string {
   return dir;
 }
 
+function tryCreateFileSymlink(target: string, link: string): boolean {
+  try {
+    fs.symlinkSync(target, link, "file");
+    return true;
+  } catch (error) {
+    if (["EPERM", "EACCES", "UNKNOWN"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
+    throw error;
+  }
+}
+
 afterEach(() => {
   if (originalStateDir === undefined) delete process.env.C2C_STATE_DIR;
   else process.env.C2C_STATE_DIR = originalStateDir;
@@ -31,6 +43,13 @@ afterEach(() => {
 });
 
 describe("transport mode", () => {
+  it.each(["\\\\HOST\\share\\token", "\\\\?\\C:\\fixture\\token", "\\??\\C:\\fixture\\token", "\\Device\\token", "\\rooted"])(
+    "rejects an unsafe Windows credential path before filesystem access: %s",
+    (unsafePath) => {
+      expect(isLocalAbsoluteTokenPath(unsafePath, "win32")).toBe(false);
+    }
+  );
+
   it("defaults new workspaces to OpenAI Secure MCP Tunnel", () => {
     useTempStateDir();
     expect(readTransportMode("workspace-a")).toBe("openai");
@@ -97,4 +116,76 @@ describe("transport mode", () => {
       expect(fs.readFileSync(file, "utf8")).toBe(contents);
     }
   );
+
+  it("atomically replaces a malformed canonical credential on the current platform", () => {
+    useTempStateDir();
+    const file = openAITunnelTokenFile("workspace-repair-malformed");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "malformed-token\n", { mode: 0o600 });
+
+    const repaired = ensureOpenAITunnelToken("workspace-repair-malformed");
+    expect(repaired).toMatch(/^c2c_tunnel_[A-Za-z0-9_-]{43}$/);
+    expect(fs.readFileSync(file, "utf8")).toBe(`${repaired}\n`);
+    expect(fs.readdirSync(path.dirname(file)).some((name) => name.endsWith(".tmp"))).toBe(false);
+  });
+
+  it("does not write a new credential through a linked state-directory ancestor", () => {
+    const dir = useTempStateDir();
+    const target = path.join(dir, "linked-state-target");
+    const linkedState = path.join(dir, "linked-state");
+    fs.mkdirSync(target);
+    try {
+      fs.symlinkSync(target, linkedState, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") return;
+      throw error;
+    }
+    process.env.C2C_STATE_DIR = linkedState;
+
+    expect(() => ensureOpenAITunnelToken("workspace-linked-parent")).toThrow(/local|symbolic|linked/i);
+    expect(fs.existsSync(path.join(target, "transports", "workspace-linked-parent.token"))).toBe(false);
+  });
+
+  it("rejects a credential whose direct parent is writable by another POSIX account", () => {
+    if (process.platform === "win32") return;
+    const dir = useTempStateDir();
+    const tokenDir = path.join(dir, "shared");
+    const tokenFile = path.join(tokenDir, "shared.token");
+    fs.mkdirSync(tokenDir, { mode: 0o777 });
+    fs.chmodSync(tokenDir, 0o777);
+    fs.writeFileSync(tokenFile, `c2c_tunnel_${"P".repeat(43)}\n`, { mode: 0o600 });
+    process.env[OPENAI_TUNNEL_TOKEN_FILE_ENV] = tokenFile;
+
+    expect(() => loadOpenAITunnelToken("workspace-shared-parent")).toThrow(/directory permissions/i);
+  });
+
+  it("rejects an explicit token file symbolic link without changing its target", () => {
+    const dir = useTempStateDir();
+    const target = path.join(dir, "linked-target.token");
+    const link = path.join(dir, "linked.token");
+    const token = `c2c_tunnel_${"L".repeat(43)}`;
+    fs.writeFileSync(target, `${token}\n`, { mode: 0o644 });
+    fs.chmodSync(target, 0o644);
+    if (!tryCreateFileSymlink(target, link)) return;
+    process.env[OPENAI_TUNNEL_TOKEN_FILE_ENV] = link;
+
+    expect(() => loadOpenAITunnelToken("workspace-linked-explicit")).toThrow(/regular file|symbolic link/i);
+    expect(fs.readFileSync(target, "utf8")).toBe(`${token}\n`);
+    if (process.platform !== "win32") expect(fs.statSync(target).mode & 0o777).toBe(0o644);
+  });
+
+  it("rejects a canonical token file symbolic link without changing its target", () => {
+    const dir = useTempStateDir();
+    const file = openAITunnelTokenFile("workspace-linked-canonical");
+    const target = path.join(dir, "canonical-target.token");
+    const token = `c2c_tunnel_${"C".repeat(43)}`;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(target, `${token}\n`, { mode: 0o644 });
+    fs.chmodSync(target, 0o644);
+    if (!tryCreateFileSymlink(target, file)) return;
+
+    expect(() => ensureOpenAITunnelToken("workspace-linked-canonical")).toThrow(/regular file|symbolic link/i);
+    expect(fs.readFileSync(target, "utf8")).toBe(`${token}\n`);
+    if (process.platform !== "win32") expect(fs.statSync(target).mode & 0o777).toBe(0o644);
+  });
 });
