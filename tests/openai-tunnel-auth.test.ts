@@ -1,8 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import fs from "node:fs";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
+import { Logger } from "../src/logger/index.js";
 import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir } from "./helpers.js";
 
 let root: string;
@@ -52,6 +54,44 @@ describe("OpenAI Secure MCP Tunnel authentication", () => {
     });
 
     expect(response.status).toBe(401);
+  });
+
+  it("records only boolean OpenAI tunnel rejection reasons", async () => {
+    const auditRoot = makeTmpDir("openai-tunnel-audit-ws");
+    const auditState = makeTmpDir("openai-tunnel-audit-state");
+    const logFile = path.join(auditState, "audit.log");
+    const expected = `c2c_tunnel_${"A".repeat(43)}`;
+    const supplied = `c2c_tunnel_${"B".repeat(43)}`;
+    makeGitRepo(auditRoot);
+    const auditBridge = await startBridge({
+      workspaceRoot: auditRoot,
+      port: 0,
+      persistRuntime: false,
+      transportMode: "openai",
+      openAITunnelToken: expected,
+      logger: new Logger({ name: "openai-tunnel-audit", file: logFile }),
+      authStoreFile: path.join(auditState, "store.json"),
+    });
+
+    try {
+      const response = await fetch(`${auditBridge.localBaseUrl()}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-c2c-tunnel-token": supplied },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 }),
+      });
+      expect(response.status).toBe(401);
+    } finally {
+      await auditBridge.close();
+    }
+
+    const output = fs.readFileSync(logFile, "utf8");
+    expect(output).toContain('"loopback":true');
+    expect(output).toContain('"proxyMarker":false');
+    expect(output).toContain('"tokenMatch":false');
+    expect(output).not.toContain(expected);
+    expect(output).not.toContain(supplied);
+    cleanup(auditRoot);
+    cleanup(auditState);
   });
 
   it("accepts the official-tunnel style local header and exposes only read-only tools", async () => {

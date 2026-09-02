@@ -102,9 +102,15 @@ export function openAITunnelAuth(deps: OpenAITunnelAuthDeps) {
     const remote = req.socket.remoteAddress ?? "";
     const hasProxyMarker = PROXY_MARKER_HEADERS.some((name) => req.headers[name] !== undefined);
     const supplied = req.get(OPENAI_TUNNEL_HEADER) ?? "";
+    const loopback = isLoopback(remote);
+    const tokenMatch = secureEqual(supplied, deps.expectedToken);
 
-    if (!isLoopback(remote) || hasProxyMarker || !secureEqual(supplied, deps.expectedToken)) {
-      deps.logger.warn("Rejected MCP request in OpenAI tunnel mode");
+    if (!loopback || hasProxyMarker || !tokenMatch) {
+      deps.logger.warn("Rejected MCP request in OpenAI tunnel mode", {
+        loopback,
+        proxyMarker: hasProxyMarker,
+        tokenMatch,
+      });
       res.status(401).json({ error: "unauthorized", error_description: "Trusted tunnel authentication required" });
       return;
     }
