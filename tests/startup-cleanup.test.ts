@@ -33,7 +33,7 @@ describe("failed Bridge startup cleanup", () => {
         pollMs: 1,
         findLive: async () => null,
         sleep: async () => undefined,
-        stopWorkspace: async () => {
+        stopBridge: async () => {
           cleanupCalls += 1;
           throw new Error("exact Bridge generation survived cleanup");
         },
@@ -47,7 +47,7 @@ describe("failed Bridge startup cleanup", () => {
     expect(cleanupCalls).toBe(1);
   });
 
-  it("preserves the original startup error after confirmed no-op cleanup", async () => {
+  it("preserves the original startup error after confirmed cleanup", async () => {
     const workspace = makeWorkspace("startup-cleanup-noop");
     let cleanupCalls = 0;
 
@@ -61,9 +61,9 @@ describe("failed Bridge startup cleanup", () => {
         pollMs: 1,
         findLive: async () => null,
         sleep: async () => undefined,
-        stopWorkspace: async () => {
+        stopBridge: async () => {
           cleanupCalls += 1;
-          return false;
+          return true;
         },
       }
     );
@@ -86,7 +86,7 @@ describe("failed Bridge startup cleanup", () => {
         pollMs: 1,
         findLive: async () => null,
         sleep: async () => undefined,
-        stopWorkspace: async () => {
+        stopBridge: async () => {
           cleanupCalls += 1;
           return true;
         },

@@ -91,7 +91,7 @@ describe("runtime snapshot publication", () => {
 });
 
 describe("revocation process identity", () => {
-  it("never signals a stale/reused PID when bridge identity cannot be proven", async () => {
+  it("uses only non-destructive liveness probes when bridge identity cannot be proven", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("stale-pid");
     writeRuntimeState(runtimeFor(workspace));
@@ -100,7 +100,8 @@ describe("revocation process identity", () => {
     const kill = vi.spyOn(process, "kill").mockReturnValue(true);
 
     await expect(stopBridge(workspace.root)).rejects.toThrow(/could not be fully stopped/);
-    expect(kill).not.toHaveBeenCalled();
+    expect(kill).toHaveBeenCalled();
+    expect(kill.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
   });
 
   it("terminates an unresponsive process only when its exact generation still matches", async () => {

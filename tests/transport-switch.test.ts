@@ -1,10 +1,15 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { switchWorkspaceTransport } from "../src/tunnel/switch-transport.js";
-import type { TransportMode } from "../src/tunnel/transport-mode.js";
-import { cleanup, makeTmpDir } from "./helpers.js";
+import {
+  readTransportMode,
+  transportStateFile,
+  writeTransportMode,
+} from "../src/tunnel/transport-mode.js";
+import { Workspace } from "../src/workspace/manager.js";
+import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const roots: string[] = [];
@@ -17,23 +22,25 @@ function makeWorkspace(name: string): string {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
+  delete process.env.C2C_STATE_DIR;
   for (const root of roots.splice(0)) cleanup(root);
 });
 
+function isolateTestState(): void {
+  roots.push(isolateStateDir());
+}
+
 describe("transactional transport switching", () => {
   it("persists the requested mode after the workspace is fully fenced", async () => {
+    isolateTestState();
     const root = makeWorkspace("transport-success");
-    let mode: TransportMode = "cloudflare";
-    const writes: TransportMode[] = [];
+    const workspace = new Workspace(root);
+    writeTransportMode(workspace.id, "cloudflare");
     let stopCalls = 0;
 
     const result = await switchWorkspaceTransport(root, "openai", {
-      readMode: () => mode,
-      writeMode: (_workspaceId, next) => {
-        writes.push(next);
-        mode = next;
-      },
-      stopWorkspace: async () => {
+      stopBridge: async () => {
         stopCalls += 1;
         return true;
       },
@@ -43,66 +50,77 @@ describe("transactional transport switching", () => {
       previous: "cloudflare",
       mode: "openai",
       changed: true,
-      bridgeActivityStopped: true,
     });
-    expect(mode).toBe("openai");
-    expect(writes).toEqual(["openai"]);
+    expect(readTransportMode(workspace.id)).toBe("openai");
     expect(stopCalls).toBe(1);
   });
 
   it("restores the previous mode when workspace fencing fails", async () => {
+    isolateTestState();
     const root = makeWorkspace("transport-rollback");
-    let mode: TransportMode = "cloudflare";
-    const writes: TransportMode[] = [];
+    const workspace = new Workspace(root);
+    writeTransportMode(workspace.id, "cloudflare");
 
     await expect(
       switchWorkspaceTransport(root, "openai", {
-        readMode: () => mode,
-        writeMode: (_workspaceId, next) => {
-          writes.push(next);
-          mode = next;
-        },
-        stopWorkspace: async () => {
+        stopBridge: async () => {
           throw new Error("old bridge survived");
         },
       })
-    ).rejects.toThrow(/restored cloudflare/);
+    ).rejects.toThrow(/old bridge survived/);
 
-    expect(mode).toBe("cloudflare");
-    expect(writes).toEqual(["openai", "cloudflare"]);
+    expect(readTransportMode(workspace.id)).toBe("cloudflare");
   });
 
   it("surfaces both the fencing and rollback failures", async () => {
+    isolateTestState();
     const root = makeWorkspace("transport-rollback-failure");
+    const workspace = new Workspace(root);
+    writeTransportMode(workspace.id, "cloudflare");
+    const stateFile = transportStateFile(workspace.id);
+    const originalWrite = fs.writeFileSync;
     let writes = 0;
+    vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+      if (path.resolve(String(file)) === path.resolve(stateFile)) {
+        writes += 1;
+        if (writes === 2) throw new Error("rollback write failed");
+      }
+      return originalWrite(file, data, options);
+    });
 
     await expect(
       switchWorkspaceTransport(root, "openai", {
-        readMode: () => "cloudflare",
-        writeMode: () => {
-          writes += 1;
-          if (writes === 2) throw new Error("rollback write failed");
-        },
-        stopWorkspace: async () => {
+        stopBridge: async () => {
           throw new Error("old bridge survived");
         },
       })
-    ).rejects.toBeInstanceOf(AggregateError);
+    ).rejects.toSatisfy((error: unknown) => {
+      return (
+        error instanceof AggregateError &&
+        error.errors.some((entry) => /old bridge survived/.test(String(entry))) &&
+        error.errors.some((entry) => /rollback write failed/.test(String(entry)))
+      );
+    });
 
     expect(writes).toBe(2);
   });
 
   it("does not stop or rewrite an unchanged mode", async () => {
+    isolateTestState();
     const root = makeWorkspace("transport-noop");
+    const workspace = new Workspace(root);
+    writeTransportMode(workspace.id, "openai");
+    const stateFile = transportStateFile(workspace.id);
+    const originalWrite = fs.writeFileSync;
     let writes = 0;
     let stopCalls = 0;
+    vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+      if (path.resolve(String(file)) === path.resolve(stateFile)) writes += 1;
+      return originalWrite(file, data, options);
+    });
 
     const result = await switchWorkspaceTransport(root, "openai", {
-      readMode: () => "openai",
-      writeMode: () => {
-        writes += 1;
-      },
-      stopWorkspace: async () => {
+      stopBridge: async () => {
         stopCalls += 1;
         return true;
       },
