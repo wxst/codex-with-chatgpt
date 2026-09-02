@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Workspace } from "../workspace/manager.js";
-import { stateSubdir } from "../config/paths.js";
+import { getStateDir, stateSubdir } from "../config/paths.js";
 import {
   findLiveBridge,
   listRuntimeStates,
@@ -25,6 +25,11 @@ import {
   listPendingStarts,
 } from "./startup-registry.js";
 import { SERVICE_NAME } from "../version.js";
+import {
+  OPENAI_TUNNEL_TOKEN_FILE_ENV,
+  openAITunnelTokenFile,
+  readTransportMode,
+} from "../tunnel/transport-mode.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const GRACEFUL_STOP_MS = 750;
@@ -34,6 +39,7 @@ const LEGACY_AUTHENTICATED_STOP_MS = 5_000;
 const LEGACY_EXIT_CONFIRM_MS = 750;
 const STOP_POLL_MS = 50;
 const PENDING_START_ENV = "C2C_PENDING_START_ID";
+const STATE_DIR_ENV = "C2C_STATE_DIR";
 
 function cliEntry(): { cmd: string; args: string[] } {
   const distEntry = path.resolve(moduleDir, "..", "cli", "index.js");
@@ -48,6 +54,29 @@ function cliEntry(): { cmd: string; args: string[] } {
 
 function daemonLogFile(workspaceId: string): string {
   return path.join(stateSubdir("logs"), `bridge-${workspaceId}.out.log`);
+}
+
+/**
+ * Pin the parent's state directory and credential file into the detached child
+ * environment. The child must use the same lifecycle registry, runtime files,
+ * and security boundary rather than rediscovering them from another context.
+ */
+export function bridgeDaemonEnvironment(
+  workspace: Workspace,
+  base: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+  const environment = { ...base };
+  for (const key of Object.keys(environment)) {
+    const normalizedKey = key.toUpperCase();
+    if (normalizedKey === STATE_DIR_ENV || normalizedKey === OPENAI_TUNNEL_TOKEN_FILE_ENV) {
+      delete environment[key];
+    }
+  }
+  environment[STATE_DIR_ENV] = getStateDir();
+  if (readTransportMode(workspace.id) === "openai") {
+    environment[OPENAI_TUNNEL_TOKEN_FILE_ENV] = openAITunnelTokenFile(workspace.id);
+  }
+  return environment;
 }
 
 export function openPrivateAppendFile(file: string): number {
@@ -150,7 +179,7 @@ export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: Ru
       child = spawn(entry.cmd, [...entry.args, "serve", "--workspace", workspace.root], {
         detached: true,
         stdio: ["ignore", logFd, logFd],
-        env: { ...process.env, [PENDING_START_ENV]: pending.startId },
+        env: { ...bridgeDaemonEnvironment(workspace), [PENDING_START_ENV]: pending.startId },
       });
     } catch (error) {
       cancelPendingStart(workspace.id, pending.startId);

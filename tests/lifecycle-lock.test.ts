@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -56,11 +56,78 @@ async function sleep(ms: number): Promise<void> {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   delete process.env.C2C_STATE_DIR;
   for (const root of roots.splice(0)) cleanup(root);
 });
 
 describe("workspace lifecycle serialization", () => {
+  it.runIf(process.platform === "win32").each(["EPERM", "EACCES", "EBUSY"])(
+    "retries a transient %s ticket rename denial",
+    async (code) => {
+      isolateStateDir();
+      const workspace = makeWorkspace(`lifecycle-transient-rename-${code}`);
+      const rename = fs.renameSync.bind(fs);
+      let attempts = 0;
+
+      vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+        if (String(target).endsWith(".ticket.json")) {
+          attempts += 1;
+          if (attempts === 1) {
+            const error = new Error("transient ticket rename denial") as NodeJS.ErrnoException;
+            error.code = code;
+            throw error;
+          }
+        }
+        return rename(source, target);
+      });
+
+      const lock = await acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 });
+      expect(attempts).toBeGreaterThan(1);
+      lock.release();
+    }
+  );
+
+  it.runIf(process.platform === "win32")("stops after the bounded transient rename retries", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-persistent-rename-denial");
+    let attempts = 0;
+
+    vi.spyOn(fs, "renameSync").mockImplementation((_source, target) => {
+      if (String(target).endsWith(".ticket.json")) {
+        attempts += 1;
+        const error = new Error("persistent ticket rename denial") as NodeJS.ErrnoException;
+        error.code = "EPERM";
+        throw error;
+      }
+    });
+
+    await expect(acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 })).rejects.toMatchObject({
+      code: "EPERM",
+    });
+    expect(attempts).toBe(7);
+  });
+
+  it.runIf(process.platform === "win32")("does not retry a non-transient rename error", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-non-transient-rename-denial");
+    let attempts = 0;
+
+    vi.spyOn(fs, "renameSync").mockImplementation((_source, target) => {
+      if (String(target).endsWith(".ticket.json")) {
+        attempts += 1;
+        const error = new Error("non-transient ticket rename denial") as NodeJS.ErrnoException;
+        error.code = "EINVAL";
+        throw error;
+      }
+    });
+
+    await expect(acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 })).rejects.toMatchObject({
+      code: "EINVAL",
+    });
+    expect(attempts).toBe(1);
+  });
+
   it("blocks revocation while the same workspace lifecycle lock is held", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("lifecycle-revoke");

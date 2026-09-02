@@ -7,6 +7,7 @@ import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
 const bridges: Bridge[] = [];
 const roots: string[] = [];
+const originalExplicitTokenFile = process.env.C2C_OPENAI_TUNNEL_TOKEN_FILE;
 
 async function makeBridge(mode: "openai" | "cloudflare"): Promise<Bridge> {
   isolateStateDir();
@@ -27,6 +28,8 @@ async function makeBridge(mode: "openai" | "cloudflare"): Promise<Bridge> {
 afterEach(async () => {
   while (bridges.length > 0) await bridges.pop()!.close();
   for (const root of roots.splice(0)) cleanup(root);
+  if (originalExplicitTokenFile === undefined) delete process.env.C2C_OPENAI_TUNNEL_TOKEN_FILE;
+  else process.env.C2C_OPENAI_TUNNEL_TOKEN_FILE = originalExplicitTokenFile;
 });
 
 describe("OpenAI Secure MCP Tunnel transport", () => {
@@ -39,6 +42,33 @@ describe("OpenAI Secure MCP Tunnel transport", () => {
   it("accepts a direct loopback request carrying the per-workspace tunnel token", async () => {
     const bridge = await makeBridge("openai");
     const token = ensureOpenAITunnelToken(bridge.workspace.id);
+    const response = await fetch(`${bridge.localBaseUrl()}/mcp`, {
+      headers: { "x-c2c-tunnel-token": token },
+    });
+    expect(response.status).toBe(405);
+  });
+
+  it("honors an explicit tunnel token file handed to the Bridge process", async () => {
+    isolateStateDir();
+    const root = makeTmpDir("transport-explicit-token");
+    const tokenDir = makeTmpDir("transport-explicit-token-file");
+    roots.push(root, tokenDir);
+    fs.writeFileSync(path.join(root, "package.json"), '{"name":"transport-explicit-token-test"}');
+
+    const token = `c2c_tunnel_${"A".repeat(43)}`;
+    const tokenFile = path.join(tokenDir, "tunnel.token");
+    fs.writeFileSync(tokenFile, `${token}\n`, { mode: 0o600 });
+    process.env.C2C_OPENAI_TUNNEL_TOKEN_FILE = tokenFile;
+
+    const bridge = await startBridge({
+      workspaceRoot: root,
+      port: 0,
+      persistRuntime: false,
+      authStoreFile: path.join(makeTmpDir("auth"), "store.json"),
+      transportMode: "openai",
+    });
+    bridges.push(bridge);
+
     const response = await fetch(`${bridge.localBaseUrl()}/mcp`, {
       headers: { "x-c2c-tunnel-token": token },
     });

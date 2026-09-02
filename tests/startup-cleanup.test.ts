@@ -1,9 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { getStateDir } from "../src/config/paths.js";
 import { waitForBridgeStartup } from "../src/process/daemon.js";
+import {
+  openAITunnelTokenFile,
+  OPENAI_TUNNEL_TOKEN_FILE_ENV,
+  writeTransportMode,
+} from "../src/tunnel/transport-mode.js";
 import { Workspace } from "../src/workspace/manager.js";
-import { cleanup, makeTmpDir } from "./helpers.js";
+import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
 const roots: string[] = [];
 
@@ -15,10 +21,60 @@ function makeWorkspace(name: string): Workspace {
 }
 
 afterEach(() => {
+  delete process.env.C2C_STATE_DIR;
+  delete process.env.C2C_OPENAI_TUNNEL_TOKEN_FILE;
   for (const root of roots.splice(0)) cleanup(root);
 });
 
 describe("failed Bridge startup cleanup", () => {
+  it("hands the parent-selected tunnel token file to a detached Bridge", async () => {
+    roots.push(isolateStateDir());
+    const workspace = makeWorkspace("startup-token-file-handoff");
+    const daemon = await import("../src/process/daemon.js");
+    const buildEnvironment = (
+      daemon as typeof daemon & {
+        bridgeDaemonEnvironment?: (workspace: Workspace, base?: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
+      }
+    ).bridgeDaemonEnvironment;
+
+    expect(buildEnvironment).toBeTypeOf("function");
+    if (!buildEnvironment) return;
+
+    const environment = buildEnvironment(workspace, {
+      C2C_STATE_DIR: "child-would-resolve-another-directory",
+      c2c_state_dir: "stale-state-directory",
+      c2c_openai_tunnel_token_file: "stale-token-file",
+    });
+    expect(environment.C2C_STATE_DIR).toBe(getStateDir());
+    expect(Object.keys(environment).filter((key) => key.toUpperCase() === "C2C_STATE_DIR")).toEqual([
+      "C2C_STATE_DIR",
+    ]);
+    expect(environment.C2C_OPENAI_TUNNEL_TOKEN_FILE).toBe(openAITunnelTokenFile(workspace.id));
+    expect(
+      Object.keys(environment).filter(
+        (key) => key.toUpperCase() === OPENAI_TUNNEL_TOKEN_FILE_ENV
+      )
+    ).toEqual([OPENAI_TUNNEL_TOKEN_FILE_ENV]);
+    expect(fs.existsSync(openAITunnelTokenFile(workspace.id))).toBe(false);
+  });
+
+  it("removes every case variant of the token file handoff outside OpenAI mode", async () => {
+    roots.push(isolateStateDir());
+    const workspace = makeWorkspace("startup-token-file-cloudflare");
+    writeTransportMode(workspace.id, "cloudflare");
+    const { bridgeDaemonEnvironment } = await import("../src/process/daemon.js");
+
+    const environment = bridgeDaemonEnvironment(workspace, {
+      c2c_openai_tunnel_token_file: "stale-token-file",
+    });
+
+    expect(
+      Object.keys(environment).filter(
+        (key) => key.toUpperCase() === OPENAI_TUNNEL_TOKEN_FILE_ENV
+      )
+    ).toEqual([]);
+  });
+
   it("surfaces an aggregate error when lifecycle-fenced cleanup also fails", async () => {
     const workspace = makeWorkspace("startup-cleanup-failure");
     let cleanupCalls = 0;

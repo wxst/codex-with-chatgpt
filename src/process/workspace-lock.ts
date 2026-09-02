@@ -37,6 +37,28 @@ export interface WorkspaceLifecycleLock {
 const DEFAULT_ORPHAN_GRACE_MS = 30_000;
 const DEFAULT_HEARTBEAT_MS = 1_000;
 const TICKET_SUFFIX = ".ticket.json";
+const WINDOWS_RENAME_RETRY_DELAYS_MS = [2, 4, 8, 16, 32, 64] as const;
+const WINDOWS_TRANSIENT_RENAME_CODES = new Set(["EACCES", "EBUSY", "EPERM"]);
+
+function renameTicketWithRetry(temp: string, file: string): void {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(temp, file);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "";
+      if (
+        process.platform !== "win32" ||
+        !WINDOWS_TRANSIENT_RENAME_CODES.has(code) ||
+        attempt >= WINDOWS_RENAME_RETRY_DELAYS_MS.length
+      ) {
+        throw error;
+      }
+      const signal = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+      Atomics.wait(signal, 0, 0, WINDOWS_RENAME_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
 
 function assertWorkspaceId(workspaceId: string): void {
   if (!/^[A-Za-z0-9._-]+$/.test(workspaceId)) {
@@ -158,7 +180,7 @@ function writeTicket(file: string, ticket: LifecycleTicket): void {
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = null;
-    fs.renameSync(temp, file);
+    renameTicketWithRetry(temp, file);
   } finally {
     if (fd !== null) {
       try {

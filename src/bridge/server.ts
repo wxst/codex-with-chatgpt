@@ -12,7 +12,7 @@ import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import { CloudflaredNamedTunnel } from "../tunnel/cloudflared-named.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
 import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
-import { ensureOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
+import { loadOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import {
@@ -212,7 +212,7 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
 
   const transportMode = opts.transportMode ?? "cloudflare";
   const openAITunnelToken =
-    transportMode === "openai" ? opts.openAITunnelToken ?? ensureOpenAITunnelToken(workspace.id) : null;
+    transportMode === "openai" ? opts.openAITunnelToken ?? loadOpenAITunnelToken(workspace.id) : null;
   const authStore = new AuthStore(workspace.id, { file: opts.authStoreFile });
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
   const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);

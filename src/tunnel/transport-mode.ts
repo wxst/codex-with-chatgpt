@@ -12,6 +12,9 @@ interface TransportState {
 }
 
 export const OPENAI_TUNNEL_HEADER = "x-c2c-tunnel-token";
+export const OPENAI_TUNNEL_TOKEN_FILE_ENV = "C2C_OPENAI_TUNNEL_TOKEN_FILE";
+
+const OPENAI_TUNNEL_TOKEN_PATTERN = /^c2c_tunnel_[A-Za-z0-9_-]{43}$/;
 
 export function transportStateFile(workspaceId: string): string {
   return path.join(getStateDir(), "transports", `${workspaceId}.json`);
@@ -72,7 +75,7 @@ export function ensureOpenAITunnelToken(workspaceId: string): string {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 
-  if (existing && /^c2c_tunnel_[A-Za-z0-9_-]{43}$/.test(existing)) {
+  if (existing && OPENAI_TUNNEL_TOKEN_PATTERN.test(existing)) {
     // Restores/copies may recreate a valid credential with permissive mode.
     // Permission repair is outside the read catch so POSIX failures propagate.
     enforceOwnerOnlyPermissions(file);
@@ -82,6 +85,39 @@ export function ensureOpenAITunnelToken(workspaceId: string): string {
   const token = `c2c_tunnel_${randomBytes(32).toString("base64url")}`;
   ensureDir(path.dirname(file));
   fs.writeFileSync(file, token + "\n", { mode: 0o600 });
+  enforceOwnerOnlyPermissions(file);
+  return token;
+}
+
+/**
+ * Load the parent-selected token file for a detached Bridge process. Passing a
+ * file path, rather than a secret value, keeps the credential out of argv and
+ * closes over environment-specific state-directory resolution.
+ */
+export function loadOpenAITunnelToken(workspaceId: string): string {
+  const rawExplicitFile = process.env[OPENAI_TUNNEL_TOKEN_FILE_ENV];
+  if (rawExplicitFile === undefined) return ensureOpenAITunnelToken(workspaceId);
+
+  const explicitFile = rawExplicitFile.trim();
+  if (!explicitFile) {
+    throw new Error(`OpenAI tunnel token file path is empty: ${OPENAI_TUNNEL_TOKEN_FILE_ENV}`);
+  }
+
+  const file = path.resolve(explicitFile);
+  const canonicalFile = path.resolve(openAITunnelTokenFile(workspaceId));
+  let token: string;
+  try {
+    token = fs.readFileSync(file, "utf8").trim();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && file === canonicalFile) {
+      return ensureOpenAITunnelToken(workspaceId);
+    }
+    throw error;
+  }
+
+  if (!OPENAI_TUNNEL_TOKEN_PATTERN.test(token)) {
+    throw new Error(`OpenAI tunnel token file is malformed: ${file}`);
+  }
   enforceOwnerOnlyPermissions(file);
   return token;
 }
