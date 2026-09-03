@@ -216,7 +216,9 @@ describe("CLI recovery contracts", () => {
   });
 
   it("fences Cloudflare quick/named choice changes and commits them inside the transaction", () => {
-    const cli = fs.readFileSync(path.join(process.cwd(), "src", "cli", "index.ts"), "utf8");
+    const cli = fs
+      .readFileSync(path.join(process.cwd(), "src", "cli", "index.ts"), "utf8")
+      .replace(/\r\n?/gu, "\n");
     const chooseStart = cli.indexOf('tunnelCmd\n  .command("choose")'.replace("\\n", "\n"));
     const chooseEnd = cli.indexOf('tunnelCmd\n  .command("login")'.replace("\\n", "\n"), chooseStart);
     const choose = cli.slice(chooseStart, chooseEnd);

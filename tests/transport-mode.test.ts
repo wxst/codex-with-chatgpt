@@ -129,6 +129,27 @@ describe("transport mode", () => {
     expect(fs.readdirSync(path.dirname(file)).some((name) => name.endsWith(".tmp"))).toBe(false);
   });
 
+  it("accepts a Windows 8.3 temp-path spelling when it identifies the same state directory", () => {
+    if (process.platform !== "win32") return;
+    const requestedStateDir = useTempStateDir();
+    const realStateDir = fs.realpathSync.native(requestedStateDir);
+    const token = ensureOpenAITunnelToken("workspace-short-path");
+    const requestedTokenFile = openAITunnelTokenFile("workspace-short-path");
+
+    expect(token).toMatch(/^c2c_tunnel_[A-Za-z0-9_-]{43}$/);
+    expect(fs.existsSync(requestedTokenFile)).toBe(true);
+    process.env[OPENAI_TUNNEL_TOKEN_FILE_ENV] = requestedTokenFile;
+    expect(loadOpenAITunnelToken("workspace-short-path")).toBe(token);
+
+    // GitHub-hosted Windows exposes TEMP through RUNNER~1 while realpath expands
+    // it. Other Windows hosts still exercise the same identity-based path.
+    if (requestedStateDir.includes("~")) {
+      expect(path.normalize(realStateDir).toLowerCase()).not.toBe(
+        path.normalize(requestedStateDir).toLowerCase()
+      );
+    }
+  });
+
   it("does not write a new credential through a linked state-directory ancestor", () => {
     const dir = useTempStateDir();
     const target = path.join(dir, "linked-state-target");
@@ -144,6 +165,28 @@ describe("transport mode", () => {
 
     expect(() => ensureOpenAITunnelToken("workspace-linked-parent")).toThrow(/local|symbolic|linked/i);
     expect(fs.existsSync(path.join(target, "transports", "workspace-linked-parent.token"))).toBe(false);
+  });
+
+  it("does not write through a linked intermediate state-directory component", () => {
+    const dir = useTempStateDir();
+    const targetParent = path.join(dir, "linked-parent-target");
+    const nestedState = path.join(targetParent, "nested-state");
+    const linkedParent = path.join(dir, "linked-parent");
+    fs.mkdirSync(nestedState, { recursive: true });
+    try {
+      fs.symlinkSync(targetParent, linkedParent, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") return;
+      throw error;
+    }
+    process.env.C2C_STATE_DIR = path.join(linkedParent, "nested-state");
+
+    expect(() => ensureOpenAITunnelToken("workspace-linked-intermediate")).toThrow(
+      /local|symbolic|linked/i
+    );
+    expect(fs.existsSync(path.join(nestedState, "transports", "workspace-linked-intermediate.token"))).toBe(
+      false
+    );
   });
 
   it("rejects a credential whose direct parent is writable by another POSIX account", () => {

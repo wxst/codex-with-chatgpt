@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +10,7 @@ import {
   cleanupLegacyWindowsWorkspaceArtifacts,
   hasLegacyWindowsWriteRights,
   isAllowedLegacyWindowsPackageProjection,
+  isTrustedLegacyWindowsAclOwner,
   isTrustedLegacyWindowsAclWriter,
   LegacyWindowsStateError,
   validateLegacyWindowsStateForCleanup,
@@ -27,7 +29,12 @@ const originalLocalAppData = process.env.LOCALAPPDATA;
 const roots: string[] = [];
 
 function temp(name: string): string {
-  const dir = makeTmpDir(name);
+  // GitHub-hosted Windows grants broad write access under the checkout root.
+  // Use the account's private temp tree so ACL tests model real per-user state.
+  const dir =
+    process.platform === "win32"
+      ? fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `${name}-`)))
+      : makeTmpDir(name);
   roots.push(dir);
   return dir;
 }
@@ -121,8 +128,18 @@ describe("legacy Windows state guard", () => {
     }
   );
 
-  it("allows only trusted ACL writers", () => {
+  it("allows only trusted ACL owners and writers", () => {
     const currentSid = "S-1-5-21-1-2-3-1001";
+    expect(isTrustedLegacyWindowsAclOwner(currentSid, currentSid)).toBe(true);
+    expect(isTrustedLegacyWindowsAclOwner("S-1-5-18", currentSid)).toBe(true);
+    expect(isTrustedLegacyWindowsAclOwner("S-1-5-32-544", currentSid)).toBe(true);
+    expect(isTrustedLegacyWindowsAclOwner(CODEX_WINDOWS_SANDBOX_CAPABILITY_SID, currentSid)).toBe(
+      false
+    );
+    expect(isTrustedLegacyWindowsAclOwner(CHATGPT_WINDOWS_SANDBOX_CAPABILITY_SID, currentSid)).toBe(
+      false
+    );
+    expect(isTrustedLegacyWindowsAclOwner("S-1-5-21-9-8-7-1002", currentSid)).toBe(false);
     expect(isTrustedLegacyWindowsAclWriter(currentSid, currentSid)).toBe(true);
     expect(isTrustedLegacyWindowsAclWriter("S-1-5-18", currentSid)).toBe(true);
     expect(isTrustedLegacyWindowsAclWriter("S-1-5-32-544", currentSid)).toBe(true);

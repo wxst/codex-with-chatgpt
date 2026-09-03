@@ -265,11 +265,17 @@ export const CODEX_WINDOWS_SANDBOX_CAPABILITY_SID =
 export const CHATGPT_WINDOWS_SANDBOX_CAPABILITY_SID =
   "S-1-15-3-2569235138-1347164924-3176874416-3980197141-1442029411-569003742-1232801007";
 
+// Elevated Windows tokens commonly make BUILTIN\Administrators the owner of
+// newly created objects. Owners can rewrite the DACL, so accept only the same
+// principals that already form the host trust boundary; app capabilities stay
+// writer-only and never qualify as owners.
+export function isTrustedLegacyWindowsAclOwner(sid: string, currentSid: string): boolean {
+  return sid === currentSid || sid === "S-1-5-18" || sid === "S-1-5-32-544";
+}
+
 export function isTrustedLegacyWindowsAclWriter(sid: string, currentSid: string): boolean {
   return (
-    sid === currentSid ||
-    sid === "S-1-5-18" ||
-    sid === "S-1-5-32-544" ||
+    isTrustedLegacyWindowsAclOwner(sid, currentSid) ||
     sid === CODEX_WINDOWS_SANDBOX_CAPABILITY_SID ||
     sid === CHATGPT_WINDOWS_SANDBOX_CAPABILITY_SID
   );
@@ -384,8 +390,8 @@ function assertPrivateWindowsAcls(targets: LegacyWindowsAclTarget[], platform: N
     for (const line of lines) {
       if (line.startsWith("OWNER|")) {
         ownerCount += 1;
-        if (line.slice("OWNER|".length) !== currentSid) {
-          throw new Error("Legacy state directory owner is not the current Windows principal");
+        if (!isTrustedLegacyWindowsAclOwner(line.slice("OWNER|".length), currentSid)) {
+          throw new Error("Legacy state directory owner is not a trusted Windows principal");
         }
       } else if (line.startsWith("ALLOW|")) {
         const fields = line.split("|");

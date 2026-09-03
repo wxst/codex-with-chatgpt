@@ -43,4 +43,4 @@ jobs:
         run: pnpm build
 
       - name: Install packed CLI and run smoke checks
-        run: pnpm test:install
+        run: pnpm smoke:install

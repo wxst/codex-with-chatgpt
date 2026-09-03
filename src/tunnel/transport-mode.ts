@@ -59,6 +59,33 @@ function sameFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean 
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+function assertNoLinkedWindowsDirectoryComponent(directory: string): void {
+  if (process.platform !== "win32") return;
+  const root = path.parse(directory).root;
+  const relative = path.relative(root, directory);
+  const segments = relative ? relative.split(path.sep).filter(Boolean) : [];
+  let cursor = root;
+  for (const segment of ["", ...segments]) {
+    if (segment) cursor = path.join(cursor, segment);
+    const stat = fs.lstatSync(cursor, { bigint: true });
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`OpenAI tunnel token directory must be local without symbolic links: ${cursor}`);
+    }
+  }
+}
+
+function realPathMatchesIdentity(
+  requestedPath: string,
+  realPath: string,
+  requestedStat: fs.BigIntStats
+): boolean {
+  if (process.platform !== "win32") {
+    return normalizedRealPath(realPath) === normalizedRealPath(requestedPath);
+  }
+  const realStat = fs.lstatSync(realPath, { bigint: true });
+  return sameFileIdentity(requestedStat, realStat);
+}
+
 function requireCurrentPosixOwner(stat: fs.BigIntStats, label: string): void {
   if (process.platform === "win32" || typeof process.getuid !== "function") return;
   if (stat.uid !== BigInt(process.getuid())) {
@@ -84,7 +111,7 @@ function inspectLocalRegularFile(file: string): { file: string; stat: fs.BigIntS
 
   const realFile = fs.realpathSync.native(resolvedFile);
   requireLocalAbsoluteTokenPath(realFile);
-  if (normalizedRealPath(realFile) !== normalizedRealPath(resolvedFile)) {
+  if (!realPathMatchesIdentity(resolvedFile, realFile, before)) {
     throw new Error(`OpenAI tunnel token must be a local regular file without symbolic links: ${resolvedFile}`);
   }
   return { file: resolvedFile, stat: before };
@@ -95,13 +122,14 @@ function inspectLocalDirectory(
   options: { allowSharedSticky?: boolean } = {}
 ): { directory: string; stat: fs.BigIntStats } {
   const resolvedDirectory = requireLocalAbsoluteTokenPath(directory);
+  assertNoLinkedWindowsDirectoryComponent(resolvedDirectory);
   const before = fs.lstatSync(resolvedDirectory, { bigint: true });
   if (before.isSymbolicLink() || !before.isDirectory()) {
     throw new Error(`OpenAI tunnel token directory must be local without symbolic links: ${resolvedDirectory}`);
   }
   const realDirectory = fs.realpathSync.native(resolvedDirectory);
   requireLocalAbsoluteTokenPath(realDirectory);
-  if (normalizedRealPath(realDirectory) !== normalizedRealPath(resolvedDirectory)) {
+  if (!realPathMatchesIdentity(resolvedDirectory, realDirectory, before)) {
     throw new Error(`OpenAI tunnel token directory must be local without symbolic links: ${resolvedDirectory}`);
   }
   if (process.platform !== "win32") {

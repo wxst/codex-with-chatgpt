@@ -254,7 +254,13 @@ describe("installation documentation contract", () => {
 
 describe("release automation contract", () => {
   it("contains no consumed one-shot write workflow", () => {
-    expect(fs.existsSync(path.join(process.cwd(), ".github", "workflows", "update-stop-tests.yml"))).toBe(false);
+    for (const workflow of [
+      "apply-install-readiness-patch.yml",
+      "finalize-install-readiness.yml",
+      "update-stop-tests.yml",
+    ]) {
+      expect(fs.existsSync(path.join(process.cwd(), ".github", "workflows", workflow))).toBe(false);
+    }
   });
 
   it("runs a clean installation smoke test on Linux and Windows", () => {
@@ -262,12 +268,18 @@ describe("release automation contract", () => {
       scripts?: Record<string, string>;
     };
     const ci = fs.readFileSync(path.join(process.cwd(), ".github", "workflows", "ci.yml"), "utf8");
+    const installSmoke = fs.readFileSync(
+      path.join(process.cwd(), ".github", "workflows", "install-smoke.yml"),
+      "utf8"
+    );
 
     expect(pkg.scripts?.["smoke:install"]).toBe("node scripts/install-smoke.mjs");
     expect(ci).toContain("ubuntu-24.04");
     expect(ci).toContain("windows-latest");
     expect(ci).toContain("Install smoke test");
     expect(ci).toContain("pnpm smoke:install");
+    expect(installSmoke).toContain("pnpm smoke:install");
+    expect(installSmoke).not.toContain("pnpm test:install");
   });
 
   it("bounds Windows integration concurrency to a stable level", () => {
