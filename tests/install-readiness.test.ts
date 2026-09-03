@@ -160,6 +160,27 @@ describe("installation documentation contract", () => {
     }
   });
 
+  it("uses the direct ChatGPT conversation channel for the routine control loop", () => {
+    const skill = read("skill/SKILL.md");
+    const architecture = read("docs/architecture.md");
+    const protocol = read("docs/protocol.md");
+
+    expect(skill).toContain('kind: "chatgpt"');
+    expect(skill).toContain("send_message_to_thread");
+    expect(skill).toContain("read_thread");
+    expect(skill).toContain("Do not open a browser for routine C2C messages");
+    expect(skill).not.toContain(
+      "Use ChatGPT's built-in browser surface for ChatGPT interactions"
+    );
+    expect(skill).not.toContain("browser fallback");
+    expect(skill).not.toContain("Use ChatGPT web as");
+    expect(skill).not.toMatch(/\bChrome\b/iu);
+    expect(architecture).toContain("Direct Chat");
+    expect(architecture).not.toContain("Computer Use = control plane");
+    expect(protocol).toContain("Control plane: Codex App direct messaging");
+    expect(protocol).not.toContain("typed into the ChatGPT UI");
+  });
+
   it("documents the two-view Windows legacy cleanup command", () => {
     const cli = read("src/cli/index.ts");
     const troubleshooting = read("docs/troubleshooting.md");
