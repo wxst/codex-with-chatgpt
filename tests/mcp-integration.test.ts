@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import fs from "node:fs";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -7,6 +8,8 @@ import { appendExecutionRecord } from "../src/execution/records.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git, isolateStateDir } from "./helpers.js";
 
 let root: string;
+let stateRoot: string;
+let authRoot: string;
 let bridge: Bridge;
 let client: Client;
 let accessToken: string;
@@ -21,8 +24,9 @@ function jsonOf<T = Record<string, unknown>>(result: { content?: unknown }): T {
 }
 
 beforeAll(async () => {
-  isolateStateDir();
+  stateRoot = isolateStateDir();
   root = makeTmpDir("mcp-ws");
+  authRoot = makeTmpDir("auth");
   makeGitRepo(root);
   write(root, "package.json", JSON.stringify({ name: "demo", scripts: { test: "vitest run" }, dependencies: { react: "^19.0.0" } }));
   write(root, ".env", "API_KEY=supersecret\n");
@@ -33,7 +37,7 @@ beforeAll(async () => {
     workspaceRoot: root,
     port: 0,
     persistRuntime: false,
-    authStoreFile: path.join(makeTmpDir("auth"), "store.json"),
+    authStoreFile: path.join(authRoot, "store.json"),
   });
   const tokens = bridge.authStore.issueTokens({
     clientId: "it-client",
@@ -49,9 +53,17 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await client.close();
-  await bridge.close();
-  cleanup(root);
+  try {
+    if (client) await client.close();
+  } finally {
+    try {
+      if (bridge) await bridge.close();
+    } finally {
+      for (const dir of [root, authRoot, stateRoot]) {
+        if (dir) cleanup(dir);
+      }
+    }
+  }
 });
 
 describe("MCP tools over Streamable HTTP", () => {
@@ -133,23 +145,30 @@ describe("MCP tools over Streamable HTTP", () => {
   });
 
   it("git_diff paginates large diffs", async () => {
-    const big = Array.from({ length: 20000 }, (_, i) => `content line ${i}`).join("\n");
-    write(root, "big-change.txt", big);
-    git(root, "add", "big-change.txt");
-    const first = jsonOf<{ hasMore: boolean; nextOffset: number; totalBytes: number; returnedBytes: number }>(
-      await client.callTool({ name: "git_diff", arguments: { mode: "staged", max_bytes: 4096 } })
-    );
-    expect(first.hasMore).toBe(true);
-    expect(first.returnedBytes).toBeLessThanOrEqual(4096);
-    const second = jsonOf<{ offset: number; diff: string }>(
-      await client.callTool({
-        name: "git_diff",
-        arguments: { mode: "staged", max_bytes: 4096, offset: first.nextOffset },
-      })
-    );
-    expect(second.offset).toBe(first.nextOffset);
-    expect(second.diff.length).toBeGreaterThan(0);
-    git(root, "reset", "big-change.txt");
+    try {
+      const big = Array.from({ length: 20000 }, (_, i) => `content line ${i}`).join("\n");
+      write(root, "big-change.txt", big);
+      git(root, "add", "big-change.txt");
+      const first = jsonOf<{ hasMore: boolean; nextOffset: number; totalBytes: number; returnedBytes: number }>(
+        await client.callTool({ name: "git_diff", arguments: { mode: "staged", max_bytes: 4096 } })
+      );
+      expect(first.hasMore).toBe(true);
+      expect(first.returnedBytes).toBeLessThanOrEqual(4096);
+      const second = jsonOf<{ offset: number; diff: string }>(
+        await client.callTool({
+          name: "git_diff",
+          arguments: { mode: "staged", max_bytes: 4096, offset: first.nextOffset },
+        })
+      );
+      expect(second.offset).toBe(first.nextOffset);
+      expect(second.diff.length).toBeGreaterThan(0);
+    } finally {
+      try {
+        git(root, "reset", "big-change.txt");
+      } finally {
+        fs.rmSync(path.join(root, "big-change.txt"), { force: true });
+      }
+    }
   });
 
   it("execution_summary and test_status read harness records", async () => {
@@ -179,71 +198,102 @@ describe("MCP tools over Streamable HTTP", () => {
     const transport = new StreamableHTTPClientTransport(new URL(`${bridge.localBaseUrl()}/mcp`), {
       requestInit: { headers: { authorization: `Bearer ${limited.accessToken}` } },
     });
-    await limitedClient.connect(transport);
-    const denied = await limitedClient.callTool({ name: "git_diff", arguments: {} });
-    expect(denied.isError).toBe(true);
-    expect(textOf(denied)).toContain("INSUFFICIENT_SCOPE");
-    const allowed = await limitedClient.callTool({ name: "read_file", arguments: { path: "hello.txt" } });
-    expect(allowed.isError ?? false).toBe(false);
-    await limitedClient.close();
+    try {
+      await limitedClient.connect(transport);
+      const denied = await limitedClient.callTool({ name: "git_diff", arguments: {} });
+      expect(denied.isError).toBe(true);
+      expect(textOf(denied)).toContain("INSUFFICIENT_SCOPE");
+      const allowed = await limitedClient.callTool({ name: "read_file", arguments: { path: "hello.txt" } });
+      expect(allowed.isError ?? false).toBe(false);
+    } finally {
+      await limitedClient.close().catch(() => undefined);
+    }
   });
 
   it("git_diff over MCP excludes sensitive files like .npmrc and service-account*.json", async () => {
-    write(root, ".npmrc", "//registry.npmjs.org/:_authToken=supersecret-npm-token\n");
-    write(root, "service-account-test.json", '{"private_key": "supersecret-sa-key"}\n');
-    write(root, "src/visible.ts", "export const visible = 'safe-change';\n");
+    const files = [".npmrc", "service-account-test.json", "src/visible.ts"];
+    try {
+      write(root, ".npmrc", "//registry.npmjs.org/:_authToken=supersecret-npm-token\n");
+      write(root, "service-account-test.json", '{"private_key": "supersecret-sa-key"}\n');
+      write(root, "src/visible.ts", "export const visible = 'safe-change';\n");
 
-    git(root, "add", "-f", ".npmrc", "service-account-test.json", "src/visible.ts");
+      git(root, "add", "-f", ...files);
 
-    const result = jsonOf<{ diff: string; isRepo: boolean }>(
-      await client.callTool({ name: "git_diff", arguments: { mode: "staged" } })
-    );
+      const result = jsonOf<{ diff: string; isRepo: boolean }>(
+        await client.callTool({ name: "git_diff", arguments: { mode: "staged" } })
+      );
 
-    expect(result.isRepo).toBe(true);
-    expect(result.diff).toContain("safe-change");
-    expect(result.diff).not.toContain("supersecret-npm-token");
-    expect(result.diff).not.toContain("supersecret-sa-key");
-
-    git(root, "rm", "-f", "--cached", ".npmrc", "service-account-test.json", "src/visible.ts");
+      expect(result.isRepo).toBe(true);
+      expect(result.diff).toContain("safe-change");
+      expect(result.diff).not.toContain("supersecret-npm-token");
+      expect(result.diff).not.toContain("supersecret-sa-key");
+    } finally {
+      try {
+        git(root, "reset", "--", ...files);
+      } finally {
+        for (const file of files) fs.rmSync(path.join(root, file), { force: true });
+      }
+    }
   });
 
   it("git_diff over MCP blocks sensitive-to-safe renames from leaking original content", async () => {
-    write(root, ".npmrc", "//registry.npmjs.org/:_authToken=mcp-secret-token-123\n");
-    git(root, "add", "-f", ".npmrc");
-    git(root, "commit", "-m", "add secret to rename");
+    const base = git(root, "rev-parse", "HEAD").trim();
+    try {
+      write(root, ".npmrc", "//registry.npmjs.org/:_authToken=mcp-secret-token-123\n");
+      git(root, "add", "-f", ".npmrc");
+      git(root, "commit", "-m", "add secret to rename");
 
-    git(root, "mv", ".npmrc", "public_harmless.txt");
+      git(root, "mv", ".npmrc", "public_harmless.txt");
 
-    const result = jsonOf<{ diff: string; isRepo: boolean }>(
-      await client.callTool({ name: "git_diff", arguments: { mode: "staged" } })
-    );
+      const result = jsonOf<{ diff: string; isRepo: boolean }>(
+        await client.callTool({ name: "git_diff", arguments: { mode: "staged" } })
+      );
 
-    expect(result.isRepo).toBe(true);
-    expect(result.diff).not.toContain("mcp-secret-token-123");
-    expect(result.diff).not.toContain("public_harmless.txt");
-
-    git(root, "reset", "--hard", "HEAD");
+      expect(result.isRepo).toBe(true);
+      expect(result.diff).not.toContain("mcp-secret-token-123");
+      expect(result.diff).not.toContain("public_harmless.txt");
+    } finally {
+      try {
+        git(root, "reset", "--mixed", base);
+      } finally {
+        fs.rmSync(path.join(root, ".npmrc"), { force: true });
+        fs.rmSync(path.join(root, "public_harmless.txt"), { force: true });
+      }
+    }
   });
 
   it("git_diff over MCP with path='src' blocks cross-boundary rename leaks from root secrets", async () => {
-    write(root, ".npmrc", "//registry.npmjs.org/:_authToken=root-mcp-scoped-secret\n");
-    git(root, "add", "-f", ".npmrc");
-    git(root, "commit", "-m", "add root secret for scoped test");
+    const base = git(root, "rev-parse", "HEAD").trim();
+    try {
+      write(root, ".npmrc", "//registry.npmjs.org/:_authToken=root-mcp-scoped-secret\n");
+      git(root, "add", "-f", ".npmrc");
+      git(root, "commit", "-m", "add root secret for scoped test");
 
-    // Rename root .npmrc to src/public.txt
-    git(root, "mv", ".npmrc", "src/public.txt");
+      // Rename root .npmrc to src/public.txt
+      git(root, "mv", ".npmrc", "src/public.txt");
 
-    const result = jsonOf<{ diff: string; isRepo: boolean }>(
-      await client.callTool({
-        name: "git_diff",
-        arguments: { mode: "staged", path: "src" },
-      })
-    );
+      const result = jsonOf<{ diff: string; isRepo: boolean }>(
+        await client.callTool({
+          name: "git_diff",
+          arguments: { mode: "staged", path: "src" },
+        })
+      );
 
-    expect(result.isRepo).toBe(true);
-    expect(result.diff).not.toContain("root-mcp-scoped-secret");
-    expect(result.diff).not.toContain("src/public.txt");
+      expect(result.isRepo).toBe(true);
+      expect(result.diff).not.toContain("root-mcp-scoped-secret");
+      expect(result.diff).not.toContain("src/public.txt");
+    } finally {
+      try {
+        git(root, "reset", "--mixed", base);
+      } finally {
+        fs.rmSync(path.join(root, ".npmrc"), { force: true });
+        fs.rmSync(path.join(root, "src", "public.txt"), { force: true });
+      }
+    }
+  });
 
-    git(root, "reset", "--hard", "HEAD");
+  it("fixture cleanup preserves the pre-existing unstaged workspace change", () => {
+    expect(fs.readFileSync(path.join(root, "src", "index.ts"), "utf8")).toContain("answer = 43");
+    expect(git(root, "diff", "--", "src/index.ts")).toContain("answer = 43");
   });
 });

@@ -7,6 +7,7 @@ import {
   isWorkspaceLifecycleLockHeldBy,
   lifecycleTicketFile,
 } from "../src/process/workspace-lock.js";
+import { getProcessGeneration, requireCurrentProcessGeneration } from "../src/process/process-identity.js";
 import { ensureBridge, stopBridge } from "../src/process/daemon.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { revokeWorkspaceAccess } from "../src/auth/revoke.js";
@@ -152,6 +153,244 @@ describe("workspace lifecycle serialization", () => {
     held.release();
     await pending;
     expect(enteredRevocation).toBe(true);
+  });
+
+  it("rejects a held ticket whose content nonce or ownership schema was replaced", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-replaced-own-ticket");
+    const held = await acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 });
+    const file = lifecycleTicketFile(workspace.id, held.nonce);
+    const original = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+
+    try {
+      for (const replacement of [
+        { ...original, nonce: "different-ticket-nonce" },
+        { ...original, choosing: 0 },
+        { ...original, acquired: "yes" },
+        { ...original, number: 0, choosing: false, acquired: true },
+        { ...original, number: 1, choosing: true, acquired: true },
+      ]) {
+        fs.writeFileSync(file, JSON.stringify(replacement), { mode: 0o600 });
+        expect(isWorkspaceLifecycleLockHeldBy(workspace.id, held.nonce)).toBe(false);
+      }
+    } finally {
+      fs.writeFileSync(file, JSON.stringify(original), { mode: 0o600 });
+      held.release();
+    }
+  });
+
+  it("rejects a held ticket rebound to another live process generation", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-rebound-owner");
+    const held = await acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 });
+    const file = lifecycleTicketFile(workspace.id, held.nonce);
+    const original = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+
+    try {
+      if (!child.pid) throw new Error("owner fixture PID is missing");
+      let generation: string | null = null;
+      for (let attempt = 0; attempt < 20 && !generation; attempt += 1) {
+        generation = getProcessGeneration(child.pid);
+        if (!generation) await sleep(25);
+      }
+      if (!generation) throw new Error("owner fixture generation is missing");
+      fs.writeFileSync(
+        file,
+        JSON.stringify({ ...original, pid: child.pid, processGeneration: generation }),
+        { mode: 0o600 }
+      );
+      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, held.nonce)).toBe(false);
+    } finally {
+      fs.writeFileSync(file, JSON.stringify(original), { mode: 0o600 });
+      held.release();
+      child.kill("SIGKILL");
+    }
+  });
+
+  it("fails closed when the lock directory cannot be enumerated", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-readdir-denied");
+    const held = await acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 });
+    const locksDirectory = path.dirname(lifecycleTicketFile(workspace.id, held.nonce));
+    const realReaddir = fs.readdirSync.bind(fs);
+    const readdir = vi.spyOn(fs, "readdirSync").mockImplementation(((target, options) => {
+      if (path.resolve(String(target)) === path.resolve(locksDirectory)) {
+        const error = new Error("lock directory denied") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return realReaddir(target, options as never);
+    }) as typeof fs.readdirSync);
+
+    try {
+      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, held.nonce)).toBe(false);
+    } finally {
+      readdir.mockRestore();
+      held.release();
+    }
+  });
+
+  it("fails closed when a fresh contender cannot be read", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-contender-read-denied");
+    const held = await acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 });
+    const contenderNonce = "fresh-blocking-contender";
+    const contender = lifecycleTicketFile(workspace.id, contenderNonce);
+    fs.writeFileSync(
+      contender,
+      JSON.stringify({
+        pid: process.pid,
+        processGeneration: requireCurrentProcessGeneration(),
+        nonce: contenderNonce,
+        number: 0,
+        choosing: true,
+        acquired: false,
+        createdAt: new Date().toISOString(),
+      }),
+      { mode: 0o600 }
+    );
+    const realReadFile = fs.readFileSync.bind(fs);
+    const readFile = vi.spyOn(fs, "readFileSync").mockImplementation(((target, options) => {
+      if (path.resolve(String(target)) === path.resolve(contender)) {
+        const error = new Error("contender read denied") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return realReadFile(target, options as never);
+    }) as typeof fs.readFileSync);
+
+    try {
+      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, held.nonce)).toBe(false);
+    } finally {
+      readFile.mockRestore();
+      held.release();
+    }
+  });
+
+  it("fails closed when a matching ticket pathname is a directory", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-ticket-directory");
+    const held = await acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 });
+    const directoryTicket = lifecycleTicketFile(workspace.id, "directory-contender");
+    fs.mkdirSync(directoryTicket);
+    try {
+      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, held.nonce)).toBe(false);
+    } finally {
+      held.release();
+    }
+  });
+
+  it("fails closed before reading a matching symlink ticket pathname", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-ticket-symlink");
+    const held = await acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 });
+    const target = path.join(path.dirname(lifecycleTicketFile(workspace.id, held.nonce)), "outside-target.json");
+    const symlinkTicket = lifecycleTicketFile(workspace.id, "symlink-contender");
+    fs.writeFileSync(target, "{}", { mode: 0o600 });
+    fs.symlinkSync(target, symlinkTicket, "file");
+    const realReadFile = fs.readFileSync.bind(fs);
+    let symlinkReads = 0;
+    const readFile = vi.spyOn(fs, "readFileSync").mockImplementation(((source, options) => {
+      if (path.resolve(String(source)) === path.resolve(symlinkTicket)) symlinkReads += 1;
+      return realReadFile(source, options as never);
+    }) as typeof fs.readFileSync);
+    try {
+      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, held.nonce)).toBe(false);
+      expect(symlinkReads).toBe(0);
+    } finally {
+      readFile.mockRestore();
+      held.release();
+    }
+  });
+
+  it("fails closed when another ticket filename contains a clone of the active descriptor", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-cloned-active-ticket");
+    const held = await acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 });
+    const own = lifecycleTicketFile(workspace.id, held.nonce);
+    const clone = lifecycleTicketFile(workspace.id, "cloned-active-ticket");
+    fs.writeFileSync(clone, fs.readFileSync(own), { mode: 0o600 });
+    try {
+      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, held.nonce)).toBe(false);
+    } finally {
+      held.release();
+    }
+  });
+
+  it.each(["hardlink", "symlink"] as const)(
+    "does not refresh an own-ticket %s target outside the lock directory",
+    async (kind) => {
+      isolateStateDir();
+      const workspace = makeWorkspace(`lifecycle-heartbeat-${kind}`);
+      const held = await acquireWorkspaceLifecycleLock(workspace.id, {
+        timeoutMs: 1000,
+        pollMs: 5,
+        orphanGraceMs: 80,
+      });
+      const own = lifecycleTicketFile(workspace.id, held.nonce);
+      const original = fs.readFileSync(own);
+      const outsideRoot = makeTmpDir(`lifecycle-heartbeat-${kind}-outside`);
+      roots.push(outsideRoot);
+      const target = path.join(outsideRoot, "target.json");
+      fs.writeFileSync(target, original, { mode: 0o600 });
+      const old = new Date(Date.now() - 120_000);
+      fs.utimesSync(target, old, old);
+      const before = fs.statSync(target).mtimeMs;
+      fs.unlinkSync(own);
+      if (kind === "hardlink") fs.linkSync(target, own);
+      else fs.symlinkSync(target, own, "file");
+
+      try {
+        await sleep(120);
+        expect(fs.statSync(target).mtimeMs).toBe(before);
+        expect(isWorkspaceLifecycleLockHeldBy(workspace.id, held.nonce, 80)).toBe(false);
+      } finally {
+        held.release();
+      }
+    }
+  );
+
+  it("stops heartbeat when the own ticket generation no longer matches acquisition", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-heartbeat-generation-replaced");
+    const held = await acquireWorkspaceLifecycleLock(workspace.id, {
+      timeoutMs: 1000,
+      pollMs: 5,
+      orphanGraceMs: 80,
+    });
+    const own = lifecycleTicketFile(workspace.id, held.nonce);
+    const original = JSON.parse(fs.readFileSync(own, "utf8")) as Record<string, unknown>;
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+
+    try {
+      if (!child.pid) throw new Error("generation fixture PID is missing");
+      let otherGeneration: string | null = null;
+      for (let attempt = 0; attempt < 20 && !otherGeneration; attempt += 1) {
+        otherGeneration = getProcessGeneration(child.pid);
+        if (!otherGeneration) await sleep(25);
+      }
+      if (!otherGeneration) throw new Error("generation fixture identity is missing");
+      fs.writeFileSync(
+        own,
+        JSON.stringify({ ...original, processGeneration: otherGeneration }),
+        { mode: 0o600 }
+      );
+      const before = fs.statSync(own).mtimeMs;
+      await sleep(120);
+      expect(fs.statSync(own).mtimeMs).toBe(before);
+      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, held.nonce, 80)).toBe(false);
+    } finally {
+      fs.writeFileSync(own, JSON.stringify(original), { mode: 0o600 });
+      held.release();
+      child.kill("SIGKILL");
+    }
   });
 
   it("makes the bridge process acquire its own ticket before startup", async () => {

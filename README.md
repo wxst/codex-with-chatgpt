@@ -59,10 +59,14 @@ CAPTCHA, two-factor authentication, or a required OpenAI Tunnel credential.
    the repository copy for a machine-specific path.
 6. For the target workspace run the installed Skill's first-time checks using
    node bin/c2c.js. Keep transport mode openai. Verify the official OpenAI
-   tunnel client and the CONTROL_PLANE_TUNNEL_ID and CONTROL_PLANE_API_KEY
-   runtime environment without printing their values. Follow the installed
-   client's current help output rather than guessing flags.
-7. If OpenAI Secure MCP Tunnel is unavailable for this account or environment,
+   tunnel client, read `runtimeAlias` from setup, and run
+   `tunnel-client runtimes status <runtimeAlias> --json` first. A runtime is
+   already configured when process_running, healthy, and ready are true and
+   stale is false. Only when starting or reconnecting it, check that
+   CONTROL_PLANE_TUNNEL_ID and CONTROL_PLANE_API_KEY are present in that launch
+   environment without printing their values. Follow the installed client's
+   current help output rather than guessing flags.
+7. If this account or environment is missing OpenAI Secure MCP Tunnel access,
    stop and explain the exact blocker. Do not enable Cloudflare unless I give
    explicit approval.
 8. Use only the built-in ChatGPT browser surface for ChatGPT setup. Never paste

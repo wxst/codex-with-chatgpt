@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Workspace } from "../workspace/manager.js";
+import { Workspace, type WorkspaceIdentity } from "../workspace/manager.js";
 import { getStateDir, stateSubdir } from "../config/paths.js";
 import {
   findLiveBridge,
@@ -344,8 +344,10 @@ async function terminateExactGeneration(
   return waitForExactGenerationExit(runtime, generation, FORCE_STOP_MS);
 }
 
-export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeState): Promise<boolean> {
-  const workspace = new Workspace(workspaceRoot);
+export async function stopBridgeRuntimeForWorkspaceIdentity(
+  workspace: WorkspaceIdentity,
+  runtime: RuntimeState
+): Promise<boolean> {
   if (runtime.workspaceId !== workspace.id || path.resolve(runtime.workspaceRoot) !== workspace.root) return false;
 
   let info: AdminRuntimeIdentity | null = null;
@@ -369,6 +371,10 @@ export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeS
   } catch {
     return terminateExactGeneration(runtime, generation, "SIGTERM");
   }
+}
+
+export async function stopBridgeRuntime(workspaceRoot: string, runtime: RuntimeState): Promise<boolean> {
+  return stopBridgeRuntimeForWorkspaceIdentity(new Workspace(workspaceRoot), runtime);
 }
 
 /**

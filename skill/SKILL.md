@@ -84,9 +84,11 @@ When `transportMode` is `openai`:
 2. `/mcp` requires the generated per-workspace `X-C2C-Tunnel-Token`; the token file path is returned by `setup --json` and stored with owner-only permissions.
 3. C2C's Cloudflare endpoint is disabled, so there is no C2C-managed public MCP URL.
 4. Use the official OpenAI `tunnel-client` for the outbound connection. Prefer the installed client's current `help`, `quickstart`, `runtimes connect`, and `runtimes status` output over guessed flags.
-5. Require `CONTROL_PLANE_TUNNEL_ID` and `CONTROL_PLANE_API_KEY` in the runtime environment. Never echo their values.
-6. Configure the official client to send the local token only to the loopback MCP origin using its supported extra-header mechanism and the token file returned by C2C.
-7. In ChatGPT, use the Tunnel connection exposed by OpenAI instead of entering a public C2C server URL.
+5. Read `runtimeAlias` from `setup --json`, then check an existing managed runtime with `tunnel-client runtimes status <runtimeAlias> --json` before requesting credentials.
+6. Evaluate process_running, healthy, ready, and stale together: treat the runtime as configured only when the first three are true and `stale` is false. Missing control-plane variables in the current Codex process are not a failure when that managed runtime is already healthy; the variables belong only to the process that starts or reconnects it.
+7. When a start or reconnect is required, require `CONTROL_PLANE_TUNNEL_ID` and `CONTROL_PLANE_API_KEY` in that runtime launch environment. Check only whether they are set and never echo their values.
+8. Configure the official client to send the local token only to the loopback MCP origin using its supported extra-header mechanism and the token file returned by C2C.
+9. In ChatGPT, use the Tunnel connection exposed by OpenAI instead of entering a public C2C server URL.
 
 If the OpenAI Tunnel entitlement, runtime, client, or credentials are unavailable,
 report the exact blocker and ask whether the user wants the explicit Cloudflare

@@ -194,6 +194,7 @@ describe("revocation split-brain detection", () => {
       processGeneration: "definitely-not-the-current-generation",
     };
     let healthChecks = 0;
+    const finalizer = vi.fn();
 
     await expect(
       revokeWorkspaceAccess(workspace.root, {
@@ -216,10 +217,12 @@ describe("revocation split-brain detection", () => {
         sleep: async () => undefined,
         stopTimeoutMs: 0,
         maxRuntimeGenerations: 1,
+        afterQuiescent: finalizer,
       })
     ).rejects.toThrow(/Failed to fully revoke/);
 
     expect(healthChecks).toBeGreaterThan(0);
+    expect(finalizer).not.toHaveBeenCalled();
   });
 });
 
@@ -258,11 +261,15 @@ describe("revocation persistence races", () => {
         },
       }),
       sleep: async () => undefined,
+      afterQuiescent: () => {
+        events.push("finalize");
+      },
     });
 
     expect(result.bridgeStopped).toBe(true);
     expect(storeCalls).toBeGreaterThanOrEqual(2);
     expect(events.lastIndexOf("disk-revoke")).toBeGreaterThan(events.indexOf("stop"));
+    expect(events.indexOf("finalize")).toBeGreaterThan(events.lastIndexOf("disk-revoke"));
     expect(events).not.toContain("clear-runtime");
   });
 });

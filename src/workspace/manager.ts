@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import readline from "node:readline";
 import { IgnoreRules } from "./ignore.js";
 import { readJsonIfExists } from "../config/paths.js";
+import { assertNoLegacyWindowsWorkspaceState } from "../config/legacy-state.js";
 
 export type WorkspaceErrorCode =
   | "INVALID_PATH"
@@ -27,6 +28,29 @@ export class WorkspaceError extends Error {
 
 const CASE_INSENSITIVE = process.platform === "win32" || process.platform === "darwin";
 const normCase = (p: string): string => (CASE_INSENSITIVE ? p.toLowerCase() : p);
+
+export interface WorkspaceIdentity {
+  root: string;
+  id: string;
+}
+
+/** Resolve a workspace identity without reading or mutating C2C state. */
+export function resolveWorkspaceIdentity(rootInput: string): WorkspaceIdentity {
+  const resolved = path.resolve(rootInput);
+  let real: string;
+  try {
+    real = fs.realpathSync.native(resolved);
+  } catch {
+    throw new WorkspaceError("FILE_NOT_FOUND", `Workspace root does not exist: ${rootInput}`);
+  }
+  if (!fs.statSync(real).isDirectory()) {
+    throw new WorkspaceError("NOT_A_DIRECTORY", `Workspace root is not a directory: ${rootInput}`);
+  }
+  return {
+    root: real,
+    id: createHash("sha256").update(normCase(real)).digest("hex").slice(0, 12),
+  };
+}
 
 export interface ReadFileResult {
   path: string;
@@ -72,18 +96,11 @@ export class Workspace {
   readonly projectConfig: ProjectConfig;
 
   constructor(rootInput: string) {
-    const resolved = path.resolve(rootInput);
-    let real: string;
-    try {
-      real = fs.realpathSync.native(resolved);
-    } catch {
-      throw new WorkspaceError("FILE_NOT_FOUND", `Workspace root does not exist: ${rootInput}`);
-    }
-    if (!fs.statSync(real).isDirectory()) {
-      throw new WorkspaceError("NOT_A_DIRECTORY", `Workspace root is not a directory: ${rootInput}`);
-    }
-    this.root = real;
-    this.id = createHash("sha256").update(normCase(real)).digest("hex").slice(0, 12);
+    const identity = resolveWorkspaceIdentity(rootInput);
+    const real = identity.root;
+    this.root = identity.root;
+    this.id = identity.id;
+    assertNoLegacyWindowsWorkspaceState(this.id);
     this.ignoreRules = new IgnoreRules(real);
     this.projectConfig = readJsonIfExists<ProjectConfig>(path.join(real, ".c2c.json")) ?? {};
     this.name = this.projectConfig.name ?? path.basename(real);

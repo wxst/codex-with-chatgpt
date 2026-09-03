@@ -8,7 +8,11 @@ import {
   type HealthPayload,
   type RuntimeState,
 } from "../bridge/runtime.js";
-import { adminFetch, stopBridgeRuntime } from "../process/daemon.js";
+import {
+  adminFetch,
+  stopBridgeRuntime,
+  stopBridgeRuntimeForWorkspaceIdentity,
+} from "../process/daemon.js";
 import {
   processGenerationStatus,
   type ProcessGenerationStatus,
@@ -16,7 +20,13 @@ import {
 import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
 import { cancelPendingStarts, listPendingStarts } from "../process/startup-registry.js";
 import { readTransportMode, revokeOpenAITunnelToken, type TransportMode } from "../tunnel/transport-mode.js";
-import { Workspace } from "../workspace/manager.js";
+import { resolveWorkspaceIdentity, Workspace, type WorkspaceIdentity } from "../workspace/manager.js";
+import {
+  cleanupLegacyWindowsWorkspaceArtifacts,
+  LegacyWindowsStateError,
+  validateLegacyWindowsStateForCleanup,
+  validateLegacyWindowsStateForCleanupUnderLock,
+} from "../config/legacy-state.js";
 import { SERVICE_NAME } from "../version.js";
 
 type ReadRuntimeState = (workspaceId: string) => RuntimeState | null;
@@ -66,6 +76,14 @@ export interface RevokeWorkspaceAccessDeps {
   sleep?: (ms: number) => Promise<void>;
   stopTimeoutMs?: number;
   maxRuntimeGenerations?: number;
+  /** Run a synchronous state finalizer only after quiescence, while the lifecycle lock is still held. */
+  afterQuiescent?: (workspaceId: string) => void;
+  /** Test hook used to mutate the legacy view after lock acquisition and prove the inner fence. */
+  afterLegacyLifecycleLockAcquired?: (
+    workspaceId: string,
+    lockNonce: string,
+    legacyRoot: string
+  ) => void;
 }
 
 export interface RevokeWorkspaceAccessResult {
@@ -73,6 +91,13 @@ export interface RevokeWorkspaceAccessResult {
   legacyTokensRevoked: number;
   tunnelCredentialRevoked: boolean;
   bridgeStopped: boolean;
+}
+
+export interface RevokeLegacyWindowsWorkspaceAccessResult {
+  workspaceId: string;
+  removedArtifacts: number;
+  alreadyClean: boolean;
+  revocation: RevokeWorkspaceAccessResult | null;
 }
 
 function authenticatedRuntimeMatches(runtime: RuntimeState, info: RuntimeIdentityPayload): boolean {
@@ -118,8 +143,79 @@ export async function revokeWorkspaceAccess(
   return withWorkspaceLifecycleLock(workspace.id, () => revokeWorkspaceAccessLocked(workspace, deps));
 }
 
+/**
+ * Quiesce one pre-migration Windows state view without exposing a general
+ * C2C_STATE_DIR bypass to setup/start/serve or any other workspace command.
+ */
+export async function revokeLegacyWindowsWorkspaceAccess(
+  workspaceRoot: string,
+  deps: RevokeWorkspaceAccessDeps = {}
+): Promise<RevokeLegacyWindowsWorkspaceAccessResult> {
+  if (process.platform !== "win32") {
+    throw new Error("Legacy Windows state cleanup is supported only on Windows");
+  }
+  const identity = resolveWorkspaceIdentity(workspaceRoot);
+  const preflight = validateLegacyWindowsStateForCleanup(identity.id);
+  if (preflight.artifacts.length === 0) {
+    return {
+      workspaceId: identity.id,
+      removedArtifacts: 0,
+      alreadyClean: true,
+      revocation: null,
+    };
+  }
+
+  const previousStateDir = process.env.C2C_STATE_DIR;
+  let removedArtifacts: number | null = null;
+  try {
+    process.env.C2C_STATE_DIR = preflight.legacyRoot;
+    const stopLegacyRuntime: StopBridgeRuntime =
+      deps.stopBridge ??
+      ((_workspaceRoot, runtime) =>
+        runtime
+          ? stopBridgeRuntimeForWorkspaceIdentity(identity, runtime)
+          : Promise.resolve(false));
+    const revocation = await withWorkspaceLifecycleLock(identity.id, (lock) => {
+      deps.afterLegacyLifecycleLockAcquired?.(identity.id, lock.nonce, preflight.legacyRoot);
+      validateLegacyWindowsStateForCleanupUnderLock(identity.id, {
+        activeLifecycleNonce: lock.nonce,
+      });
+      return revokeWorkspaceAccessLocked(identity, {
+        ...deps,
+        stopBridge: stopLegacyRuntime,
+        afterQuiescent: (workspaceId) => {
+          deps.afterQuiescent?.(workspaceId);
+          removedArtifacts = cleanupLegacyWindowsWorkspaceArtifacts(workspaceId, {
+            activeLifecycleNonce: lock.nonce,
+          }).removed;
+        },
+      });
+    });
+    if (removedArtifacts === null) {
+      throw new Error("Legacy workspace state finalization did not run");
+    }
+    const postflight = validateLegacyWindowsStateForCleanup(identity.id);
+    if (postflight.artifacts.length > 0) {
+      throw new LegacyWindowsStateError(
+        postflight.legacyRoot,
+        postflight.artifacts,
+        postflight.inspectionFailures
+      );
+    }
+    return {
+      workspaceId: identity.id,
+      removedArtifacts,
+      alreadyClean: false,
+      revocation,
+    };
+  } finally {
+    if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+    else process.env.C2C_STATE_DIR = previousStateDir;
+  }
+}
+
 async function revokeWorkspaceAccessLocked(
-  workspace: Workspace,
+  workspace: WorkspaceIdentity,
   deps: RevokeWorkspaceAccessDeps
 ): Promise<RevokeWorkspaceAccessResult> {
   const transportMode = readTransportMode(workspace.id);
@@ -365,6 +461,8 @@ async function revokeWorkspaceAccessLocked(
   if (failures.length > 0) {
     throw new AggregateError(failures, "Failed to fully revoke ChatGPT access to this workspace");
   }
+
+  deps.afterQuiescent?.(workspace.id);
 
   return {
     transportMode,

@@ -7,7 +7,7 @@ import { startBridge } from "../bridge/server.js";
 import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
-import { revokeWorkspaceAccess } from "../auth/revoke.js";
+import { revokeLegacyWindowsWorkspaceAccess, revokeWorkspaceAccess } from "../auth/revoke.js";
 import { appendExecutionRecord } from "../execution/records.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
 import {
@@ -780,6 +780,39 @@ program
         check("已断开 ChatGPT 对当前项目的访问（Tunnel 凭证已撤销，Bridge 已停止）");
       } else {
         check("已断开 ChatGPT 对当前项目的访问（OAuth 令牌已吊销）");
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+program
+  .command("legacy-cleanup")
+  .description("Quiesce and clear this workspace from the pre-migration Windows state view")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; json: boolean }) => {
+    const root = resolveWorkspace(opts.workspace);
+    try {
+      if (process.platform !== "win32") {
+        throw new Error("legacy-cleanup applies only to the pre-migration Windows state directory");
+      }
+      const result = await revokeLegacyWindowsWorkspaceAccess(root);
+      if (opts.json) {
+        say(
+          JSON.stringify({
+            ok: true,
+            workspaceId: result.workspaceId,
+            cleanedCurrentProcessView: true,
+            removedArtifacts: result.removedArtifacts,
+            alreadyClean: result.alreadyClean,
+            ...(result.revocation ?? {}),
+          })
+        );
+      } else {
+        if (result.alreadyClean) check("当前进程可见的旧 Windows 状态已经干净");
+        else check("当前进程可见的旧 Windows 状态已停机并清理");
+        say("若这是普通 Windows Terminal，请在 packaged Codex 或 ChatGPT 内再执行同一命令；反向亦然。");
       }
     } catch (error) {
       handleCliError(error, opts.json);

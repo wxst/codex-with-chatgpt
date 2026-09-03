@@ -68,13 +68,34 @@ The Skill installs this automatically during setup.
 ### Every new Codex chat “repairs” the connection / cannot write logs
 The C2C state directory lives outside the project (macOS:
 `~/Library/Application Support/codex-with-chatgpt`; Windows:
-`%LOCALAPPDATA%\codex-with-chatgpt`). Codex's default sandbox cannot write
+`%USERPROFILE%\.config\codex-with-chatgpt\c2c-state`). Codex's default sandbox cannot write
 there, so each new chat looks like a health-check failure.
 
 `c2c setup`, `c2c doctor` and `c2c sandbox-allow` add that directory to
 `[sandbox_workspace_write].writable_roots` in `~/.codex/config.toml`
 (`%USERPROFILE%\.codex\config.toml` on Windows). After that, later chats
 do not need elevation.
+
+### Windows reports legacy state after an upgrade
+Older builds stored state under `%LOCALAPPDATA%\codex-with-chatgpt`. A
+packaged Codex process and a detached process may see different files at that
+same-looking path, so C2C stops before creating a second Bridge. Open a regular
+Windows Terminal outside packaged Codex or ChatGPT and run
+`c2c legacy-cleanup -w <workspace>` first. This stops the old Bridge and clears
+the host view. Then run the same command once inside packaged Codex or ChatGPT
+to clear its private view. Retry with the new default only after both runs pass.
+After revocation reaches quiescence, the command deletes only exact
+per-workspace runtime records, auth state, OpenAI tunnel token, transport-mode
+state, tunnel metadata, and endpoint metadata. Pending starts are cancelled by
+the revocation transaction. Shared directories stay in place. The command
+removes only this workspace's lifecycle tickets that are older than the orphan
+grace period and either belong to a different process generation or have a
+generationless PID that is confirmed gone. Its active ticket and every fresh or
+ambiguous contender stay untouched. A malformed ticket or a generationless
+ticket with a live/unknown PID stops cleanup before revocation and reports the
+exact file for manual inspection. If C2C reports a shared `pending-starts` or
+`locks` inspection failure, repair that directory's access or structure instead
+of deleting the shared directory.
 
 ### Port already in use
 Handled automatically: an existing healthy bridge for the same workspace is

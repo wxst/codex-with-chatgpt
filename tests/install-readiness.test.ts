@@ -138,6 +138,97 @@ describe("installation documentation contract", () => {
     expect(combined).toContain("Cloudflare");
     expect(combined).toContain("explicit");
   });
+
+  it("checks an existing managed runtime before requesting tunnel credentials", () => {
+    const skill = read("skill/SKILL.md");
+    const statusCheck = skill.indexOf("tunnel-client runtimes status <runtimeAlias> --json");
+    const credentialCheck = skill.indexOf("When a start or reconnect is required");
+
+    expect(statusCheck).toBeGreaterThan(-1);
+    expect(credentialCheck).toBeGreaterThan(statusCheck);
+    expect(skill).toContain(
+      "Missing control-plane variables in the current Codex process are not a failure when that managed runtime is already healthy"
+    );
+    expect(skill).toContain("process_running, healthy, ready, and stale");
+
+    for (const file of ["README.md", "README.zh-CN.md"]) {
+      const instructions = read(file);
+      const readmeStatusCheck = instructions.indexOf("tunnel-client runtimes status <runtimeAlias> --json");
+      const readmeCredentialCheck = instructions.indexOf("CONTROL_PLANE_TUNNEL_ID");
+      expect(readmeStatusCheck, file).toBeGreaterThan(-1);
+      expect(readmeCredentialCheck, file).toBeGreaterThan(readmeStatusCheck);
+    }
+  });
+
+  it("documents the two-view Windows legacy cleanup command", () => {
+    const cli = read("src/cli/index.ts");
+    const troubleshooting = read("docs/troubleshooting.md");
+
+    expect(cli).toContain('.command("legacy-cleanup")');
+    expect(troubleshooting).toContain("c2c legacy-cleanup -w <workspace>");
+    expect(troubleshooting).toContain("inside packaged Codex or ChatGPT");
+  });
+
+  it("validates the legacy view before selecting it as active state", () => {
+    const cli = read("src/cli/index.ts");
+    const revokeSource = read("src/auth/revoke.ts");
+    const command = cli.indexOf('.command("legacy-cleanup")');
+    const dedicatedCall = cli.indexOf("revokeLegacyWindowsWorkspaceAccess(root)", command);
+    const dedicatedFunction = revokeSource.indexOf("function revokeLegacyWindowsWorkspaceAccess");
+    const outerPreflight = revokeSource.indexOf(
+      "validateLegacyWindowsStateForCleanup",
+      dedicatedFunction
+    );
+    const stateSelection = revokeSource.indexOf(
+      "process.env.C2C_STATE_DIR = preflight.legacyRoot",
+      outerPreflight
+    );
+    const lifecycleLock = revokeSource.indexOf("withWorkspaceLifecycleLock", stateSelection);
+    const lockedPreflight = revokeSource.indexOf(
+      "validateLegacyWindowsStateForCleanup",
+      lifecycleLock
+    );
+    const revokeLocked = revokeSource.indexOf(
+      "revokeWorkspaceAccessLocked(identity",
+      lockedPreflight
+    );
+    const cleanupLocked = revokeSource.indexOf(
+      "cleanupLegacyWindowsWorkspaceArtifacts(workspaceId,",
+      revokeLocked
+    );
+    const cleanupUsesLockNonce = revokeSource.indexOf(
+      "activeLifecycleNonce: lock.nonce",
+      cleanupLocked
+    );
+    const finalPostflight = revokeSource.indexOf(
+      "const postflight = validateLegacyWindowsStateForCleanup",
+      cleanupUsesLockNonce
+    );
+
+    expect(command).toBeGreaterThan(-1);
+    expect(dedicatedCall).toBeGreaterThan(command);
+    expect(dedicatedFunction).toBeGreaterThan(-1);
+    expect(outerPreflight).toBeGreaterThan(dedicatedFunction);
+    expect(stateSelection).toBeGreaterThan(outerPreflight);
+    expect(lifecycleLock).toBeGreaterThan(stateSelection);
+    expect(lockedPreflight).toBeGreaterThan(lifecycleLock);
+    expect(revokeLocked).toBeGreaterThan(lockedPreflight);
+    expect(cleanupLocked).toBeGreaterThan(revokeLocked);
+    expect(cleanupUsesLockNonce).toBeGreaterThan(cleanupLocked);
+    expect(finalPostflight).toBeGreaterThan(cleanupUsesLockNonce);
+  });
+
+  it("keeps Windows ACL inspection input out of the CreateProcess environment", () => {
+    const legacyState = read("src/config/legacy-state.ts");
+
+    expect(legacyState).not.toContain("C2C_LEGACY_ACL_TARGETS");
+    expect(legacyState).toContain("[Console]::In.ReadToEnd()");
+    expect(legacyState).toContain("[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)");
+    expect(legacyState).toContain("WINDOWS_ACL_TARGET_BATCH_SIZE");
+    expect(legacyState).toContain("WINDOWS_ACL_MAX_TARGETS");
+    expect(legacyState).toContain("bounded inspection limit");
+    expect(legacyState).toContain("input: JSON.stringify(batch)");
+  });
 });
 
 describe("release automation contract", () => {
@@ -156,5 +247,13 @@ describe("release automation contract", () => {
     expect(ci).toContain("windows-latest");
     expect(ci).toContain("Install smoke test");
     expect(ci).toContain("pnpm smoke:install");
+  });
+
+  it("bounds Windows integration concurrency to a stable level", () => {
+    const config = fs.readFileSync(path.join(process.cwd(), "vitest.config.ts"), "utf8");
+    const match = config.match(/maxWorkers:\s*(\d+)/u);
+
+    expect(match).not.toBeNull();
+    expect(Number(match?.[1])).toBeLessThanOrEqual(2);
   });
 });

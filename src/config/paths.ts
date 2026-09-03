@@ -14,7 +14,11 @@ export function getStateDir(): string {
     case "darwin":
       return path.join(home, "Library", "Application Support", "codex-with-chatgpt");
     case "win32":
-      return path.join(process.env.LOCALAPPDATA ?? path.join(home, "AppData", "Local"), "codex-with-chatgpt");
+      // Packaged Windows callers can virtualize individual files under
+      // LOCALAPPDATA into a package-specific LocalCache. Detached processes
+      // then resolve the same-looking path to a different credential file.
+      // Keep shared local state in the user's non-virtualized home tree.
+      return path.join(home, ".config", "codex-with-chatgpt", "c2c-state");
     default: {
       const base = process.env.XDG_STATE_HOME ?? path.join(home, ".local", "state");
       return path.join(base, "codex-with-chatgpt");

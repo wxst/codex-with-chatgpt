@@ -54,10 +54,13 @@ OpenAI Tunnel 凭证时才能打断我，而且一次只让我做一个动作。
    codex-with-chatgpt/SKILL.md。只在复制后的安装文件里，把全部
    __C2C_CHECKOUT__ 替换为仓库绝对路径；不要把机器路径写回仓库模板。
 6. 针对目标代码工作区，严格按安装后的 Skill 做首次配置。保持 openai 传输模式。
-   检查官方 OpenAI tunnel client，以及运行环境中的 CONTROL_PLANE_TUNNEL_ID 和
-   CONTROL_PLANE_API_KEY，但绝不能显示、打印或粘贴它们的值。所有参数以当前客户端
-   help 输出为准，禁止猜测命令行参数。
-7. 如果当前账号或环境无法使用 OpenAI Secure MCP Tunnel，停止并准确报告阻断点。
+   检查官方 OpenAI tunnel client，从 setup 结果读取 `runtimeAlias`，先执行
+   `tunnel-client runtimes status <runtimeAlias> --json`。只有 process_running、healthy、
+   ready 都为 true 且 stale 为 false，才把已有 runtime 视为健康；此时不要求当前 Codex
+   进程带控制面变量。只有启动或重连 runtime 时，才检查该启动环境中是否存在
+   CONTROL_PLANE_TUNNEL_ID 和 CONTROL_PLANE_API_KEY，全程不显示、打印或粘贴它们的值。
+   所有参数以当前客户端 help 输出为准，禁止猜测命令行参数。
+7. 如果当前账号或环境缺少 OpenAI Secure MCP Tunnel 访问条件，停止并准确报告阻断点。
    未经我明确同意，不得启用 Cloudflare。
 8. ChatGPT 配置只使用内置浏览器界面。禁止向 ChatGPT 粘贴仓库文件、diff、密钥、
    Token、Cookie 或长日志；ChatGPT 必须通过只读 MCP 自己读取所需上下文。
