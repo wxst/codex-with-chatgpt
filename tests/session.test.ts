@@ -1,143 +1,98 @@
+import fs from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  clearChatPointer,
-  mergeSession,
-  normalizeProjectUrl,
-  projectIdFromUrl,
-  readSession,
-  resolveConversation,
-  writeSession,
+  beginTaskSend,
+  claimStandbyConversation,
+  confirmTaskDelivery,
+  confirmTaskReply,
+  importStandbyConversation,
+  newMessageId,
+  readSessionRegistry,
+  recordTaskReadResult,
+  resolveCodexTaskId,
 } from "../src/session/state.js";
-import { cleanup, makeTmpDir } from "./helpers.js";
+import { cleanup, isolateStateDir } from "./helpers.js";
 
-const PROJECT = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
+let stateRoot: string | undefined;
+afterEach(() => { if (stateRoot) cleanup(stateRoot); stateRoot = undefined; });
+const reset = (): void => { stateRoot = isolateStateDir(); };
 
-describe("normalizeProjectUrl", () => {
-  it("accepts the collection URL and strips extras", () => {
-    expect(normalizeProjectUrl(`${PROJECT}/`)).toBe(PROJECT);
-    expect(normalizeProjectUrl("https://www.chatgpt.com/g/g-p-abc123/project?foo=1")).toBe(
-      "https://chatgpt.com/g/g-p-abc123/project"
-    );
-    expect(projectIdFromUrl(PROJECT)).toBe("g-p-6a94399430e08191860ab5364b7748b8");
+async function claimedTask(workspaceId = "workspace123", taskId = "task-a") {
+  await importStandbyConversation({
+    conversationId: `standby-${taskId}`, projectId: "g-p-sessionpool123",
+    marker: "C2C_STANDBY_READY", markerMessageId: `marker-${taskId}`, markerRole: "user",
+  });
+  return claimStandbyConversation({ workspaceId, taskId, connectorName: "C2C Router", workspaceName: "repo", branch: "main" });
+}
+
+describe("task-scoped standby session registry", () => {
+  it("uses the stable host task id before an explicit or generated id", () => {
+    expect(resolveCodexTaskId("explicit", { CODEX_THREAD_ID: "host-task" })).toMatchObject({ taskId: "host-task", source: "CODEX_THREAD_ID" });
+    expect(resolveCodexTaskId("explicit", {})).toMatchObject({ taskId: "explicit", source: "explicit" });
+    expect(resolveCodexTaskId(undefined, {}).generated).toBe(true);
   });
 
-  it("rejects a normal chat URL or a guessed name", () => {
-    expect(normalizeProjectUrl("https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")).toBeNull();
-    expect(normalizeProjectUrl("https://chatgpt.com/")).toBeNull();
-    expect(normalizeProjectUrl("https://example.com/g/g-p-abc/project")).toBeNull();
-  });
-});
-
-describe("resolveConversation", () => {
-  it("treats a missing file as a new workspace (Project by default)", () => {
-    const view = resolveConversation(null);
-    expect(view.mode).toBe("project");
-    expect(view.reason).toBe("new-workspace");
-    expect(view.reuseSavedChat).toBe(false);
-    expect(view.projectReady).toBe(false);
+  it("accepts task content only after a user-confirmed xhigh pool claim is ready", async () => {
+    reset();
+    const claimed = await claimedTask();
+    const messageId = newMessageId();
+    await expect(beginTaskSend("workspace123", "task-a", messageId, 1)).rejects.toThrow(/workspace verification/);
+    const bootId = newMessageId();
+    await beginTaskSend("workspace123", "task-a", bootId, 0, { bootstrap: true });
+    await confirmTaskDelivery("workspace123", "task-a", bootId);
+    const completed = await confirmTaskReply("workspace123", "task-a", bootId, "DONE");
+    expect(completed.lastState).toBe("DONE");
+    expect(claimed.task.settingsSource).toBe("user_confirmed");
+    expect(claimed.task.thinkingLevel).toBe("xhigh");
   });
 
-  it("keeps a legacy session file on long-chat and does not migrate", () => {
-    const view = resolveConversation({
-      url: "https://chatgpt.com/c/old-chat",
+  it("retains a degraded exact Chat and retires it only after deletion", async () => {
+    reset();
+    const claimed = await claimedTask();
+    const timeout = await recordTaskReadResult("workspace123", "task-a", "timeout", "host timeout");
+    expect(timeout.conversationId).toBe(claimed.task.conversationId);
+    expect(timeout.bindingState).toBe("bound");
+    const gone = await recordTaskReadResult("workspace123", "task-a", "gone", "deleted");
+    expect(gone.bindingState).toBe("unavailable");
+  });
+
+  it("recognizes old per-workspace session files only as migration data", () => {
+    reset();
+    const file = path.join(process.env.C2C_STATE_DIR!, "sessions", "workspace123.json");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ version: 1, url: "https://chatgpt.com/c/legacy" }));
+    const state = readSessionRegistry("workspace123");
+    expect(state.legacyDetected).toBe(true);
+    expect(state.registry.tasks).toEqual([]);
+  });
+
+  it("keeps a v3 legacy provision inert and lets the task claim standby inventory", async () => {
+    reset();
+    const file = path.join(process.env.C2C_STATE_DIR!, "sessions", "workspace123.json");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      version: 3,
+      workspaceId: "workspace123",
+      tasks: [],
+      provisions: [{
+        taskId: "task-a", generation: 1,
+        provisionId: "c2c_provision_00000000-0000-4000-8000-000000000001",
+        bindingCodeDigest: "legacy", bindingState: "provisioning", creationState: "pending",
+        receiptMessageId: "c2c_msg_00000000-0000-4000-8000-000000000001",
+        clientThreadId: "legacy-client", allowPro: false, seenConversationIds: [],
+        createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+      }],
       savedAt: "2026-01-01T00:00:00.000Z",
+    }));
+    await importStandbyConversation({
+      conversationId: "standby-migrated", projectId: "g-p-sessionpool123",
+      marker: "C2C_STANDBY_READY", markerMessageId: "marker-migrated", markerRole: "user",
     });
-    expect(view.mode).toBe("long-chat");
-    expect(view.reason).toBe("existing-long-chat");
-    expect(view.reuseSavedChat).toBe(true);
-    expect(view.chatUrl).toBe("https://chatgpt.com/c/old-chat");
-  });
-
-  it("lets an explicit long-chat opt-out win over a leftover collection URL", () => {
-    const view = resolveConversation({
-      conversationMode: "long-chat",
-      projectUrl: PROJECT,
-      url: "https://chatgpt.com/c/keep",
-      savedAt: "2026-01-01T00:00:00.000Z",
+    const claimed = await claimStandbyConversation({
+      workspaceId: "workspace123", taskId: "task-a", connectorName: "C2C", workspaceName: "repo", branch: "main",
     });
-    expect(view.mode).toBe("long-chat");
-    expect(view.reuseSavedChat).toBe(true);
-  });
-
-  it("uses Project when a collection URL is stored", () => {
-    const view = resolveConversation({
-      conversationMode: "project",
-      projectUrl: PROJECT,
-      url: "https://chatgpt.com/c/thread-1",
-      connectorName: "Codex with ChatGPT · Demo",
-      savedAt: "2026-01-01T00:00:00.000Z",
-    });
-    expect(view.mode).toBe("project");
-    expect(view.projectReady).toBe(true);
-    expect(view.reuseSavedChat).toBe(false);
-    expect(view.connectorName).toBe("Codex with ChatGPT · Demo");
-  });
-});
-
-describe("mergeSession", () => {
-  it("keeps Project fields when only the chat URL is updated", () => {
-    const next = mergeSession(
-      {
-        conversationMode: "project",
-        projectUrl: PROJECT,
-        connectorName: "Codex with ChatGPT · Demo",
-        url: "https://chatgpt.com/c/old",
-        savedAt: "2026-01-01T00:00:00.000Z",
-      },
-      { url: "https://chatgpt.com/c/new", taskId: "c2c_ab12", iteration: 1 }
-    );
-    expect(next.projectUrl).toBe(PROJECT);
-    expect(next.conversationMode).toBe("project");
-    expect(next.url).toBe("https://chatgpt.com/c/new");
-    expect(next.connectorName).toBe("Codex with ChatGPT · Demo");
-    expect(next.taskId).toBe("c2c_ab12");
-  });
-
-  it("rejects a non-collection project URL", () => {
-    expect(() =>
-      mergeSession(null, {
-        conversationMode: "project",
-        projectUrl: "https://chatgpt.com/c/nope",
-      })
-    ).toThrow(/project URL/);
-  });
-});
-
-describe("clearChatPointer", () => {
-  const dirs: string[] = [];
-
-  afterEach(() => {
-    for (const dir of dirs) cleanup(dir);
-    dirs.length = 0;
-    delete process.env.C2C_STATE_DIR;
-  });
-
-  it("keeps the collection binding in Project mode", () => {
-    const dir = makeTmpDir("session-clear");
-    dirs.push(dir);
-    process.env.C2C_STATE_DIR = dir;
-    writeSession("abc123abc123", {
-      conversationMode: "project",
-      projectUrl: PROJECT,
-      url: "https://chatgpt.com/c/gone",
-      connectorName: "Codex with ChatGPT · Demo",
-      savedAt: "2026-01-01T00:00:00.000Z",
-    });
-    expect(clearChatPointer("abc123abc123")).toEqual({ cleared: true, keptProject: true });
-    const saved = readSession("abc123abc123");
-    expect(saved?.projectUrl).toBe(PROJECT);
-    expect(saved?.url).toBeUndefined();
-  });
-
-  it("deletes a legacy long-chat file", () => {
-    const dir = makeTmpDir("session-clear-legacy");
-    dirs.push(dir);
-    process.env.C2C_STATE_DIR = dir;
-    writeSession("def456def456", {
-      url: "https://chatgpt.com/c/legacy",
-      savedAt: "2026-01-01T00:00:00.000Z",
-    });
-    expect(clearChatPointer("def456def456")).toEqual({ cleared: true, keptProject: false });
-    expect(readSession("def456def456")).toBeNull();
+    expect(claimed.task.conversationId).toBe("standby-migrated");
+    expect(readSessionRegistry("workspace123").registry.provisions).toEqual([]);
   });
 });

@@ -1,245 +1,94 @@
 # C2C Agent Protocol
 
-Control plane: Codex App direct messaging to an existing `kind: "chatgpt"` conversation.
-Data plane: MCP (ChatGPT pulls files, diffs, search results itself).
+Control plane: Codex App background tools `list_threads → read_thread →
+send_message_to_thread`.
 
-Never mix the two: control messages carry state, never content.
+Data plane: the C2C Router MCP endpoint. It has eight read-only tools.
 
-## States
+Browser automation, UIA, ChatGPT Classic, ChatGPT Work, drafts, and clipboard
+flows are not protocol surfaces.
 
-```
-INIT → PLAN → EXECUTING → EXECUTED → REVIEW → PLAN | DONE | BLOCKED | ERROR
-```
+## Global Router
 
-| State | Sender | Meaning |
-| --- | --- | --- |
-| INIT | Codex | New task; asks ChatGPT to inspect + plan |
-| PLAN | ChatGPT | Executable plan for the next iteration |
-| EXECUTING | Codex | (optional) execution in progress |
-| EXECUTED | Codex | Iteration finished; metadata only |
-| REVIEW | ChatGPT | (implicit) ChatGPT is inspecting via MCP |
-| DONE | ChatGPT | Success criteria met |
-| BLOCKED | ChatGPT | Cannot proceed; contains reason |
-| ERROR | either | Protocol/infrastructure failure |
-| HANDOFF | Codex | Continuation brief sent to a replacement conversation |
+One Router is anchored to the existing OpenAI Secure MCP Tunnel and its existing
+ChatGPT connector. `c2c router ensure -w <workspace>` registers each new local
+workspace. The gateway keeps one transport runtime; requests are stateless and
+resolve a new `Workspace` instance from a task capability on every call.
 
-## Message format
+A route capability binds:
 
-Every control message starts with `[C2C]` and key-value headers, then sections.
-Keep messages < 1 KB. No diffs, no logs, no file bodies.
-
-### INIT (Codex → ChatGPT)
-
-```
-[C2C]
-STATE: INIT
-TASK_ID: c2c_f81a
-ITERATION: 0
-
-GOAL:
-Implement dark mode.
-
-INSTRUCTION:
-Inspect the connected workspace through Codex with ChatGPT MCP.
-Create an implementation plan for Codex.
+```text
+workspaceId + taskId + conversationId → SHA-256(route_token)
 ```
 
-### PLAN (ChatGPT → Codex)
+The raw `route_token` appears only in the one task Chat Boot Prompt. It is not
+saved in the session registry, Router state, logs, or task outputs. All eight
+MCP tool schemas require `route_token`. An invalid, revoked, expired, or
+cross-task token returns `ROUTE_ACCESS_DENIED` before workspace access.
 
-```
-[C2C]
-STATE: PLAN
-TASK_ID: c2c_f81a
-ITERATION: 1
+## Standby Chat pool
 
-GOAL:
-...
+The single **Codex-with-ChatGPT** Project holds manually prepared ordinary
+Chats. A candidate is accepted only when `list_threads` and `read_thread` prove:
 
-RATIONALE:
-...
+- `kind: chatgpt`;
+- exact Project id;
+- an exact marker in a **user** turn;
+- no prior task ownership.
 
-ACTIONS:
-1. ...
-2. ...
-3. ...
+`C2C_STANDBY_READY` means user-confirmed non-Pro xhigh. Explicit Pro tasks use
+only `C2C_STANDBY_READY_PRO`. Model names stay unknown because the host does not
+return verified model fields.
 
-FILES_LIKELY_INVOLVED:
-...
+`session pool claim` holds the global session lock, uses FIFO `createdAt`, and
+atomically saves a permanent `workspaceId + taskId → conversationId` binding.
+A claimed Chat is never returned to stock. If it is deleted, it becomes retired
+and the same task may claim a next generation. A temporary direct-tool failure
+only sets `degraded`; it does not replace the Chat. Empty compatible stock yields
+`POOL_EXHAUSTED` and blocks task content.
 
-TESTS:
-...
+## Boot and direct delivery
 
-SUCCESS_CRITERIA:
-...
-```
+Every control message has:
 
-Plans must be finite, concrete, executable. Not 40-step epics.
-
-### EXECUTED (Codex → ChatGPT)
-
-```
-[C2C]
-STATE: EXECUTED
-TASK_ID: c2c_f81a
-ITERATION: 1
-
-RESULT:
-Execution finished.
-
-CHANGED_FILES:
-4
-
-TESTS:
-27 passed
-
-Please independently inspect the workspace and current git diff through MCP.
+```text
+TASK_ID
+WORKSPACE_ID
+ITERATION
+MESSAGE_ID: c2c_msg_<uuid>
 ```
 
-Before sending EXECUTED, Codex records the iteration:
-`c2c record --task c2c_f81a --iteration 1 --changed-files ... --tests ... --exit-status ok`
-so ChatGPT can read it via the `execution_summary` / `test_status` tools.
+The new Chat's Boot Prompt additionally contains `C2C_ROUTE_TOKEN` and tells
+ChatGPT to call `workspace_info` first with `route_token`. The task becomes
+`ready` only after delivery and reply readback plus matching workspace id, name,
+branch, connector, and all four identity fields.
 
-### DONE / BLOCKED (ChatGPT → Codex)
+`send_message_to_thread` means accepted only. The coordinator polls
+`read_thread` on the exact conversation. It confirms delivery after the matching
+user message appears, and confirms reply only after the matching ChatGPT reply
+appears. `wait_threads` is not used for ordinary ChatGPT conversations.
 
-```
-[C2C]
-STATE: DONE
-TASK_ID: c2c_f81a
-ITERATION: 3
+Channel states:
 
-SUMMARY:
-...
-```
-
-```
-[C2C]
-STATE: BLOCKED
-TASK_ID: c2c_f81a
-ITERATION: 3
-
-REASON:
-...
-
-NEEDS:
-...
+```text
+ready → sending → awaiting_reply → ready
+degraded (only an explicit recovery probe may continue)
 ```
 
-### HANDOFF (Codex → new ChatGPT conversation)
+No automatic resend occurs after a missed readback. No title guess, recency
+selection, or cross-task substitution is allowed.
 
-`c2c session --json` → `conversation.mode` chooses how chats are grouped.
+## Single writer
 
-- **long-chat:** one long-lived C2C conversation per workspace. Codex opens a
-  replacement chat only when the user asks, the old chat lags, or the chat was
-  lost.
-- **project:** one ChatGPT Project (collection) per workspace. A new Codex
-  conversation starts a new chat **inside that Project**. The same Codex
-  conversation keeps using its saved chat URL.
+Only the primary coordinating Codex agent claims pool items, sends control
+messages, and advances receipt state. Subagents return findings to it. A task
+Chat has at most one in-flight request. Separate tasks claim separate Chats and
+separate route capabilities.
 
-Right after the boot prompt, Codex sends a HANDOFF so the new chat can
-continue — a brief, never a data dump (the new chat re-reads code via MCP).
-Project instructions and project-only memory hold durable workspace identity.
-HANDOFF still wins for the current task:
+## Read-source priority
 
-Trust order: connector (current code) > HANDOFF (this task) > Project
-instructions > Project memory.
+- GitHub connector: committed code, Issues, PRs, history.
+- mem/OpenDeepWiki: Gitea Wiki, architecture, project structure.
+- C2C MCP: current local files, status, diff, tests, unpushed changes.
 
-```
-[C2C]
-STATE: HANDOFF
-TASK_ID: c2c_f81a
-ITERATION: 4
-
-ORIGINAL_GOAL:
-Implement dark mode with a persisted user preference.
-
-PROGRESS:
-- Iter 1-2: theme context + toggle implemented, reviewed OK.
-- Iter 3: persistence added; review found the toggle flashes on load.
-
-CURRENT_STATE:
-EXECUTED (iteration 4 fix applied, not yet reviewed).
-
-KNOWN_ISSUES:
-Flash-on-load fix needs verification in src/theme/ThemeProvider.tsx.
-
-NEXT_EXPECTED_STEP:
-Independently review iteration 4 via git_diff and reply PLAN or DONE.
-```
-
-## Loop limits
-
-`maxIterations` (default 12, configurable in `.c2c.json`). When reached, Codex
-pauses and asks the user whether to continue.
-
-## Boot Prompt
-
-Send once at the start of every new C2C conversation:
-
-```
-You are the planning and review layer of a Codex coding session.
-
-Codex owns execution.
-You own high-level reasoning, planning and review.
-
-You have access to the current local workspace through the
-"Codex with ChatGPT" MCP connector.
-
-Rules:
-
-1. Do not ask Codex to paste files that are available through MCP.
-2. Inspect only the files needed for the task.
-3. Use MCP to inspect current code, git status and diff.
-4. Produce concise executable plans.
-5. Codex will execute your plan using its own harness.
-6. After Codex reports EXECUTED, independently inspect the diff.
-7. Do not assume an implementation succeeded just because Codex says so.
-8. Continue until the implementation satisfies the success criteria.
-9. Avoid unnecessary rewrites.
-10. Return C2C structured control messages.
-11. Be substantive. PLAN and review replies must carry enough signal for
-    Codex to act on: rationale, per-file natural-language suggestions
-    (which file, what to change and why), risks worth checking, and test
-    advice. Never reply with a bare one-liner. Substance over length —
-    but do not generate 40-step epics either.
-12. If you receive a HANDOFF message, this conversation continues an
-    existing task. Trust the handoff brief for history, re-read any code
-    you need through MCP, and resume from NEXT_EXPECTED_STEP.
-13. If this chat sits in a ChatGPT Project, use only the connector named
-    in that Project's instructions. Do not use another workspace's connector.
-```
-
-## Project instructions
-
-New workspaces store durable identity in the ChatGPT Project settings
-(指令), not in every boot prompt. The Skill fills this template once.
-Never put a public or temporary URL in the instructions — only the
-connector **name**.
-
-```
-You are the planning and review layer for one local workspace. Codex executes.
-
-This Project is bound only to:
-- Workspace name: {{workspace_name}}
-- Kind: {{project_type}} ({{languages}} / {{frameworks}})
-- Connector (use this one only): {{connector_name}}
-
-When you call tools, use ONLY that connector. Do not use any other
-Codex with ChatGPT connector. If workspace_info names a different
-workspace, stop. Do not plan. Do not use this Project's memory.
-
-Read code, git, and diffs through that connector. Never ask anyone to
-paste file bodies, diffs, or logs. Never upload the repo into this
-Project's files or sources.
-
-When facts conflict, trust this order:
-1. Current code from the connector
-2. A HANDOFF in this chat (this task's goal, progress, next step)
-3. These instructions
-4. This Project's memory (durable architecture only; stale memory loses)
-
-This Project's memory is only for this workspace. On HANDOFF, trust the
-brief, re-read code through the connector, and resume at NEXT_EXPECTED_STEP.
-
-Be substantive: why, which file, what to test. No empty one-liners and
-no 40-step epics. Use C2C control messages.
-```
+Current local C2C data wins on conflicts.

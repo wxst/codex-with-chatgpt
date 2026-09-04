@@ -17,6 +17,9 @@ type ToolResult = {
   isError?: boolean;
 };
 
+type HandlerExtra = { authInfo?: AuthInfo };
+type RouteArgs = { route_token?: string };
+
 function ok(data: unknown): ToolResult {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 }
@@ -43,12 +46,44 @@ function requireScope(authInfo: AuthInfo | undefined, scope: string): ToolResult
 }
 
 export interface McpContext {
-  workspace: Workspace;
+  /** Legacy, single-workspace bridge context. */
+  workspace?: Workspace;
+  /**
+   * Router context. Every request must present a task-scoped route token and
+   * receives a fresh Workspace instance for the route it owns.
+   */
+  resolveRoute?: (token: string) => Promise<{ workspace: Workspace; taskId?: string }>;
   logger: Logger;
 }
 
 export function createMcpServer(ctx: McpContext): McpServer {
-  const { workspace } = ctx;
+  if (!ctx.workspace && !ctx.resolveRoute) {
+    throw new Error("MCP server requires either a workspace or a route resolver");
+  }
+  if (ctx.workspace && ctx.resolveRoute) {
+    throw new Error("MCP server accepts either a workspace or a route resolver, not both");
+  }
+  const routed = Boolean(ctx.resolveRoute);
+  const withRouteToken = <T extends z.ZodRawShape>(schema: T): T | (T & { route_token: z.ZodString }) => {
+    if (!routed) return schema;
+    return {
+      route_token: z.string().min(32).describe("Task-scoped C2C route capability"),
+      ...schema,
+    };
+  };
+  const workspaceFor = async (args: { route_token?: string }): Promise<{ workspace: Workspace; taskId?: string }> => {
+    if (ctx.workspace) return { workspace: ctx.workspace };
+    if (!args.route_token || !ctx.resolveRoute) {
+      throw new Error("ROUTE_ACCESS_DENIED");
+    }
+    return ctx.resolveRoute(args.route_token);
+  };
+  const routeError = (error: unknown): ToolResult | null => {
+    if (error instanceof Error && error.message === "ROUTE_ACCESS_DENIED") {
+      return fail("ROUTE_ACCESS_DENIED", "A valid task route token is required.");
+    }
+    return null;
+  };
   const server = new McpServer(
     { name: PRODUCT_NAME, version: VERSION },
     { capabilities: { tools: {} }, instructions: UNTRUSTED_NOTE }
@@ -61,19 +96,21 @@ export function createMcpServer(ctx: McpContext): McpServer {
       description:
         `Get an overview of the connected workspace: identity, project type, languages, ` +
         `frameworks, git state and available scripts. Call this first. ${UNTRUSTED_NOTE}`,
-      inputSchema: {},
+      inputSchema: withRouteToken({}),
       annotations: { readOnlyHint: true },
     },
-    async (_args, extra) => {
+    async (args: RouteArgs, extra: HandlerExtra) => {
       const denied = requireScope(extra.authInfo, "workspace.read");
       if (denied) return denied;
       try {
+        const { workspace, taskId } = await workspaceFor(args);
         const project = workspace.detectProject();
         const git = gitInfo(workspace.root);
         return ok({
           workspaceId: workspace.id,
           workspaceName: workspace.name,
           rootAlias: "workspace:/",
+          ...(taskId ? { routeTaskId: taskId } : {}),
           ...project,
           git: {
             isRepo: git.isRepo,
@@ -83,6 +120,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
           },
         });
       } catch (error) {
+        const deniedRoute = routeError(error);
+        if (deniedRoute) return deniedRoute;
         return mapError(error);
       }
     }
@@ -95,20 +134,23 @@ export function createMcpServer(ctx: McpContext): McpServer {
       description:
         `List files and directories under a workspace-relative path. High-noise directories ` +
         `(node_modules, .git, build output) are omitted. Supports pagination. ${UNTRUSTED_NOTE}`,
-      inputSchema: {
+      inputSchema: withRouteToken({
         path: z.string().default(".").describe("Workspace-relative path, e.g. 'src'"),
         depth: z.number().int().min(1).max(4).default(1).describe("Recursion depth (1-4)"),
         limit: z.number().int().min(1).max(1000).default(200),
         offset: z.number().int().min(0).default(0),
-      },
+      }),
       annotations: { readOnlyHint: true },
     },
-    async (args, extra) => {
+    async (args: RouteArgs & { path: string; depth: number; limit: number; offset: number }, extra: HandlerExtra) => {
       const denied = requireScope(extra.authInfo, "workspace.read");
       if (denied) return denied;
       try {
+        const { workspace } = await workspaceFor(args);
         return ok(await workspace.listDirectory(args.path, args));
       } catch (error) {
+        const deniedRoute = routeError(error);
+        if (deniedRoute) return deniedRoute;
         return mapError(error);
       }
     }
@@ -122,19 +164,22 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `Read a text file from the workspace with line-range pagination. Defaults to the first ` +
         `400 lines; use start_line/end_line to page through large files. Sensitive files ` +
         `(.env, keys, credentials) are always denied. ${UNTRUSTED_NOTE}`,
-      inputSchema: {
+      inputSchema: withRouteToken({
         path: z.string().describe("Workspace-relative file path"),
         start_line: z.number().int().min(1).optional().describe("1-based first line to return"),
         end_line: z.number().int().min(1).optional().describe("1-based last line to return"),
-      },
+      }),
       annotations: { readOnlyHint: true },
     },
-    async (args, extra) => {
+    async (args: RouteArgs & { path: string; start_line?: number; end_line?: number }, extra: HandlerExtra) => {
       const denied = requireScope(extra.authInfo, "workspace.read");
       if (denied) return denied;
       try {
+        const { workspace } = await workspaceFor(args);
         return ok(await workspace.readFile(args.path, { startLine: args.start_line, endLine: args.end_line }));
       } catch (error) {
+        const deniedRoute = routeError(error);
+        if (deniedRoute) return deniedRoute;
         return mapError(error);
       }
     }
@@ -147,21 +192,24 @@ export function createMcpServer(ctx: McpContext): McpServer {
       description:
         `Search file contents across the workspace (ripgrep when available). Returns matching ` +
         `lines with file paths and line numbers. ${UNTRUSTED_NOTE}`,
-      inputSchema: {
+      inputSchema: withRouteToken({
         query: z.string().min(2).describe("Text to search for (literal by default)"),
         path: z.string().optional().describe("Restrict search to this workspace-relative path"),
         glob: z.string().optional().describe("Filename glob filter, e.g. '*.ts'"),
         limit: z.number().int().min(1).max(200).default(50),
         regex: z.boolean().default(false).describe("Treat query as a regular expression"),
-      },
+      }),
       annotations: { readOnlyHint: true },
     },
-    async (args, extra) => {
+    async (args: RouteArgs & { query: string; path?: string; glob?: string; limit: number; regex: boolean }, extra: HandlerExtra) => {
       const denied = requireScope(extra.authInfo, "workspace.search");
       if (denied) return denied;
       try {
+        const { workspace } = await workspaceFor(args);
         return ok(await searchWorkspace(workspace, args));
       } catch (error) {
+        const deniedRoute = routeError(error);
+        if (deniedRoute) return deniedRoute;
         return mapError(error);
       }
     }
@@ -172,15 +220,18 @@ export function createMcpServer(ctx: McpContext): McpServer {
     {
       title: "Git status",
       description: `Structured git status of the workspace: branch, staged/unstaged/untracked files. ${UNTRUSTED_NOTE}`,
-      inputSchema: {},
+      inputSchema: withRouteToken({}),
       annotations: { readOnlyHint: true },
     },
-    async (_args, extra) => {
+    async (args: RouteArgs, extra: HandlerExtra) => {
       const denied = requireScope(extra.authInfo, "git.read");
       if (denied) return denied;
       try {
+        const { workspace } = await workspaceFor(args);
         return ok(gitStatus(workspace.root));
       } catch (error) {
+        const deniedRoute = routeError(error);
+        if (deniedRoute) return deniedRoute;
         return mapError(error);
       }
     }
@@ -193,18 +244,19 @@ export function createMcpServer(ctx: McpContext): McpServer {
       description:
         `Git diff with byte-offset pagination. mode: 'unstaged' (default), 'staged', or 'head' ` +
         `(working tree vs HEAD). When has_more is true, call again with offset=next_offset. ${UNTRUSTED_NOTE}`,
-      inputSchema: {
+      inputSchema: withRouteToken({
         mode: z.enum(["unstaged", "staged", "head"]).default("unstaged"),
         path: z.string().optional().describe("Limit the diff to one workspace-relative path"),
         offset: z.number().int().min(0).default(0).describe("Byte offset for pagination"),
         max_bytes: z.number().int().min(1024).max(262144).default(65536),
-      },
+      }),
       annotations: { readOnlyHint: true },
     },
-    async (args, extra) => {
+    async (args: RouteArgs & { mode: DiffMode; path?: string; offset: number; max_bytes: number }, extra: HandlerExtra) => {
       const denied = requireScope(extra.authInfo, "git.read");
       if (denied) return denied;
       try {
+        const { workspace } = await workspaceFor(args);
         let relPath: string | undefined;
         if (args.path) {
           relPath = workspace.resolve(args.path).rel;
@@ -217,6 +269,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
           )
         );
       } catch (error) {
+        const deniedRoute = routeError(error);
+        if (deniedRoute) return deniedRoute;
         return mapError(error);
       }
     }
@@ -229,12 +283,18 @@ export function createMcpServer(ctx: McpContext): McpServer {
       description:
         `Summary of the most recent test run reported by the Codex harness. This does NOT run ` +
         `tests; it reads the latest execution record. ${UNTRUSTED_NOTE}`,
-      inputSchema: {},
+      inputSchema: withRouteToken({}),
       annotations: { readOnlyHint: true },
     },
-    async (_args, extra) => {
+    async (args: RouteArgs, extra: HandlerExtra) => {
       const denied = requireScope(extra.authInfo, "execution.read");
       if (denied) return denied;
+      let workspace: Workspace;
+      try {
+        ({ workspace } = await workspaceFor(args));
+      } catch (error) {
+        return routeError(error) ?? mapError(error);
+      }
       const latest = latestExecutionRecord(workspace.id);
       if (!latest) {
         return ok({ available: false, message: "No execution records yet for this workspace." });
@@ -257,15 +317,20 @@ export function createMcpServer(ctx: McpContext): McpServer {
       description:
         `Recent Codex execution records for this workspace: task id, iteration, changed files, ` +
         `tests and exit status. Use it after Codex reports EXECUTED. ${UNTRUSTED_NOTE}`,
-      inputSchema: {
+      inputSchema: withRouteToken({
         limit: z.number().int().min(1).max(50).default(5),
-      },
+      }),
       annotations: { readOnlyHint: true },
     },
-    async (args, extra) => {
+    async (args: RouteArgs & { limit: number }, extra: HandlerExtra) => {
       const denied = requireScope(extra.authInfo, "execution.read");
       if (denied) return denied;
-      return ok({ records: readExecutionRecords(workspace.id, args.limit) });
+      try {
+        const { workspace } = await workspaceFor(args);
+        return ok({ records: readExecutionRecords(workspace.id, args.limit) });
+      } catch (error) {
+        return routeError(error) ?? mapError(error);
+      }
     }
   );
 

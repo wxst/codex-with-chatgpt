@@ -4,9 +4,16 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
+import { startWorkspaceRouter } from "../router/server.js";
+import {
+  createWorkspaceRouter,
+  issueRouteCapability,
+  readWorkspaceRouter,
+} from "../router/state.js";
 import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
+import { gitInfo } from "../workspace/git.js";
 import { revokeLegacyWindowsWorkspaceAccess, revokeWorkspaceAccess } from "../auth/revoke.js";
 import { appendExecutionRecord } from "../execution/records.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
@@ -52,12 +59,24 @@ import {
 } from "../config/endpoint.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 import {
-  clearChatPointer,
-  mergeSession,
-  readSession,
-  resolveConversation,
-  writeSession,
-  type ConversationMode,
+  assertReceiptIdentity,
+  beginTaskSend,
+  clearTaskSession,
+  confirmTaskDelivery,
+  confirmTaskReply,
+  confirmTaskWorkspace,
+  attachTaskRouteCapability,
+  claimStandbyConversation,
+  failTaskDelivery,
+  importStandbyConversation,
+  markTaskUnavailable,
+  newMessageId,
+  readSessionRegistry,
+  readTaskSession,
+  recordTaskReadResult,
+  quarantineStandbyConversation,
+  readStandbyPool,
+  resolveCodexTaskId,
 } from "../session/state.js";
 
 const program = new Command();
@@ -151,6 +170,39 @@ interface AdminInfo {
   startedAt: string;
 }
 
+interface EnsuredRouter {
+  anchor: Workspace;
+  workspace: Workspace;
+  created: boolean;
+}
+
+/**
+ * Register the caller's workspace under the one global Router. The anchor is
+ * the only Bridge runtime and therefore retains the existing OpenAI Tunnel
+ * alias, credential and ChatGPT connector.
+ */
+async function ensureWorkspaceRouter(workspaceRoot: string, migrate = false): Promise<EnsuredRouter> {
+  const workspace = new Workspace(workspaceRoot);
+  let state = readWorkspaceRouter();
+  let created = false;
+  if (!state) {
+    await createWorkspaceRouter(workspace.root);
+    state = readWorkspaceRouter();
+    created = true;
+  }
+  if (!state) throw new Error("global workspace router was not initialized");
+  const router = await createWorkspaceRouter(state.anchor.root);
+  await router.register(workspace.root);
+  const anchor = new Workspace(state.anchor.root);
+  if (created || migrate) {
+    // Restart only the anchor. Its state files and OpenAI Tunnel token remain
+    // in place, while serve now instantiates the Router MCP server.
+    const live = await findLiveBridge(anchor.id);
+    if (live) await stopBridge(anchor.root);
+  }
+  return { anchor, workspace, created };
+}
+
 async function ensureBridgeAndTunnel(
   workspaceRoot: string,
   opts: { tunnel: boolean }
@@ -202,18 +254,27 @@ program
     const logger = new Logger({ name: "bridge", console: true });
     const workspaceRoot = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(workspaceRoot);
-    const bridge = await startBridge({
-      workspaceRoot,
-      port: opts.port ? parseInt(opts.port, 10) : undefined,
-      logger,
-      transportMode: readTransportMode(workspace.id),
-    });
+    const router = readWorkspaceRouter();
+    const isRouterAnchor = router && path.resolve(router.anchor.root) === workspace.root;
+    const bridge = isRouterAnchor
+      ? await startWorkspaceRouter({
+          anchorRoot: workspaceRoot,
+          port: opts.port ? parseInt(opts.port, 10) : undefined,
+          logger,
+          transportMode: readTransportMode(workspace.id),
+        })
+      : await startBridge({
+          workspaceRoot,
+          port: opts.port ? parseInt(opts.port, 10) : undefined,
+          logger,
+          transportMode: readTransportMode(workspace.id),
+        });
     const shutdown = (): void => {
       void bridge.close().then(() => process.exit(0));
     };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
-    say(`bridge ready on ${bridge.localBaseUrl()} (workspace ${bridge.workspace.name})`);
+    say(`${isRouterAnchor ? "router" : "bridge"} ready on ${bridge.localBaseUrl()} (workspace ${bridge.workspace.name})`);
   });
 
 // ---------------------------------------------------------------- start
@@ -227,7 +288,8 @@ program
   .action(async (opts: { workspace?: string; tunnel: boolean; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
-      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const routed = await ensureWorkspaceRouter(root);
+      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(routed.anchor.root, { tunnel: opts.tunnel });
       const connectorName = mcpUrl
         ? persistWorkspaceEndpoint({
             workspaceId: info.workspaceId,
@@ -236,13 +298,16 @@ program
             publicUrl: info.publicUrl,
             mcpUrl,
           })
-        : readLastEndpoint(info.workspaceId)?.connectorName;
+        : readLastEndpoint(info.workspaceId)?.connectorName ?? "C2C Router";
       if (opts.json) {
-        say(JSON.stringify({ ok: true, port: runtime.port, workspaceId: info.workspaceId, mcpUrl, connectorName }));
+        say(JSON.stringify({
+          ok: true, port: runtime.port, workspaceId: routed.workspace.id, workspaceName: routed.workspace.name,
+          anchorWorkspaceId: info.workspaceId, mcpUrl, connectorName, router: true,
+        }));
         return;
       }
-      check(`当前项目已识别（${info.workspaceName}）`);
-      check("Workspace Bridge 已启动");
+      check(`当前项目已注册（${routed.workspace.name}）`);
+      check("全局 Router 已启动");
       if (mcpUrl) check("安全连接已建立");
     } catch (error) {
       handleCliError(error, opts.json);
@@ -267,7 +332,8 @@ program
         say("");
       }
       const sandbox = trySandboxAllow();
-      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const routed = await ensureWorkspaceRouter(root);
+      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(routed.anchor.root, { tunnel: opts.tunnel });
       const connectorName = mcpUrl
         ? persistWorkspaceEndpoint({
             workspaceId: info.workspaceId,
@@ -317,11 +383,11 @@ program
         );
         return;
       }
-      check(`当前项目已识别（${info.workspaceName}）`);
-      check("Workspace Bridge 已启动");
+      check(`当前项目已注册（${routed.workspace.name}）`);
+      check("全局 Router 已启动");
       say("");
       if (info.transportMode === "openai") {
-        await ensureWorkspaceOpenAITunnelToken(root);
+        await ensureWorkspaceOpenAITunnelToken(routed.anchor.root);
         check("默认安全模式：OpenAI Secure MCP Tunnel");
         say(`本机 MCP：http://127.0.0.1:${runtime.port}/mcp`);
         say(`本机认证文件：${openAITunnelTokenFile(info.workspaceId)}`);
@@ -412,11 +478,11 @@ program
   .option("--tunnel", "re-establish the secure public connection", false)
   .action(async (opts: { workspace?: string; tunnel: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
-    await stopBridge(root);
-    await new Promise((resolve) => setTimeout(resolve, 500));
     try {
-      const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
-      check(`Bridge 已重启（${info.workspaceName}）`);
+      const routed = await ensureWorkspaceRouter(root, true);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const { info, mcpUrl } = await ensureBridgeAndTunnel(routed.anchor.root, { tunnel: opts.tunnel });
+      check(`全局 Router 已重启（${routed.workspace.name}）`);
       if (mcpUrl) check(`安全连接已建立`);
     } catch (error) {
       handleCliError(error, false);
@@ -433,21 +499,32 @@ program
   .action(async (opts: { workspace?: string; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
-    const runtime = await findLiveBridge(workspace.id);
+    const router = readWorkspaceRouter();
+    const registered = router?.workspaces.some((entry) => entry.workspaceId === workspace.id && !entry.revokedAt);
+    const anchor = router && registered ? new Workspace(router.anchor.root) : workspace;
+    const runtime = await findLiveBridge(anchor.id);
     if (!runtime) {
-      if (opts.json) say(JSON.stringify({ ok: false, running: false }));
+      if (opts.json) say(JSON.stringify({ ok: false, running: false, workspaceId: workspace.id, anchorWorkspaceId: anchor.id }));
       else say("Bridge 未运行。使用 `c2c start` 启动。");
       return;
     }
     const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     if (opts.json) {
-      say(JSON.stringify({ ok: true, running: true, ...info }));
+      say(JSON.stringify({
+        ok: true,
+        running: true,
+        ...info,
+        workspaceId: workspace.id,
+        workspaceName: workspace.name,
+        anchorWorkspaceId: anchor.id,
+        router: Boolean(router && registered),
+      }));
       return;
     }
     say(PRODUCT_NAME);
     say("");
-    check(`Workspace：${info.workspaceName}`);
-    check(`Bridge：运行中（端口 ${info.port}）`);
+    check(`Workspace：${workspace.name}`);
+    check(`${router && registered ? "Router" : "Bridge"}：运行中（端口 ${info.port}）`);
     check(`传输模式：${info.transportMode === "openai" ? "OpenAI Secure MCP Tunnel" : "Cloudflare fallback"}`);
     if (info.transportMode === "openai") {
       say("· 公网 MCP 入口：关闭");
@@ -458,6 +535,102 @@ program
     } else {
       say("· Cloudflare fallback：未启动");
     }
+  });
+
+// ---------------------------------------------------------------- global Router
+
+const routerCommand = program
+  .command("router")
+  .description("Manage the global multi-workspace C2C Router");
+
+routerCommand
+  .command("migrate")
+  .description("Migrate the current Bridge into the global Router anchor")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; json: boolean }) => {
+    try {
+      const routed = await ensureWorkspaceRouter(resolveWorkspace(opts.workspace), true);
+      const { runtime, info } = await ensureBridgeAndTunnel(routed.anchor.root, { tunnel: false });
+      const payload = {
+        ok: true,
+        router: true,
+        workspaceId: routed.workspace.id,
+        anchorWorkspaceId: routed.anchor.id,
+        port: runtime.port,
+        transportMode: info.transportMode,
+      };
+      if (opts.json) say(JSON.stringify(payload));
+      else check(`全局 Router 已迁移；网关锚点：${routed.anchor.name}`);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+routerCommand
+  .command("ensure", { isDefault: true })
+  .description("Register this workspace and ensure the anchor Router is running")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; json: boolean }) => {
+    try {
+      const routed = await ensureWorkspaceRouter(resolveWorkspace(opts.workspace));
+      const { runtime, info } = await ensureBridgeAndTunnel(routed.anchor.root, { tunnel: false });
+      const payload = {
+        ok: true,
+        router: true,
+        workspaceId: routed.workspace.id,
+        workspaceName: routed.workspace.name,
+        anchorWorkspaceId: routed.anchor.id,
+        port: runtime.port,
+        transportMode: info.transportMode,
+      };
+      if (opts.json) say(JSON.stringify(payload));
+      else check(`工作区已注册到全局 Router：${routed.workspace.name}`);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+routerCommand
+  .command("register")
+  .description("Register a workspace without starting or changing the gateway")
+  .requiredOption("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace: string; json: boolean }) => {
+    try {
+      const routed = await ensureWorkspaceRouter(resolveWorkspace(opts.workspace));
+      const payload = {
+        ok: true,
+        workspaceId: routed.workspace.id,
+        workspaceName: routed.workspace.name,
+        anchorWorkspaceId: routed.anchor.id,
+      };
+      if (opts.json) say(JSON.stringify(payload));
+      else check(`工作区已注册：${routed.workspace.name}`);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+routerCommand
+  .command("status")
+  .description("Show the Router anchor, registered workspaces and capability count")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    const state = readWorkspaceRouter();
+    const payload = state
+      ? {
+          ok: true,
+          router: true,
+          anchor: state.anchor,
+          workspaces: state.workspaces,
+          capabilityCount: state.capabilities.filter((entry) => !entry.revokedAt).length,
+        }
+      : { ok: false, router: false, error: "global workspace router is not initialized" };
+    if (opts.json) say(JSON.stringify(payload));
+    else if (state) check(`Router 锚点：${state.anchor.name}；已注册 ${state.workspaces.filter((entry) => !entry.revokedAt).length} 个工作区`);
+    else say("全局 Router 尚未初始化。");
   });
 
 // ---------------------------------------------------------------- doctor
@@ -893,6 +1066,7 @@ function runGit(args: string[]): { ok: boolean; stdout: string } {
     encoding: "utf8",
     timeout: 8000,
     env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    windowsHide: true,
   });
   return { ok: result.status === 0, stdout: (result.stdout ?? "").trim() };
 }
@@ -944,92 +1118,312 @@ program
     emit({ checked: true, updateAvailable, localCommit: local.stdout, remoteCommit });
   });
 
-// ---------------------------------------------------------------- session (ChatGPT conversation / Project memory)
+// ---------------------------------------------------------------- session (task-scoped ChatGPT conversations)
+const session = program.command("session").description("Bind one ordinary ChatGPT conversation to each workspace and Codex task");
 
-const session = program
-  .command("session")
-  .description("Remember the ChatGPT Project and conversation for this workspace");
+function resolvedSessionTaskId(explicitTaskId?: string) {
+  return resolveCodexTaskId(explicitTaskId);
+}
 
-session
-  .command("get", { isDefault: true })
-  .description("Show the saved ChatGPT conversation / Project for this workspace")
-  .option("-w, --workspace <path>")
+session.command("get", { isDefault: true })
+  .description("Show the task-scoped ChatGPT conversation")
+  .option("-w, --workspace <path>").option("--task-id <id>", "stable Codex task id")
   .option("--json", "machine-readable output", false)
-  .action((opts: { workspace?: string; json: boolean }) => {
+  .action((opts: { workspace?: string; taskId?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
-    const saved = readSession(workspace.id);
-    const conversation = resolveConversation(saved);
-    if (opts.json) say(JSON.stringify({ ok: true, session: saved, conversation }));
-    else if (!saved) {
-      say("尚未记录 ChatGPT 会话。新仓库默认使用 Project 合集。");
-    } else {
-      say(`模式：${conversation.mode === "project" ? "Project 合集" : "长对话"}`);
-      if (conversation.projectUrl) say(`合集：${conversation.projectUrl}`);
-      if (saved.title) say(`会话：${saved.title}`);
-      if (saved.url) say(`对话：${saved.url}`);
-      if (saved.connectorName) say(`连接器：${saved.connectorName}`);
-      if (saved.taskId) say(`任务：${saved.taskId}（第 ${saved.iteration ?? 0} 轮，${saved.lastState ?? "?"}）`);
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const read = readSessionRegistry(workspace.id);
+    const task = readTaskSession(workspace.id, resolved.taskId);
+    const provision = read.registry.provisions.find((entry) => entry.taskId === resolved.taskId) ?? null;
+    const result = {
+      ok: true,
+      workspaceId: workspace.id,
+      taskId: resolved.taskId,
+      taskIdSource: resolved.source,
+      generatedTaskId: resolved.generated,
+      task,
+      legacyProvision: provision ? { provisionId: provision.provisionId, creationState: provision.creationState } : null,
+      projectUrl: read.registry.projectUrl ?? null,
+      connectorName: read.registry.connectorName ?? null,
+      legacyDetected: read.legacyDetected,
+      requiresPoolClaim: !task || task.bindingState === "unavailable",
+      requiresSettingsConfirmation: Boolean(task && task.bindingState === "bound" && task.settingsSource !== "user_confirmed"),
+      requiresWorkspaceVerification: Boolean(task && task.bindingState === "bound" && task.verificationState !== "ready"),
+    };
+    if (opts.json) say(JSON.stringify(result));
+    else {
+      say(`工作区：${workspace.id}`);
+      say(`任务：${resolved.taskId}${resolved.generated ? "（新生成，请在本任务内复用）" : ""}`);
+      if (read.legacyDetected) say("检测到旧版会话记录；当前任务从新的人工建档开始。");
+      if (!task) say("当前任务尚未绑定普通 ChatGPT 会话。");
+      else {
+        say(`对话：${task.url}`);
+        say(`代次：${task.generation} / ${task.bindingState}`);
+        say(`思考：${task.thinkingLevel ?? "待确认"} / ${task.settingsSource}${task.proMode ? " / Pro" : ""}`);
+        say(`验证：${task.verificationState}`);
+        say(`通道：${task.channelState}`);
+      }
     }
   });
 
-session
-  .command("set")
-  .description("Save the ChatGPT Project and/or conversation for this workspace")
-  .option("-w, --workspace <path>")
-  .option("--url <url>", "ChatGPT conversation URL from the address bar")
-  .option("--title <title>")
-  .option("--task <id>")
-  .option("--iteration <n>")
-  .option("--state <state>", "last protocol state, e.g. EXECUTED")
-  .option("--mode <mode>", "long-chat or project")
-  .option("--project-url <url>", "ChatGPT Project collection URL (…/g/g-p-…/project)")
-  .option("--connector-name <name>", "exact connector title for this workspace")
-  .action(
-    (opts: {
-      workspace?: string;
-      url?: string;
-      title?: string;
-      task?: string;
-      iteration?: string;
-      state?: string;
-      mode?: string;
-      projectUrl?: string;
-      connectorName?: string;
-    }) => {
-      const workspace = new Workspace(resolveWorkspace(opts.workspace));
-      const modeRaw = opts.mode?.trim().toLowerCase();
-      if (modeRaw && modeRaw !== "long-chat" && modeRaw !== "project") {
-        throw new Error("mode must be long-chat or project");
-      }
-      const saved = mergeSession(readSession(workspace.id), {
-        url: opts.url,
-        title: opts.title,
-        taskId: opts.task,
-        iteration: opts.iteration ? parseInt(opts.iteration, 10) : undefined,
-        lastState: opts.state,
-        conversationMode: modeRaw as ConversationMode | undefined,
-        projectUrl: opts.projectUrl,
-        connectorName: opts.connectorName,
-      });
-      writeSession(workspace.id, saved);
-      if (saved.projectUrl && saved.conversationMode === "project") {
-        check("已记录 ChatGPT 合集，后续从合集页新开或复用对话");
-      } else {
-        check("已记录 ChatGPT 会话，后续任务将复用");
-      }
-    }
-  );
+const pool = session.command("pool").description("Manage manually prepared global standby Chats");
 
-session
-  .command("clear")
-  .description("Forget the current ChatGPT chat (Project binding is kept)")
+pool.command("status", { isDefault: true })
+  .description("Show available, claimed and retired standby Chats")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    const standby = readStandbyPool();
+    const payload = {
+      ok: true,
+      projectId: standby.projectId,
+      entries: standby.entries,
+      available: standby.entries.filter((entry) => entry.status === "available").length,
+      claimed: standby.entries.filter((entry) => entry.status === "claimed").length,
+    };
+    if (opts.json) say(JSON.stringify(payload));
+    else say(`备用 Chat：可用 ${payload.available}，已领取 ${payload.claimed}`);
+  });
+
+pool.command("import")
+  .description("Import one Chat verified by list_threads and read_thread as a standby Chat")
+  .requiredOption("--conversation-id <id>")
+  .requiredOption("--project-id <id>")
+  .requiredOption("--marker-message-id <id>")
+  .option("--pro", "import the explicit Pro standby marker", false)
+  .option("--created-at <iso>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { conversationId: string; projectId: string; markerMessageId: string; pro: boolean; createdAt?: string; json: boolean }) => {
+    const entry = await importStandbyConversation({
+      conversationId: opts.conversationId,
+      projectId: opts.projectId,
+      marker: opts.pro ? "C2C_STANDBY_READY_PRO" : "C2C_STANDBY_READY",
+      markerMessageId: opts.markerMessageId,
+      markerRole: "user",
+      createdAt: opts.createdAt,
+    });
+    if (opts.json) say(JSON.stringify({ ok: true, entry }));
+    else check(`已导入备用 Chat：${entry.conversationId}`);
+  });
+
+pool.command("claim")
+  .description("Claim one compatible standby Chat for this Codex task and issue its route capability")
   .option("-w, --workspace <path>")
-  .action((opts: { workspace?: string }) => {
+  .option("--task-id <id>")
+  .option("--pro", "this task explicitly requests Pro", false)
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; taskId?: string; pro: boolean; json: boolean }) => {
+    const root = resolveWorkspace(opts.workspace);
+    const workspace = new Workspace(root);
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const routed = await ensureWorkspaceRouter(root);
+    const connectorName = readLastEndpoint(routed.anchor.id)?.connectorName ?? connectorNameFor({
+      workspaceName: routed.anchor.name,
+      workspaceId: routed.anchor.id,
+      hadEndpointBefore: true,
+    });
+    const claimed = await claimStandbyConversation({
+      workspaceId: workspace.id,
+      taskId: resolved.taskId,
+      connectorName,
+      workspaceName: workspace.name,
+      branch: gitInfo(workspace.root).branch,
+      userExplicitPro: opts.pro,
+    });
+    let routeToken: string | null = null;
+    let task = claimed.task;
+    if (!claimed.reused || !task.routeCapabilityId) {
+      const route = await issueRouteCapability({
+        workspaceId: workspace.id,
+        taskId: resolved.taskId,
+        conversationId: task.conversationId,
+      });
+      task = await attachTaskRouteCapability(workspace.id, resolved.taskId, route.id);
+      routeToken = route.token;
+    }
+    const payload = {
+      ok: true,
+      workspaceId: workspace.id,
+      taskId: resolved.taskId,
+      taskIdSource: resolved.source,
+      reused: claimed.reused,
+      task,
+      entry: claimed.entry,
+      routeToken,
+      nextAction: task.verificationState === "ready" ? "send_task_message" : "send_boot_prompt",
+    };
+    if (opts.json) say(JSON.stringify(payload));
+    else check(claimed.reused ? "已复用本任务的备用 Chat" : "已领取备用 Chat；发送 Boot Prompt 后核对 workspace_info");
+  });
+
+pool.command("quarantine")
+  .description("Quarantine an invalid or removed standby Chat")
+  .requiredOption("--conversation-id <id>")
+  .requiredOption("--reason <reason>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { conversationId: string; reason: string; json: boolean }) => {
+    const entry = await quarantineStandbyConversation(opts.conversationId, opts.reason);
+    if (opts.json) say(JSON.stringify({ ok: true, entry }));
+    else check(`备用 Chat 已隔离：${entry.conversationId}`);
+  });
+session.command("confirm-workspace")
+  .description("Promote a user-confirmed binding after workspace_info matches")
+  .option("-w, --workspace <path>").option("--task-id <id>")
+  .requiredOption("--observed-workspace-id <id>")
+  .requiredOption("--observed-connector-name <name>")
+  .requiredOption("--observed-workspace-name <name>")
+  .option("--observed-branch <branch>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: {
+    workspace?: string; taskId?: string; observedWorkspaceId: string; observedConnectorName: string;
+    observedWorkspaceName: string; observedBranch?: string; json: boolean;
+  }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
-    const result = clearChatPointer(workspace.id);
-    if (!result.cleared) say("尚未记录 ChatGPT 会话。");
-    else if (result.keptProject) check("已清除当前对话，合集绑定仍保留");
-    else check("已清除会话记录，下次任务将新建 ChatGPT 会话");
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const task = await confirmTaskWorkspace(
+      workspace.id,
+      resolved.taskId,
+      opts.observedWorkspaceId,
+      opts.observedConnectorName,
+      opts.observedWorkspaceName,
+      opts.observedBranch ?? null
+    );
+    if (opts.json) say(JSON.stringify({ ok: true, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    else check("工作区和连接器已核对；会话进入 ready");
+  });
+
+session.command("mark-unavailable")
+  .description("Archive an unavailable conversation and require a replacement generation")
+  .option("-w, --workspace <path>").option("--task-id <id>")
+  .requiredOption("--reason <reason>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; taskId?: string; reason: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const task = await markTaskUnavailable(workspace.id, resolved.taskId, opts.reason);
+    if (opts.json) say(JSON.stringify({ ok: true, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    else check(`第 ${task.generation} 代会话已归档；下一次建档将创建新一代`);
+  });
+
+session.command("record-read")
+  .description("Record the health of the saved exact ChatGPT conversation")
+  .option("-w, --workspace <path>").option("--task-id <id>")
+  .requiredOption("--result <result>", "ok, missing, gone, or timeout")
+  .option("--reason <reason>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; taskId?: string; result: string; reason?: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    if (!/^(ok|missing|gone|timeout)$/u.test(opts.result)) {
+      throw new Error("read result must be ok, missing, gone, or timeout");
+    }
+    const task = await recordTaskReadResult(
+      workspace.id,
+      resolved.taskId,
+      opts.result as "ok" | "missing" | "gone" | "timeout",
+      opts.reason ?? ""
+    );
+    if (opts.json) {
+      say(JSON.stringify({
+        ok: true,
+        workspaceId: workspace.id,
+        taskIdSource: resolved.source,
+        replacementRequired: task.bindingState === "unavailable",
+        task,
+      }));
+    } else if (task.bindingState === "unavailable") {
+      say("已达到会话替换条件；下一步重新建档。");
+    } else {
+      say(`读取状态：${task.channelState}；连续缺失 ${task.consecutiveReadFailures} 次`);
+    }
+  });
+
+function addChannelCommandOptions(command: Command): Command {
+  return command.option("-w, --workspace <path>").option("--task-id <id>").requiredOption("--message-id <id>").option("--json", "machine-readable output", false);
+}
+
+function addObservedIdentityOptions(command: Command): Command {
+  return command
+    .requiredOption("--observed-task-id <id>")
+    .requiredOption("--observed-workspace-id <id>")
+    .requiredOption("--observed-iteration <n>");
+}
+
+addChannelCommandOptions(session.command("begin-send").description("Atomically reserve one outbound ChatGPT message"))
+  .requiredOption("--iteration <n>")
+  .option("--probe", "allow one recovery probe for a degraded channel", false)
+  .option("--bootstrap", "reserve the workspace_info boot message before ready", false)
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; iteration: string; probe: boolean; bootstrap: boolean; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const task = await beginTaskSend(
+      workspace.id,
+      resolved.taskId,
+      opts.messageId,
+      parseInt(opts.iteration, 10),
+      { probe: opts.probe, bootstrap: opts.bootstrap }
+    );
+    if (opts.json) say(JSON.stringify({ ok: true, accepted: true, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    else check(`已保留发送 ${task.pendingMessageId}；尚未确认送达`);
+  });
+
+addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-delivery").description("Confirm an outbound message was observed in ChatGPT")))
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const current = readTaskSession(workspace.id, resolved.taskId);
+    if (!current?.pendingMessageId || current.pendingIteration === undefined) throw new Error("task has no in-flight message");
+    assertReceiptIdentity(
+      { messageId: current.pendingMessageId, taskId: current.taskId, workspaceId: workspace.id, iteration: current.pendingIteration },
+      { messageId: opts.messageId, taskId: opts.observedTaskId, workspaceId: opts.observedWorkspaceId, iteration: parseInt(opts.observedIteration, 10) }
+    );
+    const task = await confirmTaskDelivery(workspace.id, resolved.taskId, opts.messageId);
+    if (opts.json) say(JSON.stringify({ ok: true, accepted: true, delivered: true, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    else check(`已确认送达 ${task.lastDeliveredMessageId}；正在等待回复`);
+  });
+
+addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-reply").description("Confirm a matching ChatGPT reply and complete the iteration")))
+  .requiredOption("--state <state>")
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; state: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const current = readTaskSession(workspace.id, resolved.taskId);
+    if (!current?.pendingMessageId || current.pendingIteration === undefined) throw new Error("task has no in-flight message");
+    assertReceiptIdentity(
+      { messageId: current.pendingMessageId, taskId: current.taskId, workspaceId: workspace.id, iteration: current.pendingIteration },
+      { messageId: opts.messageId, taskId: opts.observedTaskId, workspaceId: opts.observedWorkspaceId, iteration: parseInt(opts.observedIteration, 10) }
+    );
+    const task = await confirmTaskReply(workspace.id, resolved.taskId, opts.messageId, opts.state);
+    if (opts.json) say(JSON.stringify({ ok: true, accepted: true, delivered: true, replied: true, identityVerified: true, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    else check(`已确认回复；任务迭代推进到 ${task.iteration}`);
+  });
+
+addChannelCommandOptions(session.command("fail-delivery").description("Quarantine an unconfirmed direct ChatGPT channel"))
+  .requiredOption("--reason <reason>")
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; reason: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const task = await failTaskDelivery(workspace.id, resolved.taskId, opts.messageId, opts.reason);
+    if (opts.json) say(JSON.stringify({ ok: false, accepted: true, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    else say(`通道已隔离：${task.lastDeliveryError}`);
+  });
+
+session.command("new-message-id").description("Generate a unique C2C delivery receipt id")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    const messageId = newMessageId();
+    if (opts.json) say(JSON.stringify({ ok: true, messageId })); else say(messageId);
+  });
+
+session.command("clear").description("Forget only this task's ChatGPT conversation and provision")
+  .option("-w, --workspace <path>").option("--task-id <id>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; taskId?: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const result = await clearTaskSession(workspace.id, resolved.taskId);
+    if (opts.json) say(JSON.stringify({ ok: true, workspaceId: workspace.id, taskId: resolved.taskId, taskIdSource: resolved.source, ...result }));
+    else if (!result.cleared) say("当前任务尚未记录 ChatGPT 会话。");
+    else check("已清除当前任务会话；项目绑定保持不变");
   });
 
 program

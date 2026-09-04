@@ -4,7 +4,7 @@
 
 > ChatGPT plans and reviews. Codex edits, runs commands, tests, and fixes.
 
-This fork keeps the ChatGPT-web planning workflow while hardening the local
+This fork keeps ChatGPT planning inside the unified Codex App while hardening the local
 Bridge, credential lifecycle, process shutdown, dependency policy, and upstream
 update path. The ChatGPT-facing MCP surface is read-only.
 
@@ -69,7 +69,9 @@ CAPTCHA, two-factor authentication, or a required OpenAI Tunnel credential.
 7. If this account or environment is missing OpenAI Secure MCP Tunnel access,
    stop and explain the exact blocker. Do not enable Cloudflare unless I give
    explicit approval.
-8. Use only the built-in ChatGPT browser surface for ChatGPT setup. Never paste
+8. On first use, the ordinary Chat is created in the background and its binding
+   message is sent automatically. The Skill opens that exact Chat. Set the thinking level to xhigh
+   and confirm the small reminder. Never paste
    repository files, diffs, secrets, tokens, cookies, or long logs into ChatGPT;
    ChatGPT must read workspace context through the read-only MCP tools.
 9. Do not run git pull, dependency upgrades, automatic updater commands, or
@@ -145,6 +147,28 @@ Transport changes are lifecycle-fenced. A failed transition restores the
 previous persisted mode and does not provision credentials for the uncommitted
 mode.
 
+## Global Router and standby Chats
+
+Run `node bin/c2c.js router migrate -w <anchor-workspace> --json` once when
+upgrading an existing connection. Later projects use `router ensure`; they share
+the original OpenAI Secure MCP Tunnel and ChatGPT connector.
+
+Every Codex task permanently claims one ordinary Chat from the global
+**Codex-with-ChatGPT** Project. Users prepare stock Chats at non-Pro xhigh and
+send one user message containing exactly `C2C_STANDBY_READY`. An explicitly Pro
+task uses a separate `C2C_STANDBY_READY_PRO` Chat.
+
+The Skill verifies stock with Codex App background `list_threads` and
+`read_thread`, imports it with `session pool import`, then uses `session pool
+claim`. Claims are FIFO and globally locked; title guesses, recent conversations,
+and cross-task reuse are excluded. Empty stock returns `POOL_EXHAUSTED` before
+task content is sent.
+
+The claim returns a one-time task route token. The Boot Prompt places it in
+`C2C_ROUTE_TOKEN`; every one of the eight MCP calls then includes `route_token`.
+The Router resolves that token to only its bound workspace. Normal Chat control
+uses only `list_threads`, `send_message_to_thread`, and `read_thread`, with
+readback receipts before state advances.
 ## Normal use
 
 After the Skill is installed and the workspace connection is verified, ask

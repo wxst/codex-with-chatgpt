@@ -160,27 +160,48 @@ describe("installation documentation contract", () => {
     }
   });
 
-  it("uses the direct ChatGPT conversation channel for the routine control loop", () => {
+  it("routes task-owned standby Chats through the direct host channel", () => {
     const skill = read("skill/SKILL.md");
     const architecture = read("docs/architecture.md");
     const protocol = read("docs/protocol.md");
+    const cli = read("src/cli/index.ts");
+    const sessionState = read("src/session/state.ts");
+    const verifier = read("scripts/verify-codex-app-host.mjs");
 
-    expect(skill).toContain('kind: "chatgpt"');
+    expect(skill).toContain("C2C_STANDBY_READY");
+    expect(skill).toContain("session pool claim");
+    expect(skill).toContain("C2C_ROUTE_TOKEN");
+    expect(skill).toContain("route_token");
     expect(skill).toContain("send_message_to_thread");
     expect(skill).toContain("read_thread");
-    expect(skill).toContain("Do not open a browser for routine C2C messages");
-    expect(skill).not.toContain(
-      "Use ChatGPT's built-in browser surface for ChatGPT interactions"
-    );
-    expect(skill).not.toContain("browser fallback");
-    expect(skill).not.toContain("Use ChatGPT web as");
-    expect(skill).not.toMatch(/\bChrome\b/iu);
-    expect(architecture).toContain("Direct Chat");
-    expect(architecture).not.toContain("Computer Use = control plane");
-    expect(protocol).toContain("Control plane: Codex App direct messaging");
-    expect(protocol).not.toContain("typed into the ChatGPT UI");
+    expect(skill).toContain("Do not use `wait_threads` for ChatGPT Chats");
+    expect(cli).toContain('.command("router")');
+    expect(cli).toContain('session.command("pool")');
+    expect(cli).toContain('pool.command("claim")');
+    expect(cli).toContain('pool.command("import")');
+    expect(cli).not.toContain('.command("bootstrap-start")');
+    expect(protocol).toContain("ROUTE_ACCESS_DENIED");
+    expect(protocol).toContain("C2C_STANDBY_READY_PRO");
+    expect(architecture).toContain("Global C2C Router");
+    expect(sessionState).toContain("claimStandbyConversation");
+    expect(sessionState).toContain("routeCapabilityId");
+    expect(verifier).toContain('"list_threads"');
+    expect(verifier).toContain('"read_thread"');
+    expect(verifier).toContain('"send_message_to_thread"');
+    expect(verifier).not.toContain("create_chatgpt_conversation");
   });
 
+  it("keeps maximum ChatGPT reasoning offload with repository-aware sources and one writer", () => {
+    const skill = read("skill/SKILL.md");
+    expect(skill).toContain("GitHub connector");
+    expect(skill).toContain("mem / OpenDeepWiki");
+    expect(skill).toContain("current C2C workspace is final authority");
+    expect(skill).toContain("Only the main coordinating agent");
+    expect(skill).toContain("Subagents return findings");
+    expect(skill).toContain("one in-flight request");
+    expect(skill).toContain("xhigh");
+    expect(skill).toContain("Pro");
+  });
   it("documents the two-view Windows legacy cleanup command", () => {
     const cli = read("src/cli/index.ts");
     const troubleshooting = read("docs/troubleshooting.md");
@@ -272,6 +293,10 @@ describe("release automation contract", () => {
       path.join(process.cwd(), ".github", "workflows", "install-smoke.yml"),
       "utf8"
     );
+    const installSmokeScript = fs.readFileSync(
+      path.join(process.cwd(), "scripts", "install-smoke.mjs"),
+      "utf8"
+    );
 
     expect(pkg.scripts?.["smoke:install"]).toBe("node scripts/install-smoke.mjs");
     expect(ci).toContain("ubuntu-24.04");
@@ -280,6 +305,9 @@ describe("release automation contract", () => {
     expect(ci).toContain("pnpm smoke:install");
     expect(installSmoke).toContain("pnpm smoke:install");
     expect(installSmoke).not.toContain("pnpm test:install");
+    expect(installSmokeScript).toContain('["session", "--help"]');
+    expect(installSmokeScript).toContain('["session", "pool", "--help"]');
+    expect(installSmokeScript).toContain("CODEX_THREAD_ID: \"install-smoke-task\"");
   });
 
   it("bounds Windows integration concurrency to a stable level", () => {

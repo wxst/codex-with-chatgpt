@@ -68,6 +68,25 @@ try {
   assert.match(help, /Codex with ChatGPT/u, "CLI help did not identify the product");
   assert.match(help, /transport/u, "CLI help did not expose transport management");
 
+  const sessionHelp = runCli(["session", "--help"], env);
+  assert.match(sessionHelp, /pool/u, "session help did not expose the standby pool");
+  assert.match(sessionHelp, /record-read/u, "session help did not expose exact-conversation health tracking");
+  const sessionState = parseLastJson(runCli(
+    ["session", "get", "-w", workspace, "--task-id", "lower-priority-task", "--json"],
+    { ...env, CODEX_THREAD_ID: "install-smoke-task" }
+  ));
+  assert.equal(sessionState.ok, true);
+  assert.equal(sessionState.taskId, "install-smoke-task");
+  assert.equal(sessionState.taskIdSource, "CODEX_THREAD_ID");
+  assert.equal(sessionState.requiresPoolClaim, true);
+
+  const poolHelp = runCli(["session", "pool", "--help"], env);
+  assert.match(poolHelp, /claim/u, "standby pool help did not expose claim");
+  assert.match(poolHelp, /import/u, "standby pool help did not expose import");
+
+  const routerHelp = runCli(["router", "--help"], env);
+  assert.match(routerHelp, /ensure/u, "router help did not expose ensure");
+
   const initial = parseLastJson(runCli(["transport", "-w", workspace, "--json"], env));
   assert.equal(initial.ok, true);
   assert.equal(initial.mode, "openai");

@@ -4,7 +4,7 @@
 
 > ChatGPT 负责规划和审核，Codex 负责改代码、执行命令、测试和修复。
 
-这个 Fork 保留了“ChatGPT 网页版负责思考、Codex 负责执行”的工作方式，同时
+这个 Fork 保留了“统一 Codex App 内的 ChatGPT 负责思考、Codex 负责执行”的工作方式，同时
 加固了本机 Bridge、凭证生命周期、进程停止、依赖管理和上游同步流程。
 ChatGPT 能看到的 MCP 接口始终只读。
 
@@ -62,7 +62,8 @@ OpenAI Tunnel 凭证时才能打断我，而且一次只让我做一个动作。
    所有参数以当前客户端 help 输出为准，禁止猜测命令行参数。
 7. 如果当前账号或环境缺少 OpenAI Secure MCP Tunnel 访问条件，停止并准确报告阻断点。
    未经我明确同意，不得启用 Cloudflare。
-8. ChatGPT 配置只使用内置浏览器界面。禁止向 ChatGPT 粘贴仓库文件、diff、密钥、
+8. 首次建档由 Codex App 在后台创建普通 Chat 并自动发送身份消息，然后打开这个精确
+   会话。你只需将思考强度设为“极高”，再确认提示框。禁止向 ChatGPT 粘贴仓库文件、diff、密钥、
    Token、Cookie 或长日志；ChatGPT 必须通过只读 MCP 自己读取所需上下文。
 9. 安装和正常使用期间禁止自动更新仓库、升级依赖、执行自动更新命令或自动同步上游。
 10. 最后给出有证据的验收清单，包括：实际 commit、依赖安装、typecheck、全部测试、
@@ -128,9 +129,27 @@ node bin/c2c.js transport -w <workspace> --mode cloudflare --json
 node bin/c2c.js transport -w <workspace> --mode openai --json
 ```
 
-传输模式切换受生命周期锁保护。切换失败时会恢复旧模式，也不会为未完成的模式创建
-新的凭证。
+## 全局 Router 与备用 Chat
 
+升级已有连接时，在当前已连接工作区运行一次：
+`node bin/c2c.js router migrate -w <anchor-workspace> --json`。后续项目运行
+`router ensure` 即可注册，复用原来的 OpenAI Secure MCP Tunnel 和 ChatGPT
+连接器。
+
+每个 Codex 任务会从全局 **Codex-with-ChatGPT** Project 领取一个普通 Chat 并永久
+绑定。用户先手工准备库存：选择非 Pro、思考强度“极高”，并发送一条只含
+`C2C_STANDBY_READY` 的用户消息。当前任务明确要求 Pro 时，只领取使用
+`C2C_STANDBY_READY_PRO` 的独立库存 Chat。
+
+Skill 只通过 Codex App 后台的 `list_threads` 和 `read_thread` 核验库存，再用
+`session pool import` 导入，最后执行 `session pool claim`。领取按 FIFO 并在全局锁
+中完成；标题猜测、最近会话和跨任务复用均不参与。库存为空会返回
+`POOL_EXHAUSTED`，任务正文不会发送。
+
+领取结果包含一次性的任务路由 token。Boot Prompt 以 `C2C_ROUTE_TOKEN` 携带它；8 个
+MCP 工具调用都要附加 `route_token`。Router 只会将该 token 解析到它绑定的工作区。
+日常控制消息只用 `list_threads`、`send_message_to_thread` 和 `read_thread`，必须先
+回读送达和回复，才推进状态。
 ## 正常使用
 
 Skill 安装并完成连接验证后，直接对 Codex 说：

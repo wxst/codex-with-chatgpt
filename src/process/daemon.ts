@@ -180,6 +180,7 @@ export async function ensureBridge(workspaceRoot: string): Promise<{ runtime: Ru
         detached: true,
         stdio: ["ignore", logFd, logFd],
         env: { ...bridgeDaemonEnvironment(workspace), [PENDING_START_ENV]: pending.startId },
+        windowsHide: true,
       });
     } catch (error) {
       cancelPendingStart(workspace.id, pending.startId);

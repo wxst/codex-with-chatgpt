@@ -8,6 +8,7 @@ import { bearerAuth, openAITunnelAuth } from "../auth/middleware.js";
 import { PairingManager } from "../pairing/manager.js";
 import { createMcpServer } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import { CloudflaredNamedTunnel } from "../tunnel/cloudflared-named.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
@@ -147,6 +148,12 @@ export interface BridgeOptions {
   accessTokenTtlMs?: number;
   /** Parent-created one-shot start intent for detached daemon launches. */
   pendingStartId?: string;
+  /**
+   * Replaces the legacy single-workspace MCP server. The transport, pairing,
+   * runtime identity and Tunnel still belong to workspaceRoot (the Router
+   * anchor), while the supplied factory can route each request elsewhere.
+   */
+  mcpServerFactory?: (input: { workspace: Workspace; logger: Logger }) => McpServer;
 }
 
 export interface Bridge {
@@ -252,7 +259,10 @@ async function startBridgeUnlocked(opts: BridgeOptions, workspace: Workspace): P
     })
   );
 
-  const mcpHandler = createMcpHttpHandler(() => createMcpServer({ workspace, logger }), logger);
+  const mcpHandler = createMcpHttpHandler(
+    () => opts.mcpServerFactory?.({ workspace, logger }) ?? createMcpServer({ workspace, logger }),
+    logger
+  );
   const mcpAuth =
     transportMode === "openai"
       ? openAITunnelAuth({ expectedToken: openAITunnelExpectedToken, logger })
