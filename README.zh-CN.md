@@ -55,11 +55,10 @@ OpenAI Tunnel 凭证时才能打断我，而且一次只让我做一个动作。
    __C2C_CHECKOUT__ 替换为仓库绝对路径；不要把机器路径写回仓库模板。
 6. 针对目标代码工作区，严格按安装后的 Skill 做首次配置。保持 openai 传输模式。
    检查官方 OpenAI tunnel client，从 setup 结果读取 `runtimeAlias`，先执行
-   `tunnel-client runtimes status <runtimeAlias> --json`。只有 process_running、healthy、
-   ready 都为 true 且 stale 为 false，才把已有 runtime 视为健康；此时不要求当前 Codex
-   进程带控制面变量。只有启动或重连 runtime 时，才检查该启动环境中是否存在
-   CONTROL_PLANE_TUNNEL_ID 和 CONTROL_PLANE_API_KEY，全程不显示、打印或粘贴它们的值。
-   所有参数以当前客户端 help 输出为准，禁止猜测命令行参数。
+   `node bin/c2c.js runtime diagnose -w <workspace> --json`。C2C Runtime 只读取
+   `.config/codex-with-chatgpt` 下的 CurrentUser DPAPI Key 与 Tunnel ID 文件；用户环境和
+   Codex 父进程里的 Key 均在调用链外。只有 process_running、healthy、ready 都为 true
+   且 stale 为 false，才把已有 runtime 视为健康。所有参数以当前客户端 help 输出为准，禁止猜测命令行参数。
 7. 如果当前账号或环境缺少 OpenAI Secure MCP Tunnel 访问条件，停止并准确报告阻断点。
    未经我明确同意，不得启用 Cloudflare。
 8. 首次建档由 Codex App 在后台创建普通 Chat 并自动发送身份消息，然后打开这个精确
@@ -112,9 +111,10 @@ node bin/c2c.js transport -w <workspace> --mode openai --json
 node bin/c2c.js setup -w <workspace> --json
 ```
 
-配置结果会给出本机回环 MCP 地址、本机 Token 文件路径和官方 OpenAI Tunnel 客户端
-使用的 runtime alias。OpenAI 控制面凭证只保存在运行环境中，不能打印、提交到仓库
-或粘贴进 ChatGPT。
+配置结果会给出本机回环 MCP 地址、本机 Token 文件路径和托管 runtime alias。C2C
+Runtime 的唯一控制面凭据来自
+`%USERPROFILE%/.config/codex-with-chatgpt` 下的 CurrentUser DPAPI 文件；它绕过用户
+环境和父进程继承的 Key。Key 不会打印、提交到仓库或粘贴进 ChatGPT。
 
 OpenAI Tunnel 不可用时，正确行为是停止并说明原因。只有得到用户明确批准，才可以
 切换到 Cloudflare 备用方案：
@@ -155,10 +155,16 @@ MCP 工具调用都要附加 `route_token`。Router 只会将该 token 解析到
 下一次任务先读取同一条在途消息。
 
 修改托管 Runtime 前，运行 `node bin/c2c.js runtime diagnose -w <workspace> --json`。
-它只报告 C2C 当前令牌文件路径和生效引用来源，不输出密钥。持久 profile 的
-`legacy_path` 可用 `runtime repair-profile` 原子修复；只出现在环境中的旧路径属于
-Runtime 启动器，使用 `runtime repair-user-environment` 更新后重启 Codex。`invalid_runtime_api_key` 表示官方 Runtime API Key 需要先取得用户
-确认再轮换。Runtime 已停止、Key 失效和 `POOL_EXHAUSTED` 是三种独立状态。
+Runtime 唯一 Key 来源是 `%USERPROFILE%/.config/codex-with-chatgpt/tunnel-runtime-key.dpapi`。
+短生命周期子进程先清理继承的控制面 Key，再读取该 DPAPI Key 并读取精确 Tunnel。
+`credentialSource: managed_dpapi` 加 `credentialState: verified` 表示验证通过；
+`credentialState: invalid` 表示这把 DPAPI Key 收到 `401 invalid_api_key`，此时才进入轮换流程；
+`missing` 表示 DPAPI 文件需要恢复。令牌文件路径修复与 Runtime Key 健康状态保持分离。
+
+Windows 上由 `scripts/start-managed-openai-tunnel.ps1` 统一负责托管 Runtime
+的启动、重连、watchdog 和停止。它只把新解密的 DPAPI Key 注入短生命周期的
+`tunnel-client` 子进程，并以 `c2c runtime diagnose` 查询状态。不要从继承的
+Codex/用户环境直接调用 Runtime status 或 stop。
 ## 正常使用
 
 Skill 安装并完成连接验证后，直接对 Codex 说：

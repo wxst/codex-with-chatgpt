@@ -51,15 +51,21 @@ only sets `degraded`; it does not replace the Chat. Empty compatible stock yield
 
 ## Runtime configuration health
 
-`c2c runtime diagnose` compares the anchor's canonical C2C token-file path
-with the effective launch-environment or persisted-profile header reference.
-It returns paths and state only, never credential contents. A stale persisted
-profile reference is repaired with an atomic replacement after an exact
-preflight match. A stale process-environment reference is repaired atomically
-in the future Windows user-environment launch value; the running Codex process
-still needs a restart. Runtime
-health separately reports stopped, unhealthy, stale, and confirmed
-`invalid_runtime_api_key` states.
+`c2c runtime diagnose` probes the anchor through exactly one source: the
+CurrentUser DPAPI Runtime Key and Tunnel-ID files in
+`%USERPROFILE%/.config/codex-with-chatgpt`. Its child clears inherited
+control-plane variables before decrypting that source. The result exposes only
+`credentialSource: managed_dpapi`, `credentialState`, health flags, and a
+sanitized `401 invalid_api_key` code when relevant. `verified` means the
+managed Key read the exact Tunnel, `invalid` means that same Key received 401,
+and `missing` means its DPAPI source needs restoration. Header-path repair
+remains a separate local-token routing concern.
+
+On Windows, `scripts/start-managed-openai-tunnel.ps1` is the only managed
+Runtime start, reconnect, watchdog, and stop path. It clears inherited
+control-plane values and injects the DPAPI credential only for the scoped
+`tunnel-client` child. Runtime health checks call `c2c runtime diagnose`, not a
+raw `tunnel-client runtimes status` command under the Codex/user environment.
 
 ## Boot and direct delivery
 

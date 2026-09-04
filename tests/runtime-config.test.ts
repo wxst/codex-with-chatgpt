@@ -2,8 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  buildManagedRuntimeEnvironment,
   diagnoseRuntimeHeader,
   diagnoseWindowsUserRuntimeHeader,
+  probeManagedRuntime,
+  summarizeManagedRuntimeProbe,
   repairRuntimeProfileHeader,
   repairWindowsUserRuntimeHeader,
   tunnelHeaderFileReference,
@@ -23,6 +26,148 @@ afterEach(() => {
 });
 
 describe("OpenAI runtime token-file diagnostics", () => {
+  it("uses the canonical DPAPI paths and removes inherited runtime credentials", () => {
+    const root = temp();
+    const environment = buildManagedRuntimeEnvironment({
+      inherited: {
+        CONTROL_PLANE_API_KEY: "stale-user-key",
+        CONTROL_PLANE_TUNNEL_ID: "stale-tunnel-id",
+        PATH: "test-path",
+      },
+      keyFile: path.join(root, "tunnel-runtime-key.dpapi"),
+      tunnelIdFile: path.join(root, "tunnel-runtime-id.dpapi"),
+      runtimeAlias: "c2c-test",
+    });
+
+    expect(environment).toMatchObject({
+      PATH: "test-path",
+      C2C_MANAGED_RUNTIME_KEY_FILE: path.join(root, "tunnel-runtime-key.dpapi"),
+      C2C_MANAGED_RUNTIME_TUNNEL_ID_FILE: path.join(root, "tunnel-runtime-id.dpapi"),
+      C2C_MANAGED_RUNTIME_ALIAS: "c2c-test",
+    });
+    expect(environment.CONTROL_PLANE_API_KEY).toBeUndefined();
+    expect(environment.CONTROL_PLANE_TUNNEL_ID).toBeUndefined();
+    expect(JSON.stringify(environment)).not.toContain("stale-user-key");
+  });
+
+  it("treats only the DPAPI probe result as the runtime credential state", () => {
+    expect(summarizeManagedRuntimeProbe({
+      credentialState: "verified",
+      runtime: { process_running: true, healthy: true, ready: true, stale: false },
+    })).toMatchObject({
+      credentialSource: "managed_dpapi",
+      credentialState: "verified",
+      processRunning: true,
+      healthy: true,
+      ready: true,
+      stale: false,
+    });
+
+    expect(summarizeManagedRuntimeProbe({
+      credentialState: "invalid",
+      remoteLookup: { status: 401, code: "invalid_api_key" },
+      runtime: { process_running: false, healthy: false, ready: false, stale: true },
+    })).toMatchObject({
+      credentialSource: "managed_dpapi",
+      credentialState: "invalid",
+      remoteLookup: { status: 401, code: "invalid_api_key" },
+    });
+
+    expect(summarizeManagedRuntimeProbe({ credentialState: "missing" })).toMatchObject({
+      credentialSource: "managed_dpapi",
+      credentialState: "missing",
+      processRunning: false,
+      healthy: false,
+      ready: false,
+      stale: true,
+    });
+  });
+
+  it("runs the managed probe with DPAPI file references instead of an inherited Key", () => {
+    const root = temp();
+    const keyFile = path.join(root, "tunnel-runtime-key.dpapi");
+    const tunnelIdFile = path.join(root, "tunnel-runtime-id.dpapi");
+    const result = probeManagedRuntime({
+      platform: "win32",
+      inherited: { CONTROL_PLANE_API_KEY: "stale-user-key", PATH: "test-path" },
+      keyFile,
+      tunnelIdFile,
+      runtimeAlias: "c2c-test",
+      run: (command, args, options) => {
+        expect(command).toMatch(/powershell\.exe$/iu);
+        expect(args).toContain("-EncodedCommand");
+        expect(options.env).toMatchObject({
+          C2C_MANAGED_RUNTIME_KEY_FILE: keyFile,
+          C2C_MANAGED_RUNTIME_TUNNEL_ID_FILE: tunnelIdFile,
+          C2C_MANAGED_RUNTIME_ALIAS: "c2c-test",
+        });
+        expect(options.env.CONTROL_PLANE_API_KEY).toBeUndefined();
+        expect(JSON.stringify(options.env)).not.toContain("stale-user-key");
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            credentialState: "verified",
+            runtime: { process_running: true, healthy: true, ready: true, stale: false },
+          }),
+          stderr: "tunnel-client emitted a non-JSON diagnostic on stderr",
+        };
+      },
+    });
+
+    expect(result).toMatchObject({
+      credentialSource: "managed_dpapi",
+      credentialState: "verified",
+      processRunning: true,
+      ready: true,
+    });
+  });
+
+  it("maps the managed DPAPI probe's 401 and missing outcomes without consulting a parent Key", () => {
+    const root = temp();
+    const shared = {
+      platform: "win32" as const,
+      inherited: { CONTROL_PLANE_API_KEY: "stale-user-key" },
+      keyFile: path.join(root, "tunnel-runtime-key.dpapi"),
+      tunnelIdFile: path.join(root, "tunnel-runtime-id.dpapi"),
+      runtimeAlias: "c2c-test",
+    };
+
+    const invalid = probeManagedRuntime({
+      ...shared,
+      run: (_command, _args, options) => {
+        expect(options.env.CONTROL_PLANE_API_KEY).toBeUndefined();
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            credentialState: "invalid",
+            remoteLookup: { status: 401, code: "invalid_api_key" },
+          }),
+          stderr: "",
+        };
+      },
+    });
+    expect(invalid).toMatchObject({
+      credentialSource: "managed_dpapi",
+      credentialState: "invalid",
+      remoteLookup: { status: 401, code: "invalid_api_key" },
+    });
+
+    const missing = probeManagedRuntime({
+      ...shared,
+      run: () => ({
+        status: 0,
+        stdout: JSON.stringify({ credentialState: "missing", errorClass: "managed_credential_file_missing" }),
+        stderr: "",
+      }),
+    });
+    expect(missing).toMatchObject({
+      credentialSource: "managed_dpapi",
+      credentialState: "missing",
+      errorClass: "managed_credential_file_missing",
+    });
+    expect(JSON.stringify({ invalid, missing })).not.toContain("stale-user-key");
+  });
+
   it("recognizes the effective environment reference and never exposes runtime API keys", () => {
     const root = temp();
     const canonical = path.join(root, "state", "transports", "workspace.token");

@@ -141,23 +141,61 @@ describe("installation documentation contract", () => {
 
   it("checks an existing managed runtime before requesting tunnel credentials", () => {
     const skill = read("skill/SKILL.md");
-    const statusCheck = skill.indexOf("tunnel-client runtimes status <runtimeAlias> --json");
-    const credentialCheck = skill.indexOf("When a start or reconnect is required");
+    const statusCheck = skill.indexOf("runtime diagnose -w <workspace> --json");
+    const credentialCheck = skill.indexOf("credentialSource: managed_dpapi");
 
     expect(statusCheck).toBeGreaterThan(-1);
     expect(credentialCheck).toBeGreaterThan(statusCheck);
-    expect(skill).toContain(
-      "Missing control-plane variables in the current Codex process are not a failure when that managed runtime is already healthy"
-    );
-    expect(skill).toContain("process_running, healthy, ready, and stale");
+    expect(skill).toContain("tunnel-runtime-key.dpapi");
+    expect(skill).toContain("outside the C2C");
 
     for (const file of ["README.md", "README.zh-CN.md"]) {
       const instructions = read(file);
-      const readmeStatusCheck = instructions.indexOf("tunnel-client runtimes status <runtimeAlias> --json");
-      const readmeCredentialCheck = instructions.indexOf("CONTROL_PLANE_TUNNEL_ID");
+      const readmeStatusCheck = instructions.indexOf("runtime diagnose -w <workspace> --json");
+      const readmeCredentialCheck = instructions.indexOf("DPAPI");
       expect(readmeStatusCheck, file).toBeGreaterThan(-1);
       expect(readmeCredentialCheck, file).toBeGreaterThan(readmeStatusCheck);
     }
+  });
+
+  it("uses the DPAPI probe as the only runtime diagnosis source", () => {
+    const cli = read("src/cli/index.ts");
+    const start = cli.indexOf('runtime.command("diagnose", { isDefault: true })');
+    const end = cli.indexOf('runtime.command("repair-profile")', start);
+    const diagnosis = cli.slice(start, end);
+
+    expect(diagnosis).toContain("const runtime = runtimeStatusSummary(runtimeAlias);");
+    expect(diagnosis).toContain("runtime,");
+    expect(diagnosis).not.toContain("header:");
+    expect(diagnosis).not.toContain("futureUserEnvironment");
+    expect(diagnosis).not.toContain("MCP_EXTRA_HEADERS");
+  });
+
+  it("does not advertise inherited control-plane environment keys for managed Runtime setup", () => {
+    const cli = read("src/cli/index.ts");
+    const setup = cli.slice(cli.indexOf("// ---------------------------------------------------------------- setup"), cli.indexOf("// ---------------------------------------------------------------- transport"));
+    const transport = cli.slice(cli.indexOf("// ---------------------------------------------------------------- transport"), cli.indexOf("// ---------------------------------------------------------------- stop / restart"));
+    const readme = `${read("README.md")}\n${read("README.zh-CN.md")}`;
+
+    expect(setup).not.toContain("runtimeApiKeyEnv");
+    expect(setup).not.toContain("tunnelIdEnv");
+    expect(setup).not.toContain("CONTROL_PLANE_API_KEY 只放环境变量");
+    expect(transport).not.toContain("runtimeApiKeyEnv");
+    expect(transport).not.toContain("tunnelIdEnv");
+    expect(readme).not.toContain("credentials stay in environment variables");
+    expect(readme).toContain("managed DPAPI");
+  });
+
+  it("ships one managed-DPAPI launcher for runtime connect and stop", () => {
+    const launcher = read("scripts/start-managed-openai-tunnel.ps1");
+
+    expect(launcher).toContain("tunnel-runtime-key.dpapi");
+    expect(launcher).toContain("tunnel-runtime-id.dpapi");
+    expect(launcher).toContain("Remove-Item Env:CONTROL_PLANE_API_KEY, Env:CONTROL_PLANE_TUNNEL_ID");
+    expect(launcher).toContain("runtimes connect");
+    expect(launcher).toContain("runtimes stop");
+    expect(launcher).toContain("runtime diagnose -w");
+    expect(launcher).not.toContain("runtimes status");
   });
 
   it("routes task-owned standby Chats through the direct host channel", () => {
@@ -195,8 +233,11 @@ describe("installation documentation contract", () => {
     expect(verifier).toContain('"send_message_to_thread"');
     expect(verifier).not.toContain("create_chatgpt_conversation");
     expect(skill).toContain("runtime diagnose -w <workspace> --json");
-    expect(skill).toContain("invalid_runtime_api_key");
-    expect(skill).toContain("legacy_path");
+    expect(skill).toContain("managed_dpapi");
+    expect(skill).toContain("tunnel-runtime-key.dpapi");
+    expect(skill).not.toContain("invalid_runtime_api_key");
+    expect(skill).toContain("runtime repair-profile");
+    expect(cli).toContain("probeManagedRuntime({ runtimeAlias })");
   });
 
   it("keeps maximum ChatGPT reasoning offload with repository-aware sources and one writer", () => {

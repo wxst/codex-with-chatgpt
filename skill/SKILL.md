@@ -68,35 +68,45 @@ and connector.
 
 ## Tunnel runtime health
 
-Before reconnecting an existing Router anchor, inspect it with
-`tunnel-client runtimes status <runtimeAlias> --json`. Treat
-`process_running, healthy, ready, and stale` together. Missing control-plane variables in the current Codex process are not a failure when that managed runtime is already healthy. When a start or reconnect is required, place
-`CONTROL_PLANE_TUNNEL_ID` and `CONTROL_PLANE_API_KEY` only in that runtime
-launch environment; never print them.
-
-Use the C2C diagnosis before changing a runtime profile:
+Use the C2C diagnosis before inspecting or reconnecting a Router anchor:
 
 ```text
 node "__C2C_CHECKOUT__/bin/c2c.js" runtime diagnose -w <workspace> --json
 ```
+
+Runtime checks use only the canonical CurrentUser DPAPI files:
+
+```text
+%USERPROFILE%\.config\codex-with-chatgpt\tunnel-runtime-key.dpapi
+%USERPROFILE%\.config\codex-with-chatgpt\tunnel-runtime-id.dpapi
+```
+
+The probe clears inherited `CONTROL_PLANE_API_KEY` and
+`CONTROL_PLANE_TUNNEL_ID`, then decrypts those files inside its short-lived
+PowerShell child. User-environment and Codex-parent Keys stay outside the C2C
+Runtime call path.
+
+On Windows, the bundled `scripts/start-managed-openai-tunnel.ps1` owns managed
+Runtime start, reconnect, watchdog, and stop. It clears inherited control-plane
+variables, injects the DPAPI Key only into its short-lived `tunnel-client`
+child, and asks `c2c runtime diagnose` for every status check. Do not run raw
+`tunnel-client runtimes status` or `stop` from the Codex parent environment.
 
 Interpret the result exactly:
 
 - `POOL_EXHAUSTED`: standby inventory is empty; synchronize it before a claim.
 - `processRunning: false`, `healthy: false`, or `ready: false`: the managed
   Tunnel is stopped; restart its existing runtime launcher and recheck.
-- `credentialState: invalid_runtime_api_key`: the official Runtime API key is
-  invalid; obtain an explicit user confirmation immediately before creating or
-  rotating it in the official runtime settings. Keep the new value only in the
-  local runtime launcher secret store.
-- `header.state: legacy_path` with `header.source: profile`: run
-  `runtime repair-profile` for that same workspace, then reconnect the original
-  alias. It atomically updates only the stale token-file path.
-- `header.state: legacy_path` with `header.source: environment`: the stale path
-  belongs to the current app process. Run `runtime repair-user-environment` to
-  atomically update the future Windows user-environment launch value, then
-  restart Codex. Do not copy a token into a profile; the managed launcher still
-  obtains the canonical path from `c2c setup` when it starts the runtime.
+- `credentialSource: managed_dpapi` and `credentialState: verified`: the
+  managed Key successfully read the exact Tunnel.
+- `credentialState: invalid`: the managed DPAPI Key received
+  `401 invalid_api_key`; obtain explicit user confirmation immediately before
+  rotating it in official runtime settings.
+- `credentialState: missing`: the managed DPAPI files need restoration before
+  a Runtime reconnect.
+- `runtime repair-profile` and `runtime repair-user-environment` repair only
+  C2C local token-file paths. They never select or replace the managed Runtime
+  Key.
 
 Neither diagnostic nor normal control traffic uses browser, UIA, ChatGPT
 Classic, or ChatGPT Work.

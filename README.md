@@ -60,12 +60,12 @@ CAPTCHA, two-factor authentication, or a required OpenAI Tunnel credential.
 6. For the target workspace run the installed Skill's first-time checks using
    node bin/c2c.js. Keep transport mode openai. Verify the official OpenAI
    tunnel client, read `runtimeAlias` from setup, and run
-   `tunnel-client runtimes status <runtimeAlias> --json` first. A runtime is
-   already configured when process_running, healthy, and ready are true and
-   stale is false. Only when starting or reconnecting it, check that
-   CONTROL_PLANE_TUNNEL_ID and CONTROL_PLANE_API_KEY are present in that launch
-   environment without printing their values. Follow the installed client's
-   current help output rather than guessing flags.
+   `node bin/c2c.js runtime diagnose -w <workspace> --json` first. C2C probes
+   the runtime only through the canonical CurrentUser DPAPI Key and Tunnel-ID
+   files under `.config/codex-with-chatgpt`; inherited user and parent-process
+   Keys stay outside that call path. A runtime is healthy when process_running,
+   healthy, and ready are true and stale is false. Follow the installed
+   client's current help output rather than guessing flags.
 7. If this account or environment is missing OpenAI Secure MCP Tunnel access,
    stop and explain the exact blocker. Do not enable Cloudflare unless I give
    explicit approval.
@@ -126,9 +126,11 @@ node bin/c2c.js setup -w <workspace> --json
 ```
 
 The setup result provides the loopback MCP URL, the owner-only local token-file
-path, and the runtime alias expected by the official OpenAI tunnel client. The
-OpenAI control-plane credentials stay in environment variables and must never
-be printed, committed, or pasted into ChatGPT.
+path, and the managed runtime alias. C2C Runtime reads its sole control-plane
+credential from the CurrentUser DPAPI files under
+`%USERPROFILE%/.config/codex-with-chatgpt`; it bypasses inherited user and
+parent-process Keys. The Key is never printed, committed, or pasted into
+ChatGPT.
 
 If the official Tunnel connection is unavailable, the safe result is a clear
 blocker. Cloudflare may be selected only after explicit approval:
@@ -173,13 +175,20 @@ readback receipts before state advances. An accepted send whose user turn is
 late stays in flight; it is not resent or moved to another Chat.
 
 Run `node bin/c2c.js runtime diagnose -w <workspace> --json` before changing a
-managed runtime. It reports the canonical C2C token-file path and the effective
-header source without printing secrets. A `legacy_path` from a persisted profile
-can be repaired atomically with `runtime repair-profile`; an environment-only
-reference uses `runtime repair-user-environment` and a Codex restart.
-`invalid_runtime_api_key` means the
-official Runtime API key needs a confirmed rotation. A stopped runtime, an
-invalid key, and `POOL_EXHAUSTED` remain separate states.
+managed runtime. The Runtime Key source is always the canonical CurrentUser
+DPAPI file `%USERPROFILE%/.config/codex-with-chatgpt/tunnel-runtime-key.dpapi`.
+The child probe clears inherited control-plane Key values, reads that DPAPI Key,
+and performs a read of the exact Tunnel. `credentialSource: managed_dpapi` with
+`credentialState: verified` confirms it. `credentialState: invalid` means that
+same managed Key received `401 invalid_api_key` and needs a confirmed rotation;
+`missing` means the managed DPAPI files need restoration. Header-path repairs
+remain separate from Runtime Key health.
+
+On Windows, `scripts/start-managed-openai-tunnel.ps1` is the managed start,
+reconnect, watchdog, and stop path. It gives `tunnel-client` only a freshly
+decrypted DPAPI Key in a short-lived child and uses `c2c runtime diagnose` for
+each status check. Do not invoke raw Runtime status or stop commands from an
+inherited Codex/user environment.
 ## Normal use
 
 After the Skill is installed and the workspace connection is verified, ask

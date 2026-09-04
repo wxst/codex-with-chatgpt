@@ -33,7 +33,47 @@ export interface WindowsUserEnvironmentHeaderDiagnosis {
   state: RuntimeHeaderState;
 }
 
+export type ManagedRuntimeCredentialState = "verified" | "invalid" | "missing";
+
+export interface ManagedRuntimeCredentialFiles {
+  keyFile: string;
+  tunnelIdFile: string;
+}
+
+export interface ManagedRuntimeProbe {
+  credentialState: ManagedRuntimeCredentialState;
+  remoteLookup?: { status?: unknown; code?: unknown };
+  runtime?: {
+    process_running?: unknown;
+    healthy?: unknown;
+    ready?: unknown;
+    stale?: unknown;
+  };
+  errorClass?: string;
+}
+
+export interface ManagedRuntimeSummary {
+  available: boolean;
+  credentialSource: "managed_dpapi";
+  credentialState: ManagedRuntimeCredentialState;
+  processRunning: boolean;
+  healthy: boolean;
+  ready: boolean;
+  stale: boolean;
+  remoteLookup: { status: unknown; code: unknown } | null;
+  errorClass?: string;
+}
+
 type CommandRunner = (command: string, args: string[]) => Pick<SpawnSyncReturns<string>, "status" | "stdout" | "stderr" | "error">;
+type ManagedRuntimeProbeRunner = (
+  command: string,
+  args: string[],
+  options: { env: NodeJS.ProcessEnv },
+) => Pick<SpawnSyncReturns<string>, "status" | "stdout" | "stderr" | "error">;
+
+const MANAGED_RUNTIME_KEY_FILE_ENV = "C2C_MANAGED_RUNTIME_KEY_FILE";
+const MANAGED_RUNTIME_TUNNEL_ID_FILE_ENV = "C2C_MANAGED_RUNTIME_TUNNEL_ID_FILE";
+const MANAGED_RUNTIME_ALIAS_ENV = "C2C_MANAGED_RUNTIME_ALIAS";
 
 function normalizedPath(value: string): string {
   const resolved = path.resolve(value);
@@ -42,6 +82,180 @@ function normalizedPath(value: string): string {
 
 function samePath(left: string, right: string): boolean {
   return normalizedPath(left) === normalizedPath(right);
+}
+
+/** The managed launcher and every C2C runtime probe share these DPAPI paths. */
+export function defaultManagedRuntimeCredentialFiles(home = os.homedir()): ManagedRuntimeCredentialFiles {
+  const root = path.join(home, ".config", "codex-with-chatgpt");
+  return {
+    keyFile: path.join(root, "tunnel-runtime-key.dpapi"),
+    tunnelIdFile: path.join(root, "tunnel-runtime-id.dpapi"),
+  };
+}
+
+/**
+ * Child runtime tools receive only non-secret DPAPI file references. Any
+ * inherited control-plane values are deliberately excluded before PowerShell
+ * decrypts the managed secret in its own process.
+ */
+export function buildManagedRuntimeEnvironment(options: {
+  inherited?: NodeJS.ProcessEnv;
+  keyFile: string;
+  tunnelIdFile: string;
+  runtimeAlias: string;
+}): NodeJS.ProcessEnv {
+  const environment = { ...(options.inherited ?? process.env) };
+  delete environment.CONTROL_PLANE_API_KEY;
+  delete environment.CONTROL_PLANE_TUNNEL_ID;
+  environment[MANAGED_RUNTIME_KEY_FILE_ENV] = path.resolve(options.keyFile);
+  environment[MANAGED_RUNTIME_TUNNEL_ID_FILE_ENV] = path.resolve(options.tunnelIdFile);
+  environment[MANAGED_RUNTIME_ALIAS_ENV] = options.runtimeAlias;
+  return environment;
+}
+
+/** Convert the sanitized PowerShell probe record into the public CLI shape. */
+export function summarizeManagedRuntimeProbe(probe: ManagedRuntimeProbe): ManagedRuntimeSummary {
+  const runtime = probe.runtime;
+  const remote = probe.remoteLookup;
+  const available = probe.credentialState === "verified" && Boolean(runtime);
+  return {
+    available,
+    credentialSource: "managed_dpapi",
+    credentialState: probe.credentialState,
+    processRunning: runtime?.process_running === true,
+    healthy: runtime?.healthy === true,
+    ready: runtime?.ready === true,
+    stale: runtime?.stale === true || !runtime,
+    remoteLookup: remote ? { status: remote.status ?? null, code: remote.code ?? null } : null,
+    ...(probe.errorClass ? { errorClass: probe.errorClass } : {}),
+  };
+}
+
+function managedRuntimeProbeScript(): string {
+  return `
+$ErrorActionPreference = "Stop"
+$apiBytes = $null
+$tunnelIdBytes = $null
+
+function Emit-Probe([hashtable]$Value) {
+  [Console]::Out.Write(($Value | ConvertTo-Json -Compress -Depth 12))
+}
+
+try {
+  $keyFile = $env:C2C_MANAGED_RUNTIME_KEY_FILE
+  $tunnelIdFile = $env:C2C_MANAGED_RUNTIME_TUNNEL_ID_FILE
+  $alias = $env:C2C_MANAGED_RUNTIME_ALIAS
+  if ([string]::IsNullOrWhiteSpace($keyFile) -or [string]::IsNullOrWhiteSpace($tunnelIdFile) -or
+      [string]::IsNullOrWhiteSpace($alias) -or -not (Test-Path -LiteralPath $keyFile -PathType Leaf) -or
+      -not (Test-Path -LiteralPath $tunnelIdFile -PathType Leaf)) {
+    Emit-Probe @{ credentialState = "missing"; errorClass = "managed_credential_file_missing" }
+    exit 0
+  }
+
+  Add-Type -AssemblyName System.Security
+  $apiBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+    [IO.File]::ReadAllBytes($keyFile), $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+  )
+  $tunnelIdBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+    [IO.File]::ReadAllBytes($tunnelIdFile), $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+  )
+  $env:CONTROL_PLANE_API_KEY = [Text.Encoding]::UTF8.GetString($apiBytes)
+  $tunnelId = [Text.Encoding]::UTF8.GetString($tunnelIdBytes)
+
+  try {
+    $response = Invoke-WebRequest -UseBasicParsing -Method Get -Uri ("https://api.openai.com/v1/tunnels/" + $tunnelId) -Headers @{ Authorization = ("Bearer " + $env:CONTROL_PLANE_API_KEY) } -TimeoutSec 20
+    if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
+      Emit-Probe @{ credentialState = "missing"; errorClass = "managed_control_plane_probe_failed" }
+      exit 0
+    }
+  }
+  catch {
+    $status = $null
+    if ($null -ne $_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+    if ($status -eq 401) {
+      Emit-Probe @{ credentialState = "invalid"; remoteLookup = @{ status = 401; code = "invalid_api_key" } }
+      exit 0
+    }
+    Emit-Probe @{ credentialState = "missing"; errorClass = "managed_control_plane_probe_failed" }
+    exit 0
+  }
+
+  $raw = (& tunnel-client runtimes status $alias --json 2>&1 | Out-String)
+  $start = $raw.IndexOf("{")
+  if ($start -lt 0) {
+    Emit-Probe @{ credentialState = "verified"; errorClass = "runtime_status_unparseable" }
+    exit 0
+  }
+  $runtime = $raw.Substring($start) | ConvertFrom-Json
+  Emit-Probe @{ credentialState = "verified"; runtime = $runtime }
+}
+catch {
+  Emit-Probe @{ credentialState = "missing"; errorClass = "managed_credential_unreadable" }
+}
+finally {
+  Remove-Item Env:CONTROL_PLANE_API_KEY, Env:CONTROL_PLANE_TUNNEL_ID -ErrorAction SilentlyContinue
+  if ($null -ne $apiBytes) { [Array]::Clear($apiBytes, 0, $apiBytes.Length) }
+  if ($null -ne $tunnelIdBytes) { [Array]::Clear($tunnelIdBytes, 0, $tunnelIdBytes.Length) }
+}
+`;
+}
+
+function powershellExecutable(): string {
+  const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+  return systemRoot ? path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe") : "powershell.exe";
+}
+
+function parseManagedRuntimeProbe(raw: string): ManagedRuntimeProbe | null {
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  try {
+    const value = JSON.parse(raw.slice(start)) as Partial<ManagedRuntimeProbe>;
+    if (value.credentialState !== "verified" && value.credentialState !== "invalid" && value.credentialState !== "missing") {
+      return null;
+    }
+    return value as ManagedRuntimeProbe;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run the read-only runtime check under the single managed DPAPI credential.
+ * The parent process Key is removed before PowerShell starts and is never read.
+ */
+export function probeManagedRuntime(options: {
+  runtimeAlias: string;
+  keyFile?: string;
+  tunnelIdFile?: string;
+  inherited?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  run?: ManagedRuntimeProbeRunner;
+}): ManagedRuntimeSummary {
+  if ((options.platform ?? process.platform) !== "win32") {
+    return summarizeManagedRuntimeProbe({ credentialState: "missing", errorClass: "managed_dpapi_windows_only" });
+  }
+  const defaults = defaultManagedRuntimeCredentialFiles();
+  const environment = buildManagedRuntimeEnvironment({
+    inherited: options.inherited,
+    keyFile: options.keyFile ?? defaults.keyFile,
+    tunnelIdFile: options.tunnelIdFile ?? defaults.tunnelIdFile,
+    runtimeAlias: options.runtimeAlias,
+  });
+  const encoded = Buffer.from(managedRuntimeProbeScript(), "utf16le").toString("base64");
+  const result = (options.run ?? ((command, args, runtimeOptions) => spawnSync(command, args, {
+    encoding: "utf8",
+    windowsHide: true,
+    env: runtimeOptions.env,
+  })))
+    (powershellExecutable(), ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], { env: environment });
+  // The helper writes its sole JSON record to stdout. tunnel-client may write
+  // diagnostics to stderr after that record, so combining the streams would
+  // turn a valid result into malformed JSON.
+  const probe = parseManagedRuntimeProbe(result.stdout ?? "");
+  return summarizeManagedRuntimeProbe(probe ?? {
+    credentialState: "missing",
+    errorClass: result.error ? "managed_runtime_probe_unavailable" : "managed_runtime_probe_unparseable",
+  });
 }
 
 /** Extract only the local tunnel-token file reference, never its contents. */

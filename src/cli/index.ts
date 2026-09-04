@@ -40,7 +40,7 @@ import {
 import {
   defaultRuntimeProfileFile,
   diagnoseRuntimeHeader,
-  diagnoseWindowsUserRuntimeHeader,
+  probeManagedRuntime,
   repairRuntimeProfileHeader,
   repairWindowsUserRuntimeHeader,
 } from "../tunnel/runtime-config.js";
@@ -102,50 +102,7 @@ function routerAnchorForWorkspace(root: string): Workspace {
 }
 
 function runtimeStatusSummary(runtimeAlias: string): Record<string, unknown> {
-  const result = spawnSync("tunnel-client", ["runtimes", "status", runtimeAlias, "--json"], {
-    encoding: "utf8",
-    windowsHide: true,
-  });
-  const raw = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
-  const start = raw.indexOf("{");
-  if (start < 0) {
-    return {
-      available: false,
-      processRunning: false,
-      healthy: false,
-      ready: false,
-      stale: true,
-      errorClass: result.error ? "runtime_status_unavailable" : "runtime_status_unparseable",
-    };
-  }
-  try {
-    const value = JSON.parse(raw.slice(start)) as Record<string, unknown>;
-    const remote = value.remote_lookup_error as { status?: unknown; code?: unknown } | undefined;
-    const remoteError = typeof value.remote_error === "string" ? value.remote_error : "";
-    const invalidRuntimeKey =
-      (remote?.status === 401 && remote?.code === "invalid_api_key")
-      || /\b401\b[\s\S]*\binvalid_api_key\b/iu.test(remoteError);
-    return {
-      available: true,
-      processRunning: value.process_running === true,
-      healthy: value.healthy === true,
-      ready: value.ready === true,
-      stale: value.stale === true,
-      credentialState: invalidRuntimeKey ? "invalid_runtime_api_key" : "not_confirmed_invalid",
-      remoteLookup: invalidRuntimeKey
-        ? { status: 401, code: "invalid_api_key" }
-        : remote ? { status: remote.status ?? null, code: remote.code ?? null } : null,
-    };
-  } catch {
-    return {
-      available: false,
-      processRunning: false,
-      healthy: false,
-      ready: false,
-      stale: true,
-      errorClass: "runtime_status_unparseable",
-    };
-  }
+  return { ...probeManagedRuntime({ runtimeAlias }) };
 }
 const check = (msg: string): void => say(`✓ ${msg}`);
 const cross = (msg: string): void => say(`✗ ${msg}`);
@@ -430,8 +387,7 @@ program
                     headerName: "X-C2C-Tunnel-Token",
                     tokenFile: openAITunnelTokenFile(info.workspaceId),
                     runtimeAlias: `c2c-${info.workspaceId}`,
-                    tunnelIdEnv: "CONTROL_PLANE_TUNNEL_ID",
-                    runtimeApiKeyEnv: "CONTROL_PLANE_API_KEY",
+                    credentialSource: "managed_dpapi",
                   }
                 : null,
             pairingCode: info.transportMode === "cloudflare" ? pairingResult.code : null,
@@ -456,8 +412,8 @@ program
         say(`本机认证文件：${openAITunnelTokenFile(info.workspaceId)}`);
         say(`运行别名：c2c-${info.workspaceId}`);
         say("");
-        say("下一步：用 tunnel-client 把这个本机 MCP 连接到你的 OpenAI Tunnel；ChatGPT 连接器选择 Connection: Tunnel。");
-        say("CONTROL_PLANE_API_KEY 只放环境变量，不要粘贴进 ChatGPT 或命令历史。");
+        say("下一步：使用已配置的托管 Tunnel；ChatGPT 连接器选择 Connection: Tunnel。");
+        say("Runtime 凭据只从本机托管 DPAPI 文件读取；用 `c2c runtime diagnose` 检查状态。");
       } else {
         if (mcpUrl) check("Cloudflare fallback 已建立");
         say(`连接地址：${mcpUrl ?? `http://127.0.0.1:${runtime.port}/mcp`}`);
@@ -505,8 +461,7 @@ program
                 headerName: "X-C2C-Tunnel-Token",
                 tokenFile: openAITunnelTokenFile(workspace.id),
                 runtimeAlias: `c2c-${workspace.id}`,
-                tunnelIdEnv: "CONTROL_PLANE_TUNNEL_ID",
-                runtimeApiKeyEnv: "CONTROL_PLANE_API_KEY",
+                credentialSource: "managed_dpapi",
               }
             : null,
       };
@@ -1511,35 +1466,26 @@ session.command("clear").description("Forget only this task's ChatGPT conversati
 const runtime = program.command("runtime").description("Diagnose the managed OpenAI runtime without exposing credentials");
 
 runtime.command("diagnose", { isDefault: true })
-  .description("Compare the effective C2C token-file reference with the Router anchor")
+  .description("Verify the managed OpenAI runtime through its canonical DPAPI credential")
   .option("-w, --workspace <path>")
   .option("--runtime-alias <alias>")
-  .option("--profile-file <path>")
   .option("--json", "machine-readable output", false)
-  .action((opts: { workspace?: string; runtimeAlias?: string; profileFile?: string; json: boolean }) => {
+  .action((opts: { workspace?: string; runtimeAlias?: string; json: boolean }) => {
     const anchor = routerAnchorForWorkspace(resolveWorkspace(opts.workspace));
     const runtimeAlias = opts.runtimeAlias?.trim() || `c2c-${anchor.id}`;
-    const diagnosis = diagnoseRuntimeHeader({
-      canonicalTokenFile: openAITunnelTokenFile(anchor.id),
-      profileFile: opts.profileFile ? path.resolve(opts.profileFile) : defaultRuntimeProfileFile(runtimeAlias),
-      environmentHeaders: process.env.MCP_EXTRA_HEADERS,
-    });
-    const futureUserEnvironment = diagnoseWindowsUserRuntimeHeader({
-      canonicalTokenFile: diagnosis.canonicalTokenFile,
-    });
+    const runtime = runtimeStatusSummary(runtimeAlias);
     const payload = {
       ok: true,
       anchorWorkspaceId: anchor.id,
       runtimeAlias,
-      header: diagnosis,
-      futureUserEnvironment,
-      runtime: runtimeStatusSummary(runtimeAlias),
+      runtime,
     };
     if (opts.json) say(JSON.stringify(payload));
     else {
       say(`运行时：${runtimeAlias}`);
-      say(`令牌引用：${diagnosis.state} / ${diagnosis.source ?? "未配置"}`);
-      say(`令牌文件：${diagnosis.canonicalTokenFile}`);
+      say(`凭据来源：${runtime.credentialSource}`);
+      say(`凭据状态：${runtime.credentialState}`);
+      say(`健康状态：process=${runtime.processRunning} healthy=${runtime.healthy} ready=${runtime.ready} stale=${runtime.stale}`);
     }
   });
 
