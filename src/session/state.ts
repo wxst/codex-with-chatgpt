@@ -10,6 +10,7 @@ export type BindingState = "bound" | "unavailable";
 export type BootstrapCreationState = "idle" | "dispatching" | "pending" | "created";
 export type SettingsDialogState = "pending" | "confirmed" | "later";
 export type ChannelState = "ready" | "sending" | "delivered" | "awaiting_reply" | "degraded";
+export type DeliveryFailureKind = "host_rejected" | "conversation_gone" | "identity_mismatch";
 
 export interface LegacySavedSession {
   url?: string;
@@ -55,6 +56,10 @@ export interface SavedTaskSession {
   channelState: ChannelState;
   pendingMessageId?: string;
   pendingIteration?: number;
+  /** The direct host accepted the outbound request, but ChatGPT has not yet exposed its user turn. */
+  sendAcceptedAt?: string;
+  /** The first readback check that found the accepted message still absent. */
+  deliveryPendingSince?: string;
   lastDeliveredMessageId?: string;
   lastDeliveryError?: string;
   lastDeliveryCheckedAt?: string;
@@ -770,6 +775,8 @@ function unavailableTask(task: SavedTaskSession, reason: string): SavedTaskSessi
     channelState: "degraded",
     pendingMessageId: undefined,
     pendingIteration: undefined,
+    sendAcceptedAt: undefined,
+    deliveryPendingSince: undefined,
     replacedConversations,
     replacementReason: reason,
     savedAt: new Date().toISOString(),
@@ -884,9 +891,52 @@ export async function beginTaskSend(
       channelState: "sending",
       pendingMessageId: id,
       pendingIteration: iteration,
+      sendAcceptedAt: undefined,
+      deliveryPendingSince: undefined,
       lastDeliveryError: undefined,
       lastDeliveryCheckedAt: new Date().toISOString(),
       savedAt: new Date().toISOString(),
+    };
+  });
+}
+
+export async function confirmTaskSendAccepted(
+  workspaceId: string,
+  taskId: string,
+  messageId: string
+): Promise<SavedTaskSession> {
+  const id = validateMessageId(messageId);
+  return updateTaskChannel(workspaceId, taskId, (task) => {
+    if (task.channelState !== "sending" || task.pendingMessageId !== id) {
+      throw new Error("accepted send does not match the in-flight message");
+    }
+    const acceptedAt = new Date().toISOString();
+    return {
+      ...task,
+      sendAcceptedAt: task.sendAcceptedAt ?? acceptedAt,
+      lastDeliveryCheckedAt: acceptedAt,
+      savedAt: acceptedAt,
+    };
+  });
+}
+
+export async function recordTaskDeliveryPending(
+  workspaceId: string,
+  taskId: string,
+  messageId: string
+): Promise<SavedTaskSession> {
+  const id = validateMessageId(messageId);
+  return updateTaskChannel(workspaceId, taskId, (task) => {
+    if (task.channelState !== "sending" || task.pendingMessageId !== id) {
+      throw new Error("pending delivery does not match the in-flight message");
+    }
+    if (!task.sendAcceptedAt) throw new Error("delivery pending requires an accepted send");
+    const checkedAt = new Date().toISOString();
+    return {
+      ...task,
+      deliveryPendingSince: task.deliveryPendingSince ?? checkedAt,
+      lastDeliveryCheckedAt: checkedAt,
+      savedAt: checkedAt,
     };
   });
 }
@@ -905,6 +955,7 @@ export async function confirmTaskDelivery(
       ...task,
       channelState: "awaiting_reply",
       lastDeliveredMessageId: id,
+      deliveryPendingSince: undefined,
       lastDeliveryCheckedAt: new Date().toISOString(),
       savedAt: new Date().toISOString(),
     };
@@ -933,6 +984,8 @@ export async function confirmTaskReply(
       lastState: normalizedState,
       pendingMessageId: undefined,
       pendingIteration: undefined,
+      sendAcceptedAt: undefined,
+      deliveryPendingSince: undefined,
       lastDeliveryError: undefined,
       lastDeliveryCheckedAt: new Date().toISOString(),
       savedAt: new Date().toISOString(),
@@ -944,25 +997,41 @@ export async function failTaskDelivery(
   workspaceId: string,
   taskId: string,
   messageId: string,
+  failureKind: string,
   reason: string
 ): Promise<SavedTaskSession> {
   const id = validateMessageId(messageId);
+  if (!isDeliveryFailureKind(failureKind)) {
+    throw new Error("delivery failure requires a terminal host_rejected, conversation_gone, or identity_mismatch result");
+  }
   const normalizedReason = reason.trim().slice(0, 500);
   if (!normalizedReason) throw new Error("delivery failure requires a reason");
-  return updateTaskChannel(workspaceId, taskId, (task) => {
+  const task = await updateTaskChannel(workspaceId, taskId, (task) => {
     if (task.pendingMessageId !== id || !["sending", "delivered", "awaiting_reply"].includes(task.channelState)) {
       throw new Error("delivery failure does not match the in-flight message");
+    }
+    const terminalReason = `${failureKind}: ${normalizedReason}`;
+    if (failureKind === "conversation_gone" || failureKind === "identity_mismatch") {
+      return unavailableTask(task, terminalReason);
     }
     return {
       ...task,
       channelState: "degraded",
       pendingMessageId: undefined,
       pendingIteration: undefined,
-      lastDeliveryError: normalizedReason,
+      sendAcceptedAt: undefined,
+      deliveryPendingSince: undefined,
+      lastDeliveryError: terminalReason,
       lastDeliveryCheckedAt: new Date().toISOString(),
       savedAt: new Date().toISOString(),
     };
   });
+  if (task.bindingState === "unavailable") await retireClaimedStandbyEntry(task, `${failureKind}: ${normalizedReason}`);
+  return task;
+}
+
+function isDeliveryFailureKind(value: string): value is DeliveryFailureKind {
+  return value === "host_rejected" || value === "conversation_gone" || value === "identity_mismatch";
 }
 
 export async function clearTaskSession(

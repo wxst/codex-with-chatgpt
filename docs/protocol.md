@@ -63,10 +63,22 @@ ChatGPT to call `workspace_info` first with `route_token`. The task becomes
 `ready` only after delivery and reply readback plus matching workspace id, name,
 branch, connector, and all four identity fields.
 
-`send_message_to_thread` means accepted only. The coordinator polls
-`read_thread` on the exact conversation. It confirms delivery after the matching
-user message appears, and confirms reply only after the matching ChatGPT reply
-appears. `wait_threads` is not used for ordinary ChatGPT conversations.
+`send_message_to_thread` means accepted only. The coordinator records that
+acceptance, then polls `read_thread` on the exact conversation. It confirms
+delivery after the matching user message appears, and confirms reply only after
+the matching ChatGPT reply appears. `wait_threads` is not used for ordinary
+ChatGPT conversations.
+
+The first 30 seconds are a fast check. A missing user turn in that period is a
+late delivery, not a terminal failure: the task remains `sending`, retains its
+same message id and write lock, and records `deliveryPendingSince`. Active work
+may continue reading for five minutes. If it is still absent, the next task
+operation reads that exact in-flight message before any new send. There is no
+automatic resend or Chat replacement.
+
+`fail-delivery` requires terminal evidence: `host_rejected`,
+`conversation_gone`, or `identity_mismatch`. The last two retire the exact
+binding; a host rejection quarantines the channel while retaining it.
 
 Channel states:
 

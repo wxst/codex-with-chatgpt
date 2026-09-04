@@ -146,6 +146,15 @@ Every one of the eight C2C read-only tools requires `route_token`; a missing,
 wrong, revoked, or cross-task token returns `ROUTE_ACCESS_DENIED`. The token
 never grants write, shell, Git mutation, or access to another workspace.
 
+Immediately after `send_message_to_thread` accepts the request, record that
+fact. A returned conversation id does not prove that ChatGPT has displayed the
+message:
+
+```text
+node "__C2C_CHECKOUT__/bin/c2c.js" session confirm-send-accepted \
+  -w <workspace> --task-id <task-id> --message-id <message-id> --json
+```
+
 Poll `read_thread` on the same id. Do not use `wait_threads` for ChatGPT Chats.
 Confirm delivery only after the exact user message is visible:
 
@@ -156,6 +165,20 @@ node "__C2C_CHECKOUT__/bin/c2c.js" session confirm-delivery \
   --observed-iteration 0 --json
 ```
 
+Use short polling for 30 seconds. If the original message has not appeared,
+Keep the task in `sending` and record the late-delivery wait:
+
+```text
+node "__C2C_CHECKOUT__/bin/c2c.js" session record-delivery-pending \
+  -w <workspace> --task-id <task-id> --message-id <message-id> --json
+```
+
+Continue reading for up to five minutes while the task is active. After that,
+leave the same message in flight and read it again before any later task
+message. Do not resend, change Chats, or call `fail-delivery` because a short
+readback window is empty. `fail-delivery` is only for an explicit
+`host_rejected`, `conversation_gone`, or `identity_mismatch` result.
+
 Then wait for the matching ChatGPT reply and run `session confirm-reply` with
 the same observed identity fields. After `workspace_info` reports the expected
 workspace id, name, branch, and connector, run `session confirm-workspace`.
@@ -164,14 +187,16 @@ Only a `ready` task may receive task content.
 ## Normal control loop
 
 Every message includes `TASK_ID`, `WORKSPACE_ID`, `ITERATION`, and a fresh
-`MESSAGE_ID`. Call `session begin-send`, then `send_message_to_thread`, then
-poll `read_thread` and use `confirm-delivery` / `confirm-reply`.
+`MESSAGE_ID`. Always generate it with `session new-message-id`; never write a
+handmade `c2c_msg_*` value. Call `session begin-send`, then
+`send_message_to_thread`, then `confirm-send-accepted`, then poll `read_thread`
+and use `confirm-delivery` / `confirm-reply`.
 
 A send-tool result means only accepted. It is delivered only after the original
 user turn is read back. It is complete only after an identity-matching reply is
-read back. If delivery is absent after the polling window, use
-`session fail-delivery`; do not resend or change Chats. A later recovery uses a
-fresh message id and `begin-send --probe`.
+read back. A late readback keeps the same message in `sending`; it does not
+advance the iteration or create a second send. A later recovery after an
+explicit terminal host result uses a fresh message id and `begin-send --probe`.
 
 Keep control messages under 1 KB. ChatGPT must retrieve code itself.
 

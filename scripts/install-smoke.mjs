@@ -71,6 +71,11 @@ try {
   const sessionHelp = runCli(["session", "--help"], env);
   assert.match(sessionHelp, /pool/u, "session help did not expose the standby pool");
   assert.match(sessionHelp, /record-read/u, "session help did not expose exact-conversation health tracking");
+  assert.match(sessionHelp, /confirm-send-accepted/u, "session help did not expose host acceptance tracking");
+  assert.match(sessionHelp, /record-delivery-pending/u, "session help did not expose late-delivery tracking");
+
+  const failDeliveryHelp = runCli(["session", "fail-delivery", "--help"], env);
+  assert.match(failDeliveryHelp, /--kind <kind>/u, "fail-delivery did not require a terminal failure kind");
   const sessionState = parseLastJson(runCli(
     ["session", "get", "-w", workspace, "--task-id", "lower-priority-task", "--json"],
     { ...env, CODEX_THREAD_ID: "install-smoke-task" }

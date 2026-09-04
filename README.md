@@ -168,7 +168,8 @@ The claim returns a one-time task route token. The Boot Prompt places it in
 `C2C_ROUTE_TOKEN`; every one of the eight MCP calls then includes `route_token`.
 The Router resolves that token to only its bound workspace. Normal Chat control
 uses only `list_threads`, `send_message_to_thread`, and `read_thread`, with
-readback receipts before state advances.
+readback receipts before state advances. An accepted send whose user turn is
+late stays in flight; it is not resent or moved to another Chat.
 ## Normal use
 
 After the Skill is installed and the workspace connection is verified, ask

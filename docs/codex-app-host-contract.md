@@ -12,6 +12,9 @@ send_message_to_thread
 `read_thread` proves a standby marker is in a user turn and verifies direct
 message receipts. `send_message_to_thread` accepts compact control messages to
 the exact claimed id. A tool acceptance result is not a delivery receipt.
+The direct host can surface a user turn after the initial short readback window,
+so C2C retains the single in-flight message and continues exact-id reads rather
+than creating a duplicate control message.
 
 C2C does not require host-side Chat creation, model mutation, browser control,
 UIA, ChatGPT Classic, ChatGPT Work, drafts, clipboard, or private HTTPS calls.

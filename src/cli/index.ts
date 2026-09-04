@@ -62,6 +62,7 @@ import {
   assertReceiptIdentity,
   beginTaskSend,
   clearTaskSession,
+  confirmTaskSendAccepted,
   confirmTaskDelivery,
   confirmTaskReply,
   confirmTaskWorkspace,
@@ -73,6 +74,7 @@ import {
   newMessageId,
   readSessionRegistry,
   readTaskSession,
+  recordTaskDeliveryPending,
   recordTaskReadResult,
   quarantineStandbyConversation,
   readStandbyPool,
@@ -1362,8 +1364,26 @@ addChannelCommandOptions(session.command("begin-send").description("Atomically r
       parseInt(opts.iteration, 10),
       { probe: opts.probe, bootstrap: opts.bootstrap }
     );
-    if (opts.json) say(JSON.stringify({ ok: true, accepted: true, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    if (opts.json) say(JSON.stringify({ ok: true, reserved: true, accepted: false, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`已保留发送 ${task.pendingMessageId}；尚未确认送达`);
+  });
+
+addChannelCommandOptions(session.command("confirm-send-accepted").description("Record that the direct ChatGPT host accepted the outbound request"))
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const task = await confirmTaskSendAccepted(workspace.id, resolved.taskId, opts.messageId);
+    if (opts.json) say(JSON.stringify({ ok: true, reserved: true, accepted: true, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    else check(`宿主已接受 ${task.pendingMessageId}；正在等待 ChatGPT 显示该消息`);
+  });
+
+addChannelCommandOptions(session.command("record-delivery-pending").description("Keep an accepted direct message in flight after a short readback window"))
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const task = await recordTaskDeliveryPending(workspace.id, resolved.taskId, opts.messageId);
+    if (opts.json) say(JSON.stringify({ ok: true, reserved: true, accepted: true, delivered: false, pending: true, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    else say(`消息仍在等待显示：${task.pendingMessageId}`);
   });
 
 addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-delivery").description("Confirm an outbound message was observed in ChatGPT")))
@@ -1398,11 +1418,12 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-rep
   });
 
 addChannelCommandOptions(session.command("fail-delivery").description("Quarantine an unconfirmed direct ChatGPT channel"))
+  .requiredOption("--kind <kind>", "host_rejected, conversation_gone, or identity_mismatch")
   .requiredOption("--reason <reason>")
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; reason: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; kind: string; reason: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
-    const task = await failTaskDelivery(workspace.id, resolved.taskId, opts.messageId, opts.reason);
+    const task = await failTaskDelivery(workspace.id, resolved.taskId, opts.messageId, opts.kind, opts.reason);
     if (opts.json) say(JSON.stringify({ ok: false, accepted: true, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else say(`通道已隔离：${task.lastDeliveryError}`);
   });

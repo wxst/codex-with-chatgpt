@@ -149,7 +149,9 @@ Skill 只通过 Codex App 后台的 `list_threads` 和 `read_thread` 核验库�
 领取结果包含一次性的任务路由 token。Boot Prompt 以 `C2C_ROUTE_TOKEN` 携带它；8 个
 MCP 工具调用都要附加 `route_token`。Router 只会将该 token 解析到它绑定的工作区。
 日常控制消息只用 `list_threads`、`send_message_to_thread` 和 `read_thread`，必须先
-回读送达和回复，才推进状态。
+回读送达和回复，才推进状态。发送工具返回仅表示宿主已接受；前 30 秒未读到原消息时，
+任务会保持 `sending` 并继续读取，不会重发或切换会话。活跃等待最多 5 分钟；超时后
+下一次任务先读取同一条在途消息。
 ## 正常使用
 
 Skill 安装并完成连接验证后，直接对 Codex 说：

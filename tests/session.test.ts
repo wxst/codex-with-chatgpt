@@ -4,10 +4,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   beginTaskSend,
   claimStandbyConversation,
+  confirmTaskSendAccepted,
   confirmTaskDelivery,
   confirmTaskReply,
+  failTaskDelivery,
   importStandbyConversation,
   newMessageId,
+  recordTaskDeliveryPending,
   readSessionRegistry,
   recordTaskReadResult,
   resolveCodexTaskId,
@@ -45,6 +48,70 @@ describe("task-scoped standby session registry", () => {
     expect(completed.lastState).toBe("DONE");
     expect(claimed.task.settingsSource).toBe("user_confirmed");
     expect(claimed.task.thinkingLevel).toBe("xhigh");
+  });
+
+  it("keeps an accepted send in flight when the initial delivery check sees no message", async () => {
+    reset();
+    await claimedTask();
+    const messageId = newMessageId();
+    await beginTaskSend("workspace123", "task-a", messageId, 0, { bootstrap: true });
+    const accepted = await confirmTaskSendAccepted("workspace123", "task-a", messageId);
+    const pending = await recordTaskDeliveryPending("workspace123", "task-a", messageId);
+
+    expect(accepted.sendAcceptedAt).toBeTruthy();
+    expect(pending.channelState).toBe("sending");
+    expect(pending.pendingMessageId).toBe(messageId);
+    expect(pending.deliveryPendingSince).toBeTruthy();
+    await expect(beginTaskSend("workspace123", "task-a", newMessageId(), 0, { bootstrap: true }))
+      .rejects.toThrow(/in-flight/);
+  });
+
+  it("confirms a delayed message after it was recorded as pending", async () => {
+    reset();
+    await claimedTask();
+    const messageId = newMessageId();
+    await beginTaskSend("workspace123", "task-a", messageId, 0, { bootstrap: true });
+    await confirmTaskSendAccepted("workspace123", "task-a", messageId);
+    await recordTaskDeliveryPending("workspace123", "task-a", messageId);
+    const delivered = await confirmTaskDelivery("workspace123", "task-a", messageId);
+    expect(delivered.channelState).toBe("awaiting_reply");
+    expect(delivered.deliveryPendingSince).toBeUndefined();
+    const completed = await confirmTaskReply("workspace123", "task-a", messageId, "DONE");
+
+    expect(completed.channelState).toBe("ready");
+    expect(completed.pendingMessageId).toBeUndefined();
+    expect(completed.deliveryPendingSince).toBeUndefined();
+  });
+
+  it("quarantines a send only for a terminal host rejection", async () => {
+    reset();
+    await claimedTask();
+    const messageId = newMessageId();
+    await beginTaskSend("workspace123", "task-a", messageId, 0, { bootstrap: true });
+    await confirmTaskSendAccepted("workspace123", "task-a", messageId);
+
+    await expect(
+      failTaskDelivery("workspace123", "task-a", messageId, "delivery_absent", "short readback window elapsed")
+    ).rejects.toThrow(/terminal/);
+
+    const rejected = await failTaskDelivery(
+      "workspace123", "task-a", messageId, "host_rejected", "host returned a terminal send error"
+    );
+    expect(rejected.channelState).toBe("degraded");
+    expect(rejected.pendingMessageId).toBeUndefined();
+  });
+
+  it.each(["conversation_gone", "identity_mismatch"])("retires the exact Chat after %s", async (kind) => {
+    reset();
+    const claimed = await claimedTask();
+    const messageId = newMessageId();
+    await beginTaskSend("workspace123", "task-a", messageId, 0, { bootstrap: true });
+    await confirmTaskSendAccepted("workspace123", "task-a", messageId);
+
+    const retired = await failTaskDelivery("workspace123", "task-a", messageId, kind, "terminal host evidence");
+    expect(retired.bindingState).toBe("unavailable");
+    expect(retired.replacedConversations).toContainEqual(expect.objectContaining({ conversationId: claimed.task.conversationId }));
+    expect(retired.pendingMessageId).toBeUndefined();
   });
 
   it("retains a degraded exact Chat and retires it only after deletion", async () => {

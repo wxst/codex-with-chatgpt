@@ -307,6 +307,9 @@ describe("release automation contract", () => {
     expect(installSmoke).not.toContain("pnpm test:install");
     expect(installSmokeScript).toContain('["session", "--help"]');
     expect(installSmokeScript).toContain('["session", "pool", "--help"]');
+    expect(installSmokeScript).toContain("confirm-send-accepted");
+    expect(installSmokeScript).toContain("record-delivery-pending");
+    expect(installSmokeScript).toContain('["session", "fail-delivery", "--help"]');
     expect(installSmokeScript).toContain("CODEX_THREAD_ID: \"install-smoke-task\"");
   });
 
