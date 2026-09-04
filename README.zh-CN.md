@@ -138,13 +138,14 @@ node bin/c2c.js transport -w <workspace> --mode openai --json
 
 每个 Codex 任务会从全局 **Codex-with-ChatGPT** Project 领取一个普通 Chat 并永久
 绑定。用户先手工准备库存：选择非 Pro、思考强度“极高”，并发送一条只含
-`C2C_STANDBY_READY` 的用户消息。当前任务明确要求 Pro 时，只领取使用
-`C2C_STANDBY_READY_PRO` 的独立库存 Chat。
+`C2C_STANDBY_READY` 的用户消息。ChatGPT 编辑器有时会保留成字面文本
+`C2C\_STANDBY\_READY`；两种完整拼写都可识别。当前任务明确要求 Pro 时，
+只领取使用 `C2C_STANDBY_READY_PRO` 的独立库存 Chat。
 
-Skill 只通过 Codex App 后台的 `list_threads` 和 `read_thread` 核验库存，再用
-`session pool import` 导入，最后执行 `session pool claim`。领取按 FIFO 并在全局锁
-中完成；标题猜测、最近会话和跨任务复用均不参与。库存为空会返回
-`POOL_EXHAUSTED`，任务正文不会发送。
+Skill 每次领取前都通过 Codex App 后台的 `list_threads` 和 `read_thread` 同步库存，
+使用带原始用户标记的 `session pool import --marker-text` 导入，再执行 `session pool
+claim`。领取按 FIFO 并在全局锁中完成；标题猜测、最近会话和跨任务复用均不参与。
+库存为空会返回 `POOL_EXHAUSTED`，任务正文不会发送。
 
 领取结果包含一次性的任务路由 token。Boot Prompt 以 `C2C_ROUTE_TOKEN` 携带它；8 个
 MCP 工具调用都要附加 `route_token`。Router 只会将该 token 解析到它绑定的工作区。
@@ -152,6 +153,12 @@ MCP 工具调用都要附加 `route_token`。Router 只会将该 token 解析到
 回读送达和回复，才推进状态。发送工具返回仅表示宿主已接受；前 30 秒未读到原消息时，
 任务会保持 `sending` 并继续读取，不会重发或切换会话。活跃等待最多 5 分钟；超时后
 下一次任务先读取同一条在途消息。
+
+修改托管 Runtime 前，运行 `node bin/c2c.js runtime diagnose -w <workspace> --json`。
+它只报告 C2C 当前令牌文件路径和生效引用来源，不输出密钥。持久 profile 的
+`legacy_path` 可用 `runtime repair-profile` 原子修复；只出现在环境中的旧路径属于
+Runtime 启动器，使用 `runtime repair-user-environment` 更新后重启 Codex。`invalid_runtime_api_key` 表示官方 Runtime API Key 需要先取得用户
+确认再轮换。Runtime 已停止、Key 失效和 `POOL_EXHAUSTED` 是三种独立状态。
 ## 正常使用
 
 Skill 安装并完成连接验证后，直接对 Codex 说：

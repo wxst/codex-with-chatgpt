@@ -24,7 +24,7 @@ const reset = (): void => { stateRoot = isolateStateDir(); };
 async function claimedTask(workspaceId = "workspace123", taskId = "task-a") {
   await importStandbyConversation({
     conversationId: `standby-${taskId}`, projectId: "g-p-sessionpool123",
-    marker: "C2C_STANDBY_READY", markerMessageId: `marker-${taskId}`, markerRole: "user",
+    markerText: "C2C_STANDBY_READY", markerMessageId: `marker-${taskId}`, markerRole: "user",
   });
   return claimStandbyConversation({ workspaceId, taskId, connectorName: "C2C Router", workspaceName: "repo", branch: "main" });
 }
@@ -154,7 +154,7 @@ describe("task-scoped standby session registry", () => {
     }));
     await importStandbyConversation({
       conversationId: "standby-migrated", projectId: "g-p-sessionpool123",
-      marker: "C2C_STANDBY_READY", markerMessageId: "marker-migrated", markerRole: "user",
+      markerText: "C2C_STANDBY_READY", markerMessageId: "marker-migrated", markerRole: "user",
     });
     const claimed = await claimStandbyConversation({
       workspaceId: "workspace123", taskId: "task-a", connectorName: "C2C", workspaceName: "repo", branch: "main",

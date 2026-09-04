@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   claimStandbyConversation,
   importStandbyConversation,
+  parseStandbyMarkerText,
   readStandbyPool,
 } from "../src/session/state.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
@@ -20,14 +21,24 @@ function reset(): void {
 const projectId = "g-p-standbypool123";
 
 describe("global standby Chat pool", () => {
+  it("accepts only a complete raw or UI-escaped user standby marker", () => {
+    expect(parseStandbyMarkerText("C2C_STANDBY_READY")).toBe("C2C_STANDBY_READY");
+    expect(parseStandbyMarkerText("C2C\\_STANDBY\\_READY")).toBe("C2C_STANDBY_READY");
+    expect(parseStandbyMarkerText("C2C_STANDBY_READY_PRO")).toBe("C2C_STANDBY_READY_PRO");
+    expect(parseStandbyMarkerText("C2C\\_STANDBY\\_READY\\_PRO")).toBe("C2C_STANDBY_READY_PRO");
+    expect(parseStandbyMarkerText("C2C_STANDBY_READY please")).toBeNull();
+    expect(parseStandbyMarkerText(" C2C_STANDBY_READY")).toBeNull();
+    expect(parseStandbyMarkerText("C2C_STANDBY_READY\n")).toBeNull();
+  });
+
   it("claims FIFO chats once across concurrent workspaces and records task ownership", async () => {
     reset();
     await importStandbyConversation({
-      conversationId: "standby-first", projectId, marker: "C2C_STANDBY_READY",
+      conversationId: "standby-first", projectId, markerText: "C2C_STANDBY_READY",
       markerMessageId: "marker-first", markerRole: "user", createdAt: "2026-01-01T00:00:00.000Z",
     });
     await importStandbyConversation({
-      conversationId: "standby-second", projectId, marker: "C2C_STANDBY_READY",
+      conversationId: "standby-second", projectId, markerText: "C2C_STANDBY_READY",
       markerMessageId: "marker-second", markerRole: "user", createdAt: "2026-01-02T00:00:00.000Z",
     });
 
@@ -46,19 +57,22 @@ describe("global standby Chat pool", () => {
   it("rejects assistant markers, wrong projects, duplicate conversations, and Pro claims without an explicit request", async () => {
     reset();
     await expect(importStandbyConversation({
-      conversationId: "assistant-marker", projectId, marker: "C2C_STANDBY_READY", markerMessageId: "marker", markerRole: "assistant",
+      conversationId: "extra-marker", projectId, markerText: "C2C_STANDBY_READY extra", markerMessageId: "marker-extra", markerRole: "user",
+    })).rejects.toThrow(/exact raw user marker/);
+    await expect(importStandbyConversation({
+      conversationId: "assistant-marker", projectId, markerText: "C2C_STANDBY_READY", markerMessageId: "marker", markerRole: "assistant",
     })).rejects.toThrow(/user message/);
     await importStandbyConversation({
-      conversationId: "normal-marker", projectId, marker: "C2C_STANDBY_READY", markerMessageId: "marker-normal", markerRole: "user",
+      conversationId: "normal-marker", projectId, markerText: "C2C_STANDBY_READY", markerMessageId: "marker-normal", markerRole: "user",
     });
     await expect(importStandbyConversation({
-      conversationId: "normal-marker", projectId, marker: "C2C_STANDBY_READY", markerMessageId: "marker-duplicate", markerRole: "user",
+      conversationId: "normal-marker", projectId, markerText: "C2C_STANDBY_READY", markerMessageId: "marker-duplicate", markerRole: "user",
     })).rejects.toThrow(/already exists/);
     await expect(importStandbyConversation({
-      conversationId: "wrong-project", projectId: "g-p-anotherproject", marker: "C2C_STANDBY_READY", markerMessageId: "marker-wrong", markerRole: "user",
+      conversationId: "wrong-project", projectId: "g-p-anotherproject", markerText: "C2C_STANDBY_READY", markerMessageId: "marker-wrong", markerRole: "user",
     })).rejects.toThrow(/another ChatGPT Project/);
     await importStandbyConversation({
-      conversationId: "pro-marker", projectId, marker: "C2C_STANDBY_READY_PRO", markerMessageId: "marker-pro", markerRole: "user",
+      conversationId: "pro-marker", projectId, markerText: "C2C_STANDBY_READY_PRO", markerMessageId: "marker-pro", markerRole: "user",
     });
     const normal = await claimStandbyConversation({ workspaceId: "workspace", taskId: "normal-task", connectorName: "C2C", workspaceName: "repo", branch: "main" });
     expect(normal.task.conversationId).toBe("normal-marker");

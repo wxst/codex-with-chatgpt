@@ -155,14 +155,15 @@ the original OpenAI Secure MCP Tunnel and ChatGPT connector.
 
 Every Codex task permanently claims one ordinary Chat from the global
 **Codex-with-ChatGPT** Project. Users prepare stock Chats at non-Pro xhigh and
-send one user message containing exactly `C2C_STANDBY_READY`. An explicitly Pro
-task uses a separate `C2C_STANDBY_READY_PRO` Chat.
+send one user message containing exactly `C2C_STANDBY_READY`. ChatGPT's composer
+may preserve it as literal `C2C\_STANDBY\_READY`; both complete spellings are
+recognized. An explicitly Pro task uses a separate `C2C_STANDBY_READY_PRO` Chat.
 
-The Skill verifies stock with Codex App background `list_threads` and
-`read_thread`, imports it with `session pool import`, then uses `session pool
-claim`. Claims are FIFO and globally locked; title guesses, recent conversations,
-and cross-task reuse are excluded. Empty stock returns `POOL_EXHAUSTED` before
-task content is sent.
+The Skill synchronizes stock before every pool claim with Codex App background
+`list_threads` and `read_thread`, imports each exact user marker with `session
+pool import --marker-text`, then uses `session pool claim`. Claims are FIFO and
+globally locked; title guesses, recent conversations, and cross-task reuse are
+excluded. Empty stock returns `POOL_EXHAUSTED` before task content is sent.
 
 The claim returns a one-time task route token. The Boot Prompt places it in
 `C2C_ROUTE_TOKEN`; every one of the eight MCP calls then includes `route_token`.
@@ -170,6 +171,15 @@ The Router resolves that token to only its bound workspace. Normal Chat control
 uses only `list_threads`, `send_message_to_thread`, and `read_thread`, with
 readback receipts before state advances. An accepted send whose user turn is
 late stays in flight; it is not resent or moved to another Chat.
+
+Run `node bin/c2c.js runtime diagnose -w <workspace> --json` before changing a
+managed runtime. It reports the canonical C2C token-file path and the effective
+header source without printing secrets. A `legacy_path` from a persisted profile
+can be repaired atomically with `runtime repair-profile`; an environment-only
+reference uses `runtime repair-user-environment` and a Codex restart.
+`invalid_runtime_api_key` means the
+official Runtime API key needs a confirmed rotation. A stopped runtime, an
+invalid key, and `POOL_EXHAUSTED` remain separate states.
 ## Normal use
 
 After the Skill is installed and the workspace connection is verified, ask

@@ -167,7 +167,8 @@ export interface StandbyPool {
 export interface ImportStandbyConversationOptions {
   conversationId: string;
   projectId: string;
-  marker: StandbyMarker;
+  /** Exact text read from the user turn. This is intentionally not inferred. */
+  markerText: string;
   markerMessageId: string;
   markerRole: "user" | "assistant";
   createdAt?: string;
@@ -198,6 +199,17 @@ export function newMessageId(): string {
 
 export function newProvisionId(): string {
   return `c2c_provision_${randomUUID()}`;
+}
+
+/**
+ * ChatGPT's renderer can preserve Markdown escapes in a plain user turn. Keep
+ * the stored marker canonical while accepting only the two complete spellings
+ * that the user can create in the ordinary Chat composer.
+ */
+export function parseStandbyMarkerText(text: string): StandbyMarker | null {
+  if (text === STANDBY_MARKER || text === "C2C\\_STANDBY\\_READY") return STANDBY_MARKER;
+  if (text === STANDBY_PRO_MARKER || text === "C2C\\_STANDBY\\_READY\\_PRO") return STANDBY_PRO_MARKER;
+  return null;
 }
 
 export function resolveCodexTaskId(
@@ -455,8 +467,9 @@ function validTimestamp(value: string | undefined, field: string): string {
 
 /**
  * Add a manually prepared ordinary Chat to the global pool. The caller must
- * have read the Chat through Codex App and verified that the exact marker is a
- * user message in the one configured Project before calling this function.
+ * have read the Chat through Codex App and verified that the complete raw
+ * marker is a user message in the one configured Project before calling this
+ * function.
  */
 export async function importStandbyConversation(
   input: ImportStandbyConversationOptions
@@ -464,9 +477,8 @@ export async function importStandbyConversation(
   return withWorkspaceLifecycleLock(SESSION_REGISTRY_LOCK_ID, async () => {
     const conversationId = validateConversationId(input.conversationId);
     const projectId = validateProjectId(input.projectId);
-    if (input.marker !== STANDBY_MARKER && input.marker !== STANDBY_PRO_MARKER) {
-      throw new Error("standby marker is invalid");
-    }
+    const marker = parseStandbyMarkerText(input.markerText);
+    if (!marker) throw new Error("standby marker must be an exact raw user marker");
     if (input.markerRole !== "user") throw new Error("standby marker must be in a user message");
     const markerMessageId = validMarkerMessageId(input.markerMessageId);
     const pool = readStandbyPool();
@@ -483,7 +495,7 @@ export async function importStandbyConversation(
       id: `c2c_standby_${randomUUID()}`,
       conversationId,
       projectId,
-      marker: input.marker,
+      marker,
       markerMessageId,
       createdAt: validTimestamp(input.createdAt, "standby conversation creation time"),
       importedAt: now,

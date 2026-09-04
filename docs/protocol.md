@@ -36,9 +36,11 @@ Chats. A candidate is accepted only when `list_threads` and `read_thread` prove:
 - an exact marker in a **user** turn;
 - no prior task ownership.
 
-`C2C_STANDBY_READY` means user-confirmed non-Pro xhigh. Explicit Pro tasks use
-only `C2C_STANDBY_READY_PRO`. Model names stay unknown because the host does not
-return verified model fields.
+`C2C_STANDBY_READY` and the literal UI-escaped
+`C2C\_STANDBY\_READY` mean user-confirmed non-Pro xhigh. Explicit Pro tasks use
+only `C2C_STANDBY_READY_PRO` or `C2C\_STANDBY\_READY\_PRO`. A marker must be the
+whole raw user-turn text; assistant echoes and extra text do not qualify. Model
+names stay unknown because the host does not return verified model fields.
 
 `session pool claim` holds the global session lock, uses FIFO `createdAt`, and
 atomically saves a permanent `workspaceId + taskId → conversationId` binding.
@@ -46,6 +48,18 @@ A claimed Chat is never returned to stock. If it is deleted, it becomes retired
 and the same task may claim a next generation. A temporary direct-tool failure
 only sets `degraded`; it does not replace the Chat. Empty compatible stock yields
 `POOL_EXHAUSTED` and blocks task content.
+
+## Runtime configuration health
+
+`c2c runtime diagnose` compares the anchor's canonical C2C token-file path
+with the effective launch-environment or persisted-profile header reference.
+It returns paths and state only, never credential contents. A stale persisted
+profile reference is repaired with an atomic replacement after an exact
+preflight match. A stale process-environment reference is repaired atomically
+in the future Windows user-environment launch value; the running Codex process
+still needs a restart. Runtime
+health separately reports stopped, unhealthy, stale, and confirmed
+`invalid_runtime_api_key` states.
 
 ## Boot and direct delivery
 

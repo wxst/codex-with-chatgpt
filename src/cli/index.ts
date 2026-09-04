@@ -38,6 +38,13 @@ import {
   type TransportMode,
 } from "../tunnel/transport-mode.js";
 import {
+  defaultRuntimeProfileFile,
+  diagnoseRuntimeHeader,
+  diagnoseWindowsUserRuntimeHeader,
+  repairRuntimeProfileHeader,
+  repairWindowsUserRuntimeHeader,
+} from "../tunnel/runtime-config.js";
+import {
   ensureWorkspaceOpenAITunnelToken,
   switchWorkspaceTransport,
 } from "../tunnel/switch-transport.js";
@@ -86,6 +93,60 @@ const program = new Command();
 const say = (msg: string): void => {
   process.stdout.write(msg + "\n");
 };
+
+function routerAnchorForWorkspace(root: string): Workspace {
+  const workspace = new Workspace(root);
+  const router = readWorkspaceRouter();
+  const registered = router?.workspaces.some((entry) => entry.workspaceId === workspace.id);
+  return router && registered ? new Workspace(router.anchor.root) : workspace;
+}
+
+function runtimeStatusSummary(runtimeAlias: string): Record<string, unknown> {
+  const result = spawnSync("tunnel-client", ["runtimes", "status", runtimeAlias, "--json"], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  const raw = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  const start = raw.indexOf("{");
+  if (start < 0) {
+    return {
+      available: false,
+      processRunning: false,
+      healthy: false,
+      ready: false,
+      stale: true,
+      errorClass: result.error ? "runtime_status_unavailable" : "runtime_status_unparseable",
+    };
+  }
+  try {
+    const value = JSON.parse(raw.slice(start)) as Record<string, unknown>;
+    const remote = value.remote_lookup_error as { status?: unknown; code?: unknown } | undefined;
+    const remoteError = typeof value.remote_error === "string" ? value.remote_error : "";
+    const invalidRuntimeKey =
+      (remote?.status === 401 && remote?.code === "invalid_api_key")
+      || /\b401\b[\s\S]*\binvalid_api_key\b/iu.test(remoteError);
+    return {
+      available: true,
+      processRunning: value.process_running === true,
+      healthy: value.healthy === true,
+      ready: value.ready === true,
+      stale: value.stale === true,
+      credentialState: invalidRuntimeKey ? "invalid_runtime_api_key" : "not_confirmed_invalid",
+      remoteLookup: invalidRuntimeKey
+        ? { status: 401, code: "invalid_api_key" }
+        : remote ? { status: remote.status ?? null, code: remote.code ?? null } : null,
+    };
+  } catch {
+    return {
+      available: false,
+      processRunning: false,
+      healthy: false,
+      ready: false,
+      stale: true,
+      errorClass: "runtime_status_unparseable",
+    };
+  }
+}
 const check = (msg: string): void => say(`✓ ${msg}`);
 const cross = (msg: string): void => say(`✗ ${msg}`);
 
@@ -1191,14 +1252,14 @@ pool.command("import")
   .requiredOption("--conversation-id <id>")
   .requiredOption("--project-id <id>")
   .requiredOption("--marker-message-id <id>")
-  .option("--pro", "import the explicit Pro standby marker", false)
+  .requiredOption("--marker-text <text>", "exact raw user marker text returned by read_thread")
   .option("--created-at <iso>")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { conversationId: string; projectId: string; markerMessageId: string; pro: boolean; createdAt?: string; json: boolean }) => {
+  .action(async (opts: { conversationId: string; projectId: string; markerMessageId: string; markerText: string; createdAt?: string; json: boolean }) => {
     const entry = await importStandbyConversation({
       conversationId: opts.conversationId,
       projectId: opts.projectId,
-      marker: opts.pro ? "C2C_STANDBY_READY_PRO" : "C2C_STANDBY_READY",
+      markerText: opts.markerText,
       markerMessageId: opts.markerMessageId,
       markerRole: "user",
       createdAt: opts.createdAt,
@@ -1445,6 +1506,90 @@ session.command("clear").description("Forget only this task's ChatGPT conversati
     if (opts.json) say(JSON.stringify({ ok: true, workspaceId: workspace.id, taskId: resolved.taskId, taskIdSource: resolved.source, ...result }));
     else if (!result.cleared) say("当前任务尚未记录 ChatGPT 会话。");
     else check("已清除当前任务会话；项目绑定保持不变");
+  });
+
+const runtime = program.command("runtime").description("Diagnose the managed OpenAI runtime without exposing credentials");
+
+runtime.command("diagnose", { isDefault: true })
+  .description("Compare the effective C2C token-file reference with the Router anchor")
+  .option("-w, --workspace <path>")
+  .option("--runtime-alias <alias>")
+  .option("--profile-file <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; runtimeAlias?: string; profileFile?: string; json: boolean }) => {
+    const anchor = routerAnchorForWorkspace(resolveWorkspace(opts.workspace));
+    const runtimeAlias = opts.runtimeAlias?.trim() || `c2c-${anchor.id}`;
+    const diagnosis = diagnoseRuntimeHeader({
+      canonicalTokenFile: openAITunnelTokenFile(anchor.id),
+      profileFile: opts.profileFile ? path.resolve(opts.profileFile) : defaultRuntimeProfileFile(runtimeAlias),
+      environmentHeaders: process.env.MCP_EXTRA_HEADERS,
+    });
+    const futureUserEnvironment = diagnoseWindowsUserRuntimeHeader({
+      canonicalTokenFile: diagnosis.canonicalTokenFile,
+    });
+    const payload = {
+      ok: true,
+      anchorWorkspaceId: anchor.id,
+      runtimeAlias,
+      header: diagnosis,
+      futureUserEnvironment,
+      runtime: runtimeStatusSummary(runtimeAlias),
+    };
+    if (opts.json) say(JSON.stringify(payload));
+    else {
+      say(`运行时：${runtimeAlias}`);
+      say(`令牌引用：${diagnosis.state} / ${diagnosis.source ?? "未配置"}`);
+      say(`令牌文件：${diagnosis.canonicalTokenFile}`);
+    }
+  });
+
+runtime.command("repair-profile")
+  .description("Atomically replace a stale C2C token-file reference in the persisted runtime profile")
+  .option("-w, --workspace <path>")
+  .option("--runtime-alias <alias>")
+  .option("--profile-file <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; runtimeAlias?: string; profileFile?: string; json: boolean }) => {
+    const anchor = routerAnchorForWorkspace(resolveWorkspace(opts.workspace));
+    const runtimeAlias = opts.runtimeAlias?.trim() || `c2c-${anchor.id}`;
+    const profileFile = opts.profileFile ? path.resolve(opts.profileFile) : defaultRuntimeProfileFile(runtimeAlias);
+    const before = diagnoseRuntimeHeader({
+      canonicalTokenFile: openAITunnelTokenFile(anchor.id),
+      profileFile,
+      environmentHeaders: undefined,
+    });
+    if (before.source !== "profile" || before.state !== "legacy_path" || !before.configuredTokenFile) {
+      throw new Error("runtime profile has no stale C2C token-file reference to repair");
+    }
+    const header = repairRuntimeProfileHeader({
+      profileFile,
+      expectedTokenFile: before.configuredTokenFile,
+      canonicalTokenFile: before.canonicalTokenFile,
+    });
+    const payload = { ok: true, runtimeAlias, header, restartRequired: true };
+    if (opts.json) say(JSON.stringify(payload));
+    else check("运行时 profile 的令牌文件引用已原子更新；请重连原 alias");
+  });
+
+runtime.command("repair-user-environment")
+  .description("Atomically replace the stale Windows user-environment C2C token-file reference")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; json: boolean }) => {
+    const anchor = routerAnchorForWorkspace(resolveWorkspace(opts.workspace));
+    const result = repairWindowsUserRuntimeHeader({ canonicalTokenFile: openAITunnelTokenFile(anchor.id) });
+    const payload = {
+      ok: true,
+      anchorWorkspaceId: anchor.id,
+      previousTokenFile: result.previousTokenFile,
+      canonicalTokenFile: result.canonicalTokenFile,
+      changed: result.changed,
+      restartCodexRequired: result.changed,
+    };
+    if (opts.json) say(JSON.stringify(payload));
+    else check(result.changed
+      ? "用户环境中的旧令牌文件路径已更新；重启 Codex 后生效"
+      : "用户环境中的令牌文件路径已是当前路径");
   });
 
 program

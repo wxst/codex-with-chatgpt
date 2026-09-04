@@ -36,7 +36,9 @@ ChatGPT Project before use:
 
 1. Select the strongest available **non-Pro** model and set thinking to
    **xhigh / 极高**.
-2. Send one user message containing exactly `C2C_STANDBY_READY`.
+2. Send one user message containing exactly `C2C_STANDBY_READY`. ChatGPT can
+   preserve it as the literal `C2C\_STANDBY\_READY`; both complete spellings
+   mean the same non-Pro inventory marker.
 3. For a task whose current user request explicitly asks for Pro, use a separate
    Chat with exactly `C2C_STANDBY_READY_PRO`.
 
@@ -72,6 +74,33 @@ Before reconnecting an existing Router anchor, inspect it with
 `CONTROL_PLANE_TUNNEL_ID` and `CONTROL_PLANE_API_KEY` only in that runtime
 launch environment; never print them.
 
+Use the C2C diagnosis before changing a runtime profile:
+
+```text
+node "__C2C_CHECKOUT__/bin/c2c.js" runtime diagnose -w <workspace> --json
+```
+
+Interpret the result exactly:
+
+- `POOL_EXHAUSTED`: standby inventory is empty; synchronize it before a claim.
+- `processRunning: false`, `healthy: false`, or `ready: false`: the managed
+  Tunnel is stopped; restart its existing runtime launcher and recheck.
+- `credentialState: invalid_runtime_api_key`: the official Runtime API key is
+  invalid; obtain an explicit user confirmation immediately before creating or
+  rotating it in the official runtime settings. Keep the new value only in the
+  local runtime launcher secret store.
+- `header.state: legacy_path` with `header.source: profile`: run
+  `runtime repair-profile` for that same workspace, then reconnect the original
+  alias. It atomically updates only the stale token-file path.
+- `header.state: legacy_path` with `header.source: environment`: the stale path
+  belongs to the current app process. Run `runtime repair-user-environment` to
+  atomically update the future Windows user-environment launch value, then
+  restart Codex. Do not copy a token into a profile; the managed launcher still
+  obtains the canonical path from `c2c setup` when it starts the runtime.
+
+Neither diagnostic nor normal control traffic uses browser, UIA, ChatGPT
+Classic, or ChatGPT Work.
+
 ## Acquire the task Chat
 
 Resolve the task id in this order: `CODEX_THREAD_ID`, explicit `--task-id`, then
@@ -82,26 +111,32 @@ node "__C2C_CHECKOUT__/bin/c2c.js" session get -w <workspace> --task-id <task-id
 ```
 
 If the task has a bound Chat, keep that exact id. If it is absent or explicitly
-retired, inspect the ordinary Chats with Codex App background tools only:
+retired, synchronize inventory before every pool claim. Use Codex App
+background tools only:
 
 1. Call `list_threads`.
 2. Keep only `kind: "chatgpt"` entries in the configured
    **Codex-with-ChatGPT** Project.
-3. Call `read_thread` for each possible entry. Import only a unique user turn
-   containing the exact marker. Do not import a marker in an assistant reply,
-   another Project, or an already claimed conversation.
-4. Import verified inventory and claim one Chat:
+3. Call `read_thread` for each possible entry. Import only a unique **user**
+   turn whose complete raw text is one of `C2C_STANDBY_READY`,
+   `C2C\_STANDBY\_READY`, `C2C_STANDBY_READY_PRO`, or
+   `C2C\_STANDBY\_READY\_PRO`. Do not import a marker in an assistant reply,
+   another Project, a turn with extra text, or an already claimed conversation.
+4. For every verified unowned Chat, run `pool import` with the exact raw text
+   returned by `read_thread`, then claim one Chat:
 
 ```text
 node "__C2C_CHECKOUT__/bin/c2c.js" session pool import \
   --conversation-id <id> --project-id <project-id> \
-  --marker-message-id <user-message-id> --json
+  --marker-message-id <user-message-id> \
+  --marker-text <raw-user-marker-text> --json
 node "__C2C_CHECKOUT__/bin/c2c.js" session pool claim \
   -w <workspace> --task-id <task-id> --json
 ```
 
-For an explicitly Pro task, pass `--pro` to both relevant import and claim.
-Never pass `--pro` from an inferred preference. `pool claim` is globally locked,
+For an explicitly Pro task, pass `--pro` to `pool claim` only. The user marker
+selects the inventory class. Never pass `--pro` from an inferred preference.
+`pool claim` is globally locked,
 uses FIFO order, permanently binds `workspaceId + taskId`, and returns a raw
 `routeToken` once. The token is shown only in this result and must be placed in
 the task Chat's Boot Prompt; do not save, log, or paste it elsewhere.

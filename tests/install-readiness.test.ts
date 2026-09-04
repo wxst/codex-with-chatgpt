@@ -169,13 +169,17 @@ describe("installation documentation contract", () => {
     const verifier = read("scripts/verify-codex-app-host.mjs");
 
     expect(skill).toContain("C2C_STANDBY_READY");
+    expect(skill).toContain("C2C\\_STANDBY\\_READY");
     expect(skill).toContain("session pool claim");
+    expect(skill).toContain("before every pool claim");
+    expect(skill).toContain("--marker-text <raw-user-marker-text>");
     expect(skill).toContain("C2C_ROUTE_TOKEN");
     expect(skill).toContain("route_token");
     expect(skill).toContain("send_message_to_thread");
     expect(skill).toContain("read_thread");
     expect(skill).toContain("Do not use `wait_threads` for ChatGPT Chats");
     expect(cli).toContain('.command("router")');
+    expect(cli).toContain('.command("runtime")');
     expect(cli).toContain('session.command("pool")');
     expect(cli).toContain('pool.command("claim")');
     expect(cli).toContain('pool.command("import")');
@@ -184,11 +188,15 @@ describe("installation documentation contract", () => {
     expect(protocol).toContain("C2C_STANDBY_READY_PRO");
     expect(architecture).toContain("Global C2C Router");
     expect(sessionState).toContain("claimStandbyConversation");
+    expect(sessionState).toContain("parseStandbyMarkerText");
     expect(sessionState).toContain("routeCapabilityId");
     expect(verifier).toContain('"list_threads"');
     expect(verifier).toContain('"read_thread"');
     expect(verifier).toContain('"send_message_to_thread"');
     expect(verifier).not.toContain("create_chatgpt_conversation");
+    expect(skill).toContain("runtime diagnose -w <workspace> --json");
+    expect(skill).toContain("invalid_runtime_api_key");
+    expect(skill).toContain("legacy_path");
   });
 
   it("keeps maximum ChatGPT reasoning offload with repository-aware sources and one writer", () => {
@@ -258,6 +266,13 @@ describe("installation documentation contract", () => {
     expect(cleanupLocked).toBeGreaterThan(revokeLocked);
     expect(cleanupUsesLockNonce).toBeGreaterThan(cleanupLocked);
     expect(finalPostflight).toBeGreaterThan(cleanupUsesLockNonce);
+  });
+
+  it("ships the hidden Windows runtime launcher required by the managed Tunnel task", () => {
+    const launcher = read("scripts/run-hidden-command.vbs");
+    expect(launcher).toContain("WScript.Arguments.Count < 1");
+    expect(launcher).toContain("Replace(value, Chr(34), Chr(34) & Chr(34))");
+    expect(launcher).toContain("shell.Run command, 0, True");
   });
 
   it("keeps Windows ACL inspection input out of the CreateProcess environment", () => {

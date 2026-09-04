@@ -40,8 +40,10 @@ describe("Windows background process contract", () => {
     }
   });
 
-  it("keeps the Router path free of UI launchers", () => {
-    expect(fs.existsSync(path.join(repoRoot, "scripts/run-hidden-command.vbs"))).toBe(false);
+  it("keeps the Router path free of UI launchers while shipping the hidden task supervisor launcher", () => {
+    const launcher = path.join(repoRoot, "scripts/run-hidden-command.vbs");
+    expect(fs.existsSync(launcher)).toBe(true);
+    expect(readSource("scripts/run-hidden-command.vbs")).toContain("shell.Run command, 0, True");
     expect(fs.existsSync(path.join(repoRoot, "scripts/show-chat-bootstrap-dialog.ps1"))).toBe(false);
   });
 });
