@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
@@ -115,6 +116,10 @@ function isRouterState(value: unknown): value is RouterState {
 function readRouterState(): RouterState | null {
   const value = readJsonIfExists<unknown>(routerStateFile());
   if (!isRouterState(value)) return null;
+  return normalizeRouterState(value);
+}
+
+function normalizeRouterState(value: RouterState): RouterState {
   // Version-1 Router snapshots written before expiry metadata remain readable,
   // but their old capabilities are expired rather than silently reactivated.
   return {
@@ -276,4 +281,31 @@ export async function revokeWorkspaceRoutes(workspaceIdInput: string): Promise<v
 
 export function readWorkspaceRouter(): RouterState | null {
   return readRouterState();
+}
+
+export class RouterDiagnosticError extends Error {
+  constructor(readonly errorClass: "router_state_invalid" | "router_state_unavailable") {
+    super(errorClass);
+  }
+}
+
+/** Only a missing file means legacy mode; ambiguous authority must not enable repair. */
+export function readWorkspaceRouterForDiagnostics(): RouterState | null {
+  let text: string;
+  try {
+    text = fs.readFileSync(routerStateFile(), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new RouterDiagnosticError("router_state_unavailable");
+  }
+  let value: unknown;
+  try { value = JSON.parse(text); }
+  catch { throw new RouterDiagnosticError("router_state_invalid"); }
+  if (!isRouterState(value) ||
+      new Set(value.workspaces.map(entry => entry.workspaceId)).size !== value.workspaces.length ||
+      value.workspaces.some(entry => entry.revokedAt !== undefined &&
+        (typeof entry.revokedAt !== "string" || !entry.revokedAt.trim()))) {
+    throw new RouterDiagnosticError("router_state_invalid");
+  }
+  return normalizeRouterState(value);
 }

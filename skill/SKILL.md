@@ -95,11 +95,30 @@ child, and asks `c2c runtime diagnose` for every status check. Do not run raw
 
 Interpret the result exactly:
 
+- `workspaceRegistration` is `registered`, `unregistered`, `revoked`, or
+  `legacy`. With a global Router, `anchorWorkspaceId` and the default
+  `runtimeAlias` always identify that Router's anchor, even when this workspace
+  is not registered. `workspace_not_registered` or `workspace_revoked` is a
+  workspace access condition, not proof of a stopped runtime or bad credential.
+  `ok: false` can therefore coexist with a healthy anchor. Diagnostics never
+  register a workspace; use `router ensure` only for the task's actual working
+  directory when registration is intended. Never move another task's Chat
+  binding just because it belongs to an older worktree.
+- An explicit `--runtime-alias` sets `runtimeAliasSource: explicit`; its runtime
+  result describes that alias, not necessarily the Router anchor. Runtime
+  repair commands refuse unregistered and revoked workspaces before writing.
+- `runtime diagnose` sets top-level `ok` only when registration permits use and
+  the selected runtime is available, running, healthy, ready and not stale.
+  `router_state_invalid` or `router_state_unavailable` stops diagnostics and
+  repair; an unreadable, corrupt or conflicting Router registry is never
+  treated as the absence of a Router.
 - `POOL_EXHAUSTED`: standby inventory is empty; synchronize it before a claim.
-- `processRunning: false`, `healthy: false`, or `ready: false`: the managed
-  Tunnel is stopped; restart its existing runtime launcher and recheck.
+- A runtime lookup error does not prove that the Tunnel is stopped. Inspect
+  `runtime.errorClass` first. Restart the existing launcher only when runtime
+  status actually confirms it is stopped and the task authorizes recovery.
 - `credentialSource: managed_dpapi` and `credentialState: verified`: the
-  managed Key successfully read the exact Tunnel.
+  managed Key successfully read the exact Tunnel. A later alias lookup or
+  output parsing failure must retain this credential result; do not rotate it.
 - `credentialState: invalid`: the managed DPAPI Key received
   `401 invalid_api_key`; obtain explicit user confirmation immediately before
   rotating it in official runtime settings.
@@ -202,6 +221,11 @@ task id, timestamp and missing tool names through Codex feedback/support. Check
 the host's tool configuration and re-open/resume the same task when available.
 Do not rotate credentials, restart a Tunnel, change transport, or claim another
 Chat just because control tools are absent.
+
+For a new task with no binding, report the missing inventory without creating
+a session just to record `host-control`. Do not import an old worktree's owner.
+A completed host turn with no readable message is an observation gap, not
+evidence that tools returned or that an audit completed.
 
 When both return, the result is `readback_required`, not ready. Call
 `read_thread` on the saved conversation id and verify its task/workspace

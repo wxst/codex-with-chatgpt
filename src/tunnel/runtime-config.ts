@@ -134,8 +134,13 @@ export function summarizeManagedRuntimeProbe(probe: ManagedRuntimeProbe): Manage
 function managedRuntimeProbeScript(): string {
   return `
 $ErrorActionPreference = "Stop"
+$credentialState = "missing"
+$apiBlob = $null
+$tunnelIdBlob = $null
 $apiBytes = $null
 $tunnelIdBytes = $null
+$apiKey = $null
+$tunnelId = $null
 
 function Emit-Probe([hashtable]$Value) {
   [Console]::Out.Write(($Value | ConvertTo-Json -Compress -Depth 12))
@@ -146,54 +151,163 @@ try {
   $tunnelIdFile = $env:C2C_MANAGED_RUNTIME_TUNNEL_ID_FILE
   $alias = $env:C2C_MANAGED_RUNTIME_ALIAS
   if ([string]::IsNullOrWhiteSpace($keyFile) -or [string]::IsNullOrWhiteSpace($tunnelIdFile) -or
-      [string]::IsNullOrWhiteSpace($alias) -or -not (Test-Path -LiteralPath $keyFile -PathType Leaf) -or
-      -not (Test-Path -LiteralPath $tunnelIdFile -PathType Leaf)) {
+      [string]::IsNullOrWhiteSpace($alias)) {
     Emit-Probe @{ credentialState = "missing"; errorClass = "managed_credential_file_missing" }
-    exit 0
+    return
   }
 
-  Add-Type -AssemblyName System.Security
-  $apiBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
-    [IO.File]::ReadAllBytes($keyFile), $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser
-  )
-  $tunnelIdBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
-    [IO.File]::ReadAllBytes($tunnelIdFile), $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser
-  )
-  $env:CONTROL_PLANE_API_KEY = [Text.Encoding]::UTF8.GetString($apiBytes)
-  $tunnelId = [Text.Encoding]::UTF8.GetString($tunnelIdBytes)
+  try {
+    $keyExists = Test-Path -LiteralPath $keyFile -PathType Leaf
+    $tunnelIdExists = Test-Path -LiteralPath $tunnelIdFile -PathType Leaf
+  }
+  catch {
+    Emit-Probe @{ credentialState = "missing"; errorClass = "managed_credential_file_unreadable" }
+    return
+  }
+  if (-not $keyExists -or -not $tunnelIdExists) {
+    Emit-Probe @{ credentialState = "missing"; errorClass = "managed_credential_file_missing" }
+    return
+  }
 
   try {
-    $response = Invoke-WebRequest -UseBasicParsing -Method Get -Uri ("https://api.openai.com/v1/tunnels/" + $tunnelId) -Headers @{ Authorization = ("Bearer " + $env:CONTROL_PLANE_API_KEY) } -TimeoutSec 20
-    if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
+    $apiBlob = [IO.File]::ReadAllBytes($keyFile)
+    $tunnelIdBlob = [IO.File]::ReadAllBytes($tunnelIdFile)
+  }
+  catch {
+    Emit-Probe @{ credentialState = "missing"; errorClass = "managed_credential_file_unreadable" }
+    return
+  }
+
+  try {
+    Add-Type -AssemblyName System.Security
+    $apiBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+      $apiBlob, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+    )
+    $tunnelIdBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+      $tunnelIdBlob, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+    )
+    $apiKey = [Text.Encoding]::UTF8.GetString($apiBytes)
+    $tunnelId = [Text.Encoding]::UTF8.GetString($tunnelIdBytes)
+    # tunnel-client may need the same short-lived managed credential for its
+    # status request. It is created only inside this child and cleared below.
+    $env:CONTROL_PLANE_API_KEY = $apiKey
+  }
+  catch {
+    Emit-Probe @{ credentialState = "missing"; errorClass = "managed_credential_dpapi_unreadable" }
+    return
+  }
+
+  try {
+    $response = Invoke-WebRequest -UseBasicParsing -Method Get -Uri ("https://api.openai.com/v1/tunnels/" + $tunnelId) -Headers @{ Authorization = ("Bearer " + $apiKey) } -TimeoutSec 20
+    $status = [int]$response.StatusCode
+    if ($status -eq 401) {
+      Emit-Probe @{ credentialState = "invalid"; remoteLookup = @{ status = 401; code = "invalid_api_key" } }
+      return
+    }
+    if ($status -lt 200 -or $status -ge 300) {
       Emit-Probe @{ credentialState = "missing"; errorClass = "managed_control_plane_probe_failed" }
-      exit 0
+      return
     }
   }
   catch {
     $status = $null
-    if ($null -ne $_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+    try {
+      if ($null -ne $_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+    }
+    catch {
+      $status = $null
+    }
     if ($status -eq 401) {
       Emit-Probe @{ credentialState = "invalid"; remoteLookup = @{ status = 401; code = "invalid_api_key" } }
-      exit 0
+      return
     }
     Emit-Probe @{ credentialState = "missing"; errorClass = "managed_control_plane_probe_failed" }
-    exit 0
+    return
   }
 
-  $raw = (& tunnel-client runtimes status $alias --json 2>&1 | Out-String)
-  $start = $raw.IndexOf("{")
-  if ($start -lt 0) {
-    Emit-Probe @{ credentialState = "verified"; errorClass = "runtime_status_unparseable" }
-    exit 0
+  # The control-plane lookup completed successfully. Runtime query failures
+  # below describe the runtime only and must never downgrade this state.
+  $credentialState = "verified"
+  $runtimeStdout = ""
+  $runtimeStderr = ""
+  $runtimeExitCode = 0
+  $runtimeCommandFailed = $false
+  $stdoutFile = $null
+  $stderrFile = $null
+  try {
+    $stdoutFile = [IO.Path]::GetTempFileName()
+    $stderrFile = [IO.Path]::GetTempFileName()
+    $nativeErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+      $LASTEXITCODE = 0
+      & tunnel-client runtimes status $alias --json 1> $stdoutFile 2> $stderrFile
+      if ($null -ne $LASTEXITCODE) { $runtimeExitCode = [int]$LASTEXITCODE }
+    }
+    catch {
+      $runtimeCommandFailed = $true
+      $runtimeExitCode = -1
+    }
+    finally {
+      $ErrorActionPreference = $nativeErrorActionPreference
+    }
+
+    try {
+      if ($null -ne $stdoutFile) { $runtimeStdout = [IO.File]::ReadAllText($stdoutFile) }
+      if ($null -ne $stderrFile) { $runtimeStderr = [IO.File]::ReadAllText($stderrFile) }
+    }
+    catch {
+      Emit-Probe @{ credentialState = "verified"; errorClass = "runtime_status_output_unreadable" }
+      return
+    }
   }
-  $runtime = $raw.Substring($start) | ConvertFrom-Json
+  finally {
+    if ($null -ne $stdoutFile) { Remove-Item -LiteralPath $stdoutFile -Force -ErrorAction SilentlyContinue }
+    if ($null -ne $stderrFile) { Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue }
+  }
+
+  $start = $runtimeStdout.IndexOf("{")
+  if ($start -lt 0) {
+    if ($runtimeCommandFailed -or $runtimeExitCode -ne 0) {
+      Emit-Probe @{ credentialState = "verified"; errorClass = "runtime_status_command_failed" }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($runtimeStderr)) {
+      Emit-Probe @{ credentialState = "verified"; errorClass = "runtime_status_stderr" }
+    }
+    else {
+      Emit-Probe @{ credentialState = "verified"; errorClass = "runtime_status_unparseable" }
+    }
+    return
+  }
+
+  try {
+    $runtime = $runtimeStdout.Substring($start) | ConvertFrom-Json
+  }
+  catch {
+    Emit-Probe @{ credentialState = "verified"; errorClass = "runtime_status_invalid_json" }
+    return
+  }
+
+  if ($runtimeCommandFailed -or $runtimeExitCode -ne 0) {
+    Emit-Probe @{ credentialState = "verified"; errorClass = "runtime_status_command_failed" }
+    return
+  }
   Emit-Probe @{ credentialState = "verified"; runtime = $runtime }
 }
 catch {
-  Emit-Probe @{ credentialState = "missing"; errorClass = "managed_credential_unreadable" }
+  if ($credentialState -eq "verified") {
+    Emit-Probe @{ credentialState = "verified"; errorClass = "runtime_status_probe_failed" }
+  }
+  else {
+    Emit-Probe @{ credentialState = "missing"; errorClass = "managed_credential_unreadable" }
+  }
 }
 finally {
   Remove-Item Env:CONTROL_PLANE_API_KEY, Env:CONTROL_PLANE_TUNNEL_ID -ErrorAction SilentlyContinue
+  $apiKey = $null
+  $tunnelId = $null
+  if ($null -ne $apiBlob) { [Array]::Clear($apiBlob, 0, $apiBlob.Length) }
+  if ($null -ne $tunnelIdBlob) { [Array]::Clear($tunnelIdBlob, 0, $tunnelIdBlob.Length) }
   if ($null -ne $apiBytes) { [Array]::Clear($apiBytes, 0, $apiBytes.Length) }
   if ($null -ne $tunnelIdBytes) { [Array]::Clear($tunnelIdBytes, 0, $tunnelIdBytes.Length) }
 }

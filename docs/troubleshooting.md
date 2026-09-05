@@ -1,13 +1,37 @@
 # Troubleshooting
 
-First move, always:
+Start with read-only checks against the task's actual working directory:
 
 ```
-c2c doctor
+c2c router status --json
+c2c status -w <workspace> --json
+c2c runtime diagnose -w <workspace> --json
 ```
 
-It checks Node, workspace, bridge, MCP, OAuth and tunnel — and repairs what it
-can (restarts the bridge, restarts the tunnel) without asking.
+With a global Router, the default runtime alias belongs to `anchorWorkspaceId`.
+`workspaceRegistration: unregistered` or `revoked` is separate from anchor
+health. `ok: false` with `workspace_not_registered` and a healthy runtime means
+the workspace needs registration, not new credentials or a restarted Tunnel.
+Use `c2c router ensure -w <workspace> --json` only when registering that actual
+workspace is intended. Do not transfer another task's Chat binding.
+
+`runtime.errorClass` identifies the failed stage. An unknown alias or malformed
+runtime response does not undo `credentialState: verified`. An explicit
+`--runtime-alias` is marked by `runtimeAliasSource: explicit`. Runtime repair
+commands refuse unregistered/revoked workspaces before changing configuration.
+`router_state_invalid` / `router_state_unavailable` stops both diagnosis and
+repair; restore the registry's validity/access rather than treating it as a
+missing Router. Duplicate registrations are invalid regardless of ordering.
+Top-level `runtime diagnose.ok` is true only when registration and runtime
+health both pass; consult the separate fields to identify the failing layer.
+
+Missing `read_thread` / `send_message_to_thread` belongs to the Codex host's
+tool inventory. Follow [host-control recovery](host-control.md); Router health
+and proxy inventory cannot establish that the consumer model sees these tools.
+Do not restart the Tunnel or rotate credentials to repair missing host tools.
+
+`c2c doctor` may restart services. Use it only when recovery is authorized, or
+pass `--no-fix` for diagnosis.
 
 ## Common situations
 

@@ -5,10 +5,12 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
 import { startWorkspaceRouter } from "../router/server.js";
+import { resolveWorkspaceRuntimeContext, runtimeContextSummary, type WorkspaceRuntimeContext } from "../router/diagnostics.js";
 import {
   createWorkspaceRouter,
   issueRouteCapability,
   readWorkspaceRouter,
+  RouterDiagnosticError,
 } from "../router/state.js";
 import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
@@ -99,14 +101,26 @@ const say = (msg: string): void => {
   process.stdout.write(msg + "\n");
 };
 
-function routerAnchorForWorkspace(root: string): Workspace {
-  const workspace = new Workspace(root);
-  const router = readWorkspaceRouter();
-  const registered = router?.workspaces.some((entry) => entry.workspaceId === workspace.id);
-  return router && registered ? new Workspace(router.anchor.root) : workspace;
+function diagnosticContext(root: string, json: boolean): WorkspaceRuntimeContext | null {
+  try { return resolveWorkspaceRuntimeContext(root); }
+  catch (error) {
+    if (!(error instanceof RouterDiagnosticError)) throw error;
+    if (json) say(JSON.stringify({ ok: false, errorClass: error.errorClass }));
+    else cross(`${error.errorClass}：无法确认 Router 状态，诊断和修复已停止。`);
+    process.exitCode = 1;
+    return null;
+  }
 }
 
-function runtimeStatusSummary(runtimeAlias: string): Record<string, unknown> {
+function rejectUnregisteredRuntimeRepair(context: WorkspaceRuntimeContext, json: boolean): boolean {
+  if (!context.errorClass) return false;
+  if (json) say(JSON.stringify({ ok: false, ...runtimeContextSummary(context) }));
+  else cross(`${context.errorClass}：工作区没有有效 Router 注册，不能修改锚点运行时配置。`);
+  process.exitCode = 1;
+  return true;
+}
+
+function runtimeStatusSummary(runtimeAlias: string) {
   return { ...probeManagedRuntime({ runtimeAlias }) };
 }
 const check = (msg: string): void => say(`✓ ${msg}`);
@@ -549,33 +563,34 @@ program
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
-    const workspace = new Workspace(root);
-    const router = readWorkspaceRouter();
-    const registered = router?.workspaces.some((entry) => entry.workspaceId === workspace.id && !entry.revokedAt);
-    const anchor = router && registered ? new Workspace(router.anchor.root) : workspace;
+    const context = diagnosticContext(root, opts.json);
+    if (!context) return;
+    const { workspace, anchor } = context;
     const runtime = await findLiveBridge(anchor.id);
     if (!runtime) {
-      if (opts.json) say(JSON.stringify({ ok: false, running: false, workspaceId: workspace.id, anchorWorkspaceId: anchor.id }));
-      else say("Bridge 未运行。使用 `c2c start` 启动。");
+      if (opts.json) say(JSON.stringify({ ok: false, running: false, ...runtimeContextSummary(context) }));
+      else {
+        if (context.errorClass) say(`工作区注册：${context.errorClass}`);
+        say(`${context.router ? "全局 Router" : "Bridge"} 未运行。`);
+      }
       return;
     }
     const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     if (opts.json) {
       say(JSON.stringify({
-        ok: true,
+        ok: !context.errorClass,
         running: true,
         ...info,
-        workspaceId: workspace.id,
+        ...runtimeContextSummary(context),
         workspaceName: workspace.name,
-        anchorWorkspaceId: anchor.id,
-        router: Boolean(router && registered),
       }));
       return;
     }
     say(PRODUCT_NAME);
     say("");
     check(`Workspace：${workspace.name}`);
-    check(`${router && registered ? "Router" : "Bridge"}：运行中（端口 ${info.port}）`);
+    if (context.errorClass) say(`工作区注册：${context.errorClass}；此状态不代表锚点运行时故障。`);
+    check(`${context.router ? "全局 Router" : "Bridge"}：运行中（端口 ${info.port}）`);
     check(`传输模式：${info.transportMode === "openai" ? "OpenAI Secure MCP Tunnel" : "Cloudflare fallback"}`);
     if (info.transportMode === "openai") {
       say("· 公网 MCP 入口：关闭");
@@ -1608,17 +1623,23 @@ runtime.command("diagnose", { isDefault: true })
   .option("--runtime-alias <alias>")
   .option("--json", "machine-readable output", false)
   .action((opts: { workspace?: string; runtimeAlias?: string; json: boolean }) => {
-    const anchor = routerAnchorForWorkspace(resolveWorkspace(opts.workspace));
+    const context = diagnosticContext(resolveWorkspace(opts.workspace), opts.json);
+    if (!context) return;
+    const { anchor } = context;
     const runtimeAlias = opts.runtimeAlias?.trim() || `c2c-${anchor.id}`;
     const runtime = runtimeStatusSummary(runtimeAlias);
     const payload = {
-      ok: true,
-      anchorWorkspaceId: anchor.id,
+      ok: !context.errorClass && runtime.available && runtime.processRunning &&
+        runtime.healthy && runtime.ready && !runtime.stale && !runtime.errorClass,
+      ...runtimeContextSummary(context),
       runtimeAlias,
+      runtimeAliasSource: opts.runtimeAlias?.trim() ? "explicit" : context.router ? "router_anchor" : "legacy_workspace",
       runtime,
     };
     if (opts.json) say(JSON.stringify(payload));
     else {
+      say(`工作区注册：${context.workspaceRegistration}`);
+      if (context.errorClass) say(`工作区状态：${context.errorClass}；以下为所选运行时的独立诊断。`);
       say(`运行时：${runtimeAlias}`);
       say(`凭据来源：${runtime.credentialSource}`);
       say(`凭据状态：${runtime.credentialState}`);
@@ -1633,7 +1654,10 @@ runtime.command("repair-profile")
   .option("--profile-file <path>")
   .option("--json", "machine-readable output", false)
   .action((opts: { workspace?: string; runtimeAlias?: string; profileFile?: string; json: boolean }) => {
-    const anchor = routerAnchorForWorkspace(resolveWorkspace(opts.workspace));
+    const context = diagnosticContext(resolveWorkspace(opts.workspace), opts.json);
+    if (!context) return;
+    if (rejectUnregisteredRuntimeRepair(context, opts.json)) return;
+    const { anchor } = context;
     const runtimeAlias = opts.runtimeAlias?.trim() || `c2c-${anchor.id}`;
     const profileFile = opts.profileFile ? path.resolve(opts.profileFile) : defaultRuntimeProfileFile(runtimeAlias);
     const before = diagnoseRuntimeHeader({
@@ -1659,7 +1683,10 @@ runtime.command("repair-user-environment")
   .option("-w, --workspace <path>")
   .option("--json", "machine-readable output", false)
   .action((opts: { workspace?: string; json: boolean }) => {
-    const anchor = routerAnchorForWorkspace(resolveWorkspace(opts.workspace));
+    const context = diagnosticContext(resolveWorkspace(opts.workspace), opts.json);
+    if (!context) return;
+    if (rejectUnregisteredRuntimeRepair(context, opts.json)) return;
+    const { anchor } = context;
     const result = repairWindowsUserRuntimeHeader({ canonicalTokenFile: openAITunnelTokenFile(anchor.id) });
     const payload = {
       ok: true,

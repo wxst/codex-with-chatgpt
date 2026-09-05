@@ -40,3 +40,22 @@ See the [Skill](../skill/SKILL.md#host-control-preflight-and-recovery) for comma
 and HEAD-specific review rules. Report missing tools to Codex feedback/support
 with host version, timestamp, task id and tool names. Never include credentials,
 route tokens, or private message bodies. C2C cannot fix host tool injection.
+
+An unbound task reports its actual tool inventory without creating an owner or
+claiming a Chat just to save a host observation. A different worktree's existing
+owner is not transferable. A completed host turn with no readable messages is
+an observation gap; neither completion metadata nor another task's available
+tools proves consumer recovery.
+
+`status` and `runtime diagnose` report `workspaceRegistration` independently of
+the global anchor's health. Unregistered/revoked workspaces return
+`workspace_not_registered`/`workspace_revoked`; they do not cause the CLI to
+invent a per-workspace runtime alias. `runtimeAliasSource: explicit` identifies
+an explicitly selected alias. Runtime lookup failures preserve any successful
+managed credential validation. Register only the actual execution workspace
+when intended; diagnose does not register, and runtime repair commands reject
+unregistered/revoked workspaces before modifying anchor configuration.
+Malformed, unreadable or duplicate Router registrations stop diagnostics and
+repair with `router_state_invalid` or `router_state_unavailable`; they cannot
+select legacy mode. `runtime diagnose` top-level `ok` also requires the selected
+runtime to be available, running, healthy, ready, non-stale and free of errors.
