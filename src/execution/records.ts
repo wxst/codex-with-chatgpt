@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 import { ensureDir, getStateDir } from "../config/paths.js";
 
 /**
@@ -7,15 +8,17 @@ import { ensureDir, getStateDir } from "../config/paths.js";
  * iteration (via `c2c record`). ChatGPT reads them through the
  * `execution_summary` and `test_status` MCP tools.
  */
-export interface ExecutionRecord {
-  taskId: string;
-  iteration: number;
-  changedFiles: string[] | number;
-  tests: string | null;
-  exitStatus: "ok" | "failed" | "blocked" | string;
-  timestamp: string;
-  notes?: string;
-}
+export const executionRecordSchema = z.object({
+  taskId: z.string(),
+  iteration: z.number().int().nonnegative(),
+  changedFiles: z.union([z.array(z.string()), z.number().int().nonnegative()]),
+  tests: z.string().nullable(),
+  exitStatus: z.string(),
+  timestamp: z.string(),
+  notes: z.string().optional(),
+});
+
+export type ExecutionRecord = z.infer<typeof executionRecordSchema>;
 
 function recordsFile(workspaceId: string): string {
   const dir = ensureDir(path.join(getStateDir(), "executions"));
@@ -23,23 +26,26 @@ function recordsFile(workspaceId: string): string {
 }
 
 export function appendExecutionRecord(workspaceId: string, record: ExecutionRecord): void {
+  const validated = executionRecordSchema.parse(record);
   const file = recordsFile(workspaceId);
-  fs.appendFileSync(file, JSON.stringify(record) + "\n", { mode: 0o600 });
+  fs.appendFileSync(file, JSON.stringify(validated) + "\n", { mode: 0o600 });
 }
 
 export function readExecutionRecords(workspaceId: string, limit = 10): ExecutionRecord[] {
   const file = recordsFile(workspaceId);
   if (!fs.existsSync(file)) return [];
   const lines = fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean);
+  const requestedLimit = Math.max(1, Math.floor(limit));
   const records: ExecutionRecord[] = [];
-  for (const line of lines.slice(-limit)) {
+  for (let index = lines.length - 1; index >= 0 && records.length < requestedLimit; index--) {
     try {
-      records.push(JSON.parse(line) as ExecutionRecord);
+      const parsed = executionRecordSchema.safeParse(JSON.parse(lines[index]));
+      if (parsed.success) records.push(parsed.data);
     } catch {
       // skip corrupt lines
     }
   }
-  return records;
+  return records.reverse();
 }
 
 export function latestExecutionRecord(workspaceId: string): ExecutionRecord | null {

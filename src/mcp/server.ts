@@ -4,7 +4,7 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { searchWorkspace } from "../workspace/search.js";
 import { gitDiff, gitInfo, gitStatus, type DiffMode } from "../workspace/git.js";
-import { latestExecutionRecord, readExecutionRecords } from "../execution/records.js";
+import { executionRecordSchema, latestExecutionRecord, readExecutionRecords } from "../execution/records.js";
 import type { Logger } from "../logger/index.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 
@@ -14,14 +14,18 @@ const UNTRUSTED_NOTE =
 
 type ToolResult = {
   content: { type: "text"; text: string }[];
+  structuredContent?: Record<string, unknown>;
   isError?: boolean;
 };
 
 type HandlerExtra = { authInfo?: AuthInfo };
 type RouteArgs = { route_token?: string };
 
-function ok(data: unknown): ToolResult {
-  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+function ok<T extends object>(data: T): ToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+    structuredContent: data as Record<string, unknown>,
+  };
 }
 
 function fail(code: string, message: string): ToolResult {
@@ -44,6 +48,108 @@ function requireScope(authInfo: AuthInfo | undefined, scope: string): ToolResult
   }
   return null;
 }
+
+const gitIdentityOutputSchema = z.object({
+  isRepo: z.boolean(),
+  branch: z.string().nullable(),
+  commit: z.string().nullable(),
+  dirty: z.boolean(),
+});
+
+const workspaceInfoOutputSchema = {
+  workspaceId: z.string(),
+  workspaceName: z.string(),
+  rootAlias: z.string(),
+  routeTaskId: z.string().optional(),
+  projectType: z.string(),
+  languages: z.array(z.string()),
+  frameworks: z.array(z.string()),
+  packageManager: z.string().nullable(),
+  scripts: z.record(z.string()),
+  git: gitIdentityOutputSchema,
+};
+
+const directoryEntryOutputSchema = z.object({
+  path: z.string(),
+  type: z.enum(["file", "dir"]),
+  sizeBytes: z.number().int().nonnegative().optional(),
+});
+
+const listDirectoryOutputSchema = {
+  path: z.string(),
+  entries: z.array(directoryEntryOutputSchema),
+  total: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative(),
+  limit: z.number().int().positive(),
+  hasMore: z.boolean(),
+};
+
+const readFileOutputSchema = {
+  path: z.string(),
+  sizeBytes: z.number().int().nonnegative(),
+  totalLines: z.number().int().nonnegative(),
+  startLine: z.number().int().positive(),
+  endLine: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+  remainingLines: z.number().int().nonnegative(),
+  nextStartLine: z.number().int().positive().nullable(),
+  content: z.string(),
+};
+
+const searchMatchOutputSchema = z.object({
+  path: z.string(),
+  line: z.number().int().nonnegative(),
+  text: z.string(),
+});
+
+const searchWorkspaceOutputSchema = {
+  matches: z.array(searchMatchOutputSchema),
+  matchCount: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+  engine: z.enum(["ripgrep", "node"]),
+};
+
+const gitChangeOutputSchema = z.object({
+  path: z.string(),
+  change: z.string(),
+});
+
+const gitStatusOutputSchema = {
+  isRepo: z.boolean(),
+  branch: z.string().nullable(),
+  upstream: z.string().nullable(),
+  ahead: z.number().int().nonnegative(),
+  behind: z.number().int().nonnegative(),
+  staged: z.array(gitChangeOutputSchema),
+  unstaged: z.array(gitChangeOutputSchema),
+  untracked: z.array(z.string()),
+  conflicted: z.array(z.string()),
+};
+
+const gitDiffOutputSchema = {
+  isRepo: z.boolean(),
+  mode: z.enum(["unstaged", "staged", "head"]),
+  totalBytes: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative(),
+  returnedBytes: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+  nextOffset: z.number().int().nonnegative().nullable(),
+  diff: z.string(),
+};
+
+const testStatusOutputSchema = {
+  available: z.boolean(),
+  message: z.string().optional(),
+  taskId: z.string().optional(),
+  iteration: z.number().int().nonnegative().optional(),
+  tests: z.string().nullable().optional(),
+  exitStatus: z.string().optional(),
+  timestamp: z.string().optional(),
+};
+
+const executionSummaryOutputSchema = {
+  records: z.array(executionRecordSchema),
+};
 
 export interface McpContext {
   /** Legacy, single-workspace bridge context. */
@@ -97,6 +203,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `Get an overview of the connected workspace: identity, project type, languages, ` +
         `frameworks, git state and available scripts. Call this first. ${UNTRUSTED_NOTE}`,
       inputSchema: withRouteToken({}),
+      outputSchema: workspaceInfoOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args: RouteArgs, extra: HandlerExtra) => {
@@ -140,6 +247,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
         limit: z.number().int().min(1).max(1000).default(200),
         offset: z.number().int().min(0).default(0),
       }),
+      outputSchema: listDirectoryOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args: RouteArgs & { path: string; depth: number; limit: number; offset: number }, extra: HandlerExtra) => {
@@ -169,6 +277,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
         start_line: z.number().int().min(1).optional().describe("1-based first line to return"),
         end_line: z.number().int().min(1).optional().describe("1-based last line to return"),
       }),
+      outputSchema: readFileOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args: RouteArgs & { path: string; start_line?: number; end_line?: number }, extra: HandlerExtra) => {
@@ -199,6 +308,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
         limit: z.number().int().min(1).max(200).default(50),
         regex: z.boolean().default(false).describe("Treat query as a regular expression"),
       }),
+      outputSchema: searchWorkspaceOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args: RouteArgs & { query: string; path?: string; glob?: string; limit: number; regex: boolean }, extra: HandlerExtra) => {
@@ -221,6 +331,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
       title: "Git status",
       description: `Structured git status of the workspace: branch, staged/unstaged/untracked files. ${UNTRUSTED_NOTE}`,
       inputSchema: withRouteToken({}),
+      outputSchema: gitStatusOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args: RouteArgs, extra: HandlerExtra) => {
@@ -250,6 +361,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
         offset: z.number().int().min(0).default(0).describe("Byte offset for pagination"),
         max_bytes: z.number().int().min(1024).max(262144).default(65536),
       }),
+      outputSchema: gitDiffOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args: RouteArgs & { mode: DiffMode; path?: string; offset: number; max_bytes: number }, extra: HandlerExtra) => {
@@ -284,6 +396,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `Summary of the most recent test run reported by the Codex harness. This does NOT run ` +
         `tests; it reads the latest execution record. ${UNTRUSTED_NOTE}`,
       inputSchema: withRouteToken({}),
+      outputSchema: testStatusOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args: RouteArgs, extra: HandlerExtra) => {
@@ -320,6 +433,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
       inputSchema: withRouteToken({
         limit: z.number().int().min(1).max(50).default(5),
       }),
+      outputSchema: executionSummaryOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args: RouteArgs & { limit: number }, extra: HandlerExtra) => {

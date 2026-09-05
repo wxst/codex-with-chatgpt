@@ -27,6 +27,14 @@ Tunnel alias, port, and connector remain attached to the anchor.
 bridges use their original schemas. Router bridges require `route_token` on all
 eight tool schemas and resolve the workspace per request.
 
+Each of the eight tools declares an output schema. Successful results expose
+the same data as both JSON text and `structuredContent`, preserving existing
+text clients while supporting structured consumers. Routed `workspace_info`
+also retains `routeTaskId`. Errors remain `isError` text results and do not
+expose successful structured data. Execution records and project metadata are
+validated before they feed these schemas; malformed history is skipped without
+rewriting the persisted log.
+
 ## Session pool
 
 `src/session/state.ts` holds task delivery state plus a global standby-pool

@@ -19,8 +19,10 @@ function textOf(result: { content?: unknown }): string {
   return content?.[0]?.text ?? "";
 }
 
-function jsonOf<T = Record<string, unknown>>(result: { content?: unknown }): T {
-  return JSON.parse(textOf(result)) as T;
+function jsonOf<T = Record<string, unknown>>(result: { content?: unknown; structuredContent?: unknown }): T {
+  const textData = JSON.parse(textOf(result)) as T;
+  expect(result.structuredContent).toEqual(textData);
+  return textData;
 }
 
 beforeAll(async () => {
@@ -80,6 +82,10 @@ describe("MCP tools over Streamable HTTP", () => {
       "test_status",
       "workspace_info",
     ]);
+    for (const tool of tools) {
+      expect(tool.outputSchema?.type).toBe("object");
+      expect(Object.keys(tool.outputSchema?.properties ?? {})).not.toHaveLength(0);
+    }
     // no write tools in V1
     for (const forbidden of ["write_file", "delete_file", "execute_shell", "git_commit", "install_package"]) {
       expect(names).not.toContain(forbidden);
@@ -107,6 +113,7 @@ describe("MCP tools over Streamable HTTP", () => {
     expect(result.isError).toBe(true);
     expect(textOf(result)).toContain("ACCESS_DENIED_SENSITIVE_FILE");
     expect(textOf(result)).not.toContain("supersecret");
+    expect(result.structuredContent).toBeUndefined();
   });
 
   it("read_file denies paths outside the workspace", async () => {
@@ -171,6 +178,11 @@ describe("MCP tools over Streamable HTTP", () => {
     }
   });
 
+  it("empty execution results are structured and retain their legacy text", async () => {
+    expect(jsonOf(await client.callTool({ name: "test_status", arguments: {} }))).toMatchObject({ available: false });
+    expect(jsonOf(await client.callTool({ name: "execution_summary", arguments: {} }))).toEqual({ records: [] });
+  });
+
   it("execution_summary and test_status read harness records", async () => {
     appendExecutionRecord(bridge.workspace.id, {
       taskId: "c2c_test1",
@@ -192,6 +204,15 @@ describe("MCP tools over Streamable HTTP", () => {
     expect(status.tests).toBe("27 passed");
   });
 
+  it("invalid persisted records cannot poison structured execution responses", async () => {
+    const file = path.join(stateRoot, "executions", `${bridge.workspace.id}.jsonl`);
+    fs.appendFileSync(file, '\nnull\n[]\n{"iteration":null}\nnot-json\n');
+    const status = jsonOf<{ taskId: string }>(await client.callTool({ name: "test_status", arguments: {} }));
+    expect(status.taskId).toBe("c2c_test1");
+    const summary = jsonOf<{ records: { taskId: string }[] }>(await client.callTool({ name: "execution_summary", arguments: { limit: 1 } }));
+    expect(summary.records.map(x => x.taskId)).toEqual(["c2c_test1"]);
+  });
+
   it("enforces scopes per tool", async () => {
     const limited = bridge.authStore.issueTokens({ clientId: "limited", scopes: ["workspace.read"] });
     const limitedClient = new Client({ name: "limited", version: "1.0.0" });
@@ -203,6 +224,7 @@ describe("MCP tools over Streamable HTTP", () => {
       const denied = await limitedClient.callTool({ name: "git_diff", arguments: {} });
       expect(denied.isError).toBe(true);
       expect(textOf(denied)).toContain("INSUFFICIENT_SCOPE");
+      expect(denied.structuredContent).toBeUndefined();
       const allowed = await limitedClient.callTool({ name: "read_file", arguments: { path: "hello.txt" } });
       expect(allowed.isError ?? false).toBe(false);
     } finally {

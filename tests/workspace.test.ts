@@ -188,4 +188,59 @@ describe("workspace identity", () => {
     expect(namedWs.projectConfig.maxIterations).toBe(12);
     cleanup(named);
   });
+
+  it("falls back to the directory name for malformed .c2c.json metadata", () => {
+    const malformedConfigs: unknown[] = [
+      null,
+      [],
+      { name: 42, maxIterations: "many" },
+    ];
+
+    for (const [index, config] of malformedConfigs.entries()) {
+      const invalid = makeTmpDir(`invalid-project-config-${index}`);
+      write(invalid, ".c2c.json", JSON.stringify(config));
+
+      const invalidWs = new Workspace(invalid);
+
+      expect(invalidWs.name).toBe(path.basename(invalid));
+      expect(invalidWs.projectConfig).toEqual({});
+      cleanup(invalid);
+    }
+  });
+
+  it("filters malformed package scripts and dependency metadata", () => {
+    const projectRoots = [
+      {
+        name: "invalid-package-shapes",
+        packageJson: {
+          scripts: null,
+          dependencies: [],
+          devDependencies: null,
+        },
+        expectedScripts: {},
+        expectedFrameworks: [],
+      },
+      {
+        name: "invalid-package-values",
+        packageJson: {
+          scripts: { test: "vitest run", invalid: 42, nullable: null, array: [] },
+          dependencies: { react: {}, express: "^5.0.0" },
+          devDependencies: { vitest: [], jest: "^30.0.0" },
+        },
+        expectedScripts: { test: "vitest run" },
+        expectedFrameworks: ["Express", "Jest"],
+      },
+    ];
+
+    for (const fixture of projectRoots) {
+      const projectRoot = makeTmpDir(fixture.name);
+      write(projectRoot, "package.json", JSON.stringify(fixture.packageJson));
+
+      const project = new Workspace(projectRoot).detectProject();
+
+      expect(project.scripts).toEqual(fixture.expectedScripts);
+      expect(project.frameworks).toEqual(fixture.expectedFrameworks);
+      cleanup(projectRoot);
+    }
+  });
 });

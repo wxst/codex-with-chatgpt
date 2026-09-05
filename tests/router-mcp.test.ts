@@ -91,6 +91,7 @@ describe("router MCP capability boundary", () => {
     expect(tools).toHaveLength(8);
     for (const tool of tools) {
       expect(tool.inputSchema.required).toContain("route_token");
+      expect(tool.outputSchema?.type).toBe("object");
     }
   });
 
@@ -101,6 +102,7 @@ describe("router MCP capability boundary", () => {
     });
     expect(missing.isError).toBe(true);
     expect(textOf(missing)).toContain("ROUTE_ACCESS_DENIED");
+    expect(missing.structuredContent).toBeUndefined();
 
     const [alpha, beta] = await Promise.all([
       client.callTool({ name: "read_file", arguments: { route_token: alphaToken, path: "identity.txt" } }),
@@ -110,5 +112,17 @@ describe("router MCP capability boundary", () => {
     expect(textOf(alpha)).not.toContain("beta");
     expect(textOf(beta)).toContain("beta");
     expect(textOf(beta)).not.toContain("alpha");
+    expect(alpha.structuredContent).toEqual(JSON.parse(textOf(alpha)));
+    expect(beta.structuredContent).toEqual(JSON.parse(textOf(beta)));
+    expect((alpha.structuredContent as { content: string }).content).toBe("alpha");
+    expect((beta.structuredContent as { content: string }).content).toBe("beta");
+  });
+
+  it("retains task identity in structured workspace_info", async () => {
+    for (const [token, taskId] of [[alphaToken, "alpha-task"], [betaToken, "beta-task"]]) {
+      const result = await client.callTool({ name: "workspace_info", arguments: { route_token: token } });
+      expect(result.structuredContent).toEqual(JSON.parse(textOf(result)));
+      expect(result.structuredContent).toMatchObject({ routeTaskId: taskId });
+    }
   });
 });

@@ -1,4 +1,4 @@
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -114,6 +114,34 @@ const cross = (msg: string): void => say(`✗ ${msg}`);
 
 function resolveWorkspace(option?: string): string {
   return path.resolve(option ?? process.cwd());
+}
+
+function parseInteger(value: string): number {
+  const normalized = value.trim();
+  if (!/^-?\d+$/u.test(normalized)) {
+    throw new InvalidArgumentError("must be an integer");
+  }
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed)) throw new InvalidArgumentError("must be a safe integer");
+  return parsed;
+}
+
+function parseNonNegativeInteger(value: string): number {
+  const parsed = parseInteger(value);
+  if (parsed < 0) throw new InvalidArgumentError("must be a non-negative integer");
+  return parsed;
+}
+
+function parseChangedFiles(value: string): string[] | number {
+  const normalized = value.trim();
+  if (/^-?\d+$/u.test(normalized)) {
+    const count = parseInteger(normalized);
+    if (count < 0) {
+      throw new InvalidArgumentError("changed-files count must be a non-negative safe integer");
+    }
+    return count;
+  }
+  return value.split(",").map((file) => file.trim()).filter(Boolean);
 }
 
 function persistWorkspaceEndpoint(opts: {
@@ -1652,7 +1680,7 @@ program
   .description("Record a Codex execution summary (used by the Skill)")
   .option("-w, --workspace <path>")
   .requiredOption("--task <id>")
-  .requiredOption("--iteration <n>")
+  .requiredOption("--iteration <n>", "non-negative execution iteration", parseNonNegativeInteger)
   .option("--changed-files <filesOrCount>", "comma-separated files or a count", "0")
   .option("--tests <summary>", "e.g. '27 passed'")
   .option("--exit-status <status>", "ok | failed | blocked", "ok")
@@ -1661,19 +1689,17 @@ program
     (opts: {
       workspace?: string;
       task: string;
-      iteration: string;
+      iteration: number;
       changedFiles: string;
       tests?: string;
       exitStatus: string;
       notes?: string;
     }) => {
+      const changed = parseChangedFiles(opts.changedFiles);
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
-      const changed = /^\d+$/.test(opts.changedFiles)
-        ? parseInt(opts.changedFiles, 10)
-        : opts.changedFiles.split(",").map((file) => file.trim()).filter(Boolean);
       appendExecutionRecord(workspace.id, {
         taskId: opts.task,
-        iteration: parseInt(opts.iteration, 10),
+        iteration: opts.iteration,
         changedFiles: changed,
         tests: opts.tests ?? null,
         exitStatus: opts.exitStatus,
