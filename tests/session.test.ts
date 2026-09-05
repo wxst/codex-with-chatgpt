@@ -120,7 +120,6 @@ describe("task-scoped standby session registry", () => {
     await claimedTask();
     const messageId = newMessageId();
     await beginTaskSend("workspace123", "task-a", messageId, 0, { bootstrap: true });
-    await confirmTaskSendAccepted("workspace123", "task-a", messageId);
 
     await expect(
       failTaskDelivery("workspace123", "task-a", messageId, "delivery_absent", "short readback window elapsed")

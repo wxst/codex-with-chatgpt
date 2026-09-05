@@ -24,6 +24,11 @@ failures set `channelState: degraded` without removing pending receipt fields.
 Recovery derives `sending` versus `awaiting_reply` from those fields; it never
 infers delivery from restored capability. Uncertain invocation is sticky across
 probes. Lack of `sendAcceptedAt` alone never proves a call was not made.
+An explicit `host_rejected` result conflicting with an existing acceptance or
+delivery receipt is rejected; preserve the reservation and read the original
+Chat. Failure JSON retains observed acceptance/delivery facts. A successful
+readback after an uncertain send may therefore have `accepted: false` and
+`delivered: true` (no host acknowledgement was recorded).
 
 The CLI requires a preflight no older than 60 seconds. Existing library callers
 without a host observation remain compatible; once present, a non-ready host

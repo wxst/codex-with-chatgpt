@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import { beginTaskSend, claimStandbyConversation, confirmTaskDelivery, confirmTaskReply,
   confirmTaskSendAccepted, importStandbyConversation, newMessageId, readTaskSession,
-  recordTaskHostControl, readStandbyPool, recordTaskReadResult, failTaskDelivery } from "../src/session/state.js";
+  recordTaskHostControl, readStandbyPool, recordTaskReadResult, failTaskDelivery, sessionLedgerFile } from "../src/session/state.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
 
 let root: string;
@@ -114,4 +115,47 @@ it("CLI refuses missing preflight and reports actual unaccepted failures", async
   expect(started.status).toBe(0);
   const failed = cli("fail-delivery", "--task-id", "cli-task", "--message-id", id, "--kind", "host_rejected", "--reason", "explicit rejection", "--json");
   expect(JSON.parse(failed.stdout).accepted).toBe(false);
+
+  await recordTaskHostControl(workspaceId, "cli-task", { result: "probe", tools });
+  await recordTaskHostControl(workspaceId, "cli-task", { result: "read-ok", conversationId: "cli-chat", observedTaskId: "cli-task", observedWorkspaceId: workspaceId });
+  for (const value of ["1junk", "1.9", "-1"]) {
+    expect(cli("begin-send", "--task-id", "cli-task", "--message-id", newMessageId(), "--iteration", value, "--bootstrap").status).not.toBe(0);
+  }
+  const uncertainId = newMessageId();
+  await beginTaskSend(workspaceId, "cli-task", uncertainId, 0, { bootstrap: true });
+  const observed = ["--task-id", "cli-task", "--message-id", uncertainId, "--observed-task-id", "cli-task", "--observed-workspace-id", workspaceId];
+  expect(cli("confirm-delivery", ...observed, "--observed-iteration", "0.9", "--json").status).not.toBe(0);
+  expect(JSON.parse(cli("confirm-delivery", ...observed, "--observed-iteration", "0", "--json").stdout))
+    .toMatchObject({ accepted: false, delivered: true });
+  expect(cli("confirm-reply", ...observed, "--observed-iteration", "0junk", "--state", "DONE", "--json").status).not.toBe(0);
+  expect(JSON.parse(cli("confirm-reply", ...observed, "--observed-iteration", "0", "--state", "DONE", "--json").stdout))
+    .toMatchObject({ accepted: false, delivered: true, replied: true });
+});
+
+it.each([
+  { hostControl: null },
+  { hostControl: { status: "ready", missingTools: ["read_thread"], checkedAt: new Date().toISOString() } },
+  { hostControl: { status: "ready", missingTools: [], checkedAt: {} } },
+  { pendingDispatchUncertain: "false" },
+  { pendingReviewHead: "junk" },
+])("rejects malformed persisted control fields %j", async fields => {
+  const file = sessionLedgerFile();
+  const ledger = JSON.parse(fs.readFileSync(file, "utf8"));
+  Object.assign(ledger.registries[0].tasks[0], fields);
+  fs.writeFileSync(file, JSON.stringify(ledger));
+  expect(() => readTaskSession(w, t)).toThrow(/HOST_CONTROL_STATE_INVALID/);
+});
+
+it("rejects empty inventory entries", async () => {
+  await expect(probe([tools[0], "", tools[1]])).rejects.toThrow(/TOOLS/);
+});
+
+it.each(["accepted", "delivered"])("rejects conflicting host rejection after %s", async phase => {
+  const id = newMessageId();
+  await beginTaskSend(w, t, id, 0, { bootstrap: true });
+  if (phase === "accepted") await confirmTaskSendAccepted(w, t, id);
+  else await confirmTaskDelivery(w, t, id);
+  await expect(failTaskDelivery(w, t, id, "host_rejected", "conflicting host result"))
+    .rejects.toThrow(/CONFLICT/);
+  expect(readTaskSession(w, t)?.pendingMessageId).toBe(id);
 });

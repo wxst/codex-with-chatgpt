@@ -447,6 +447,23 @@ function isRegistry(value: unknown): value is SessionRegistry {
 }
 
 function normalizeRegistry(registry: SessionRegistry): SessionRegistry {
+  for (const task of registry.tasks) {
+    const host = task.hostControl;
+    if (host !== undefined && (!host || typeof host !== "object" ||
+      !["tools_missing", "readback_required", "ready", "call_timeout", "call_failed", "not_invoked"].includes(host.status) ||
+      !Array.isArray(host.missingTools) || host.missingTools.some(x => !["read_thread", "send_message_to_thread"].includes(x)) ||
+      new Set(host.missingTools).size !== host.missingTools.length ||
+      (host.status === "tools_missing" && host.missingTools.length === 0) ||
+      (["ready", "readback_required"].includes(host.status) && host.missingTools.length !== 0) ||
+      typeof host.checkedAt !== "string" || !Number.isFinite(Date.parse(host.checkedAt)))) {
+      throw new Error("HOST_CONTROL_STATE_INVALID");
+    }
+    if ((task.pendingDispatchUncertain !== undefined && typeof task.pendingDispatchUncertain !== "boolean") ||
+      [task.pendingReviewHead, task.lastReviewHead].some(head => head !== undefined &&
+        (typeof head !== "string" || !/^[0-9a-f]{40}$/u.test(head)))) {
+      throw new Error("HOST_CONTROL_STATE_INVALID");
+    }
+  }
   return {
     ...registry,
     tasks: registry.tasks.map((task) => ({
@@ -1262,7 +1279,7 @@ export async function recordTaskHostControl(
     let status: HostControlState["status"];
     let missingTools = task.hostControl?.missingTools ?? [];
     if (observation.result === "probe") {
-      if (!Array.isArray(observation.tools) || !observation.tools.every(x => typeof x === "string")) {
+      if (!Array.isArray(observation.tools) || !observation.tools.every(x => typeof x === "string" && x.trim().length > 0)) {
         throw new Error("HOST_CONTROL_TOOLS_REQUIRED");
       }
       missingTools = ["read_thread", "send_message_to_thread"].filter(name => !observation.tools!.includes(name));
@@ -1513,6 +1530,9 @@ export async function failTaskDelivery(
       throw new Error("delivery failure does not match the in-flight message");
     }
     const terminalReason = `${failureKind}: ${normalizedReason}`;
+    if (failureKind === "host_rejected" && (task.sendAcceptedAt || task.lastDeliveredMessageId === id)) {
+      throw new Error("HOST_REJECTION_RECEIPT_CONFLICT: preserve the in-flight message and read the bound Chat");
+    }
     if (failureKind === "conversation_gone") {
       return unavailableTask(task, terminalReason);
     }

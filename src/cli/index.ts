@@ -1456,6 +1456,13 @@ function addObservedIdentityOptions(command: Command): Command {
     .requiredOption("--observed-iteration <n>");
 }
 
+function parseReceiptIteration(value: string): number {
+  if (!/^(0|[1-9][0-9]*)$/u.test(value) || !Number.isSafeInteger(Number(value))) {
+    throw new Error("iteration must be a non-negative safe decimal integer");
+  }
+  return Number(value);
+}
+
 addChannelCommandOptions(session.command("begin-send").description("Atomically reserve one outbound ChatGPT message"))
   .requiredOption("--iteration <n>")
   .option("--probe", "allow one recovery probe for a degraded channel", false)
@@ -1474,7 +1481,7 @@ addChannelCommandOptions(session.command("begin-send").description("Atomically r
       workspace.id,
       resolved.taskId,
       opts.messageId,
-      parseInt(opts.iteration, 10),
+      parseReceiptIteration(opts.iteration),
       { probe: opts.probe, bootstrap: opts.bootstrap, reviewHead: opts.reviewHead }
     );
     if (opts.json) say(JSON.stringify({ ok: true, reserved: true, accepted: false, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
@@ -1507,10 +1514,10 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-del
     if (!current?.pendingMessageId || current.pendingIteration === undefined) throw new Error("task has no in-flight message");
     assertReceiptIdentity(
       { messageId: current.pendingMessageId, taskId: current.taskId, workspaceId: workspace.id, iteration: current.pendingIteration },
-      { messageId: opts.messageId, taskId: opts.observedTaskId, workspaceId: opts.observedWorkspaceId, iteration: parseInt(opts.observedIteration, 10) }
+      { messageId: opts.messageId, taskId: opts.observedTaskId, workspaceId: opts.observedWorkspaceId, iteration: parseReceiptIteration(opts.observedIteration) }
     );
     const task = await confirmTaskDelivery(workspace.id, resolved.taskId, opts.messageId);
-    if (opts.json) say(JSON.stringify({ ok: true, accepted: true, delivered: true, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    if (opts.json) say(JSON.stringify({ ok: true, accepted: Boolean(current.sendAcceptedAt), delivered: true, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`已确认送达 ${task.lastDeliveredMessageId}；正在等待回复`);
   });
 
@@ -1524,10 +1531,10 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-rep
     if (!current?.pendingMessageId || current.pendingIteration === undefined) throw new Error("task has no in-flight message");
     assertReceiptIdentity(
       { messageId: current.pendingMessageId, taskId: current.taskId, workspaceId: workspace.id, iteration: current.pendingIteration },
-      { messageId: opts.messageId, taskId: opts.observedTaskId, workspaceId: opts.observedWorkspaceId, iteration: parseInt(opts.observedIteration, 10) }
+      { messageId: opts.messageId, taskId: opts.observedTaskId, workspaceId: opts.observedWorkspaceId, iteration: parseReceiptIteration(opts.observedIteration) }
     );
     const task = await confirmTaskReply(workspace.id, resolved.taskId, opts.messageId, opts.state, opts.observedReviewHead);
-    if (opts.json) say(JSON.stringify({ ok: true, accepted: true, delivered: true, replied: true, identityVerified: true, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    if (opts.json) say(JSON.stringify({ ok: true, accepted: Boolean(current.sendAcceptedAt), delivered: true, replied: true, identityVerified: true, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`已确认回复；任务迭代推进到 ${task.iteration}`);
   });
 
@@ -1539,7 +1546,7 @@ addChannelCommandOptions(session.command("fail-delivery").description("Quarantin
     const resolved = resolvedSessionTaskId(opts.taskId);
     const current = readTaskSession(workspace.id, resolved.taskId);
     const task = await failTaskDelivery(workspace.id, resolved.taskId, opts.messageId, opts.kind, opts.reason);
-    if (opts.json) say(JSON.stringify({ ok: false, accepted: Boolean(current?.sendAcceptedAt), delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    if (opts.json) say(JSON.stringify({ ok: false, accepted: Boolean(current?.sendAcceptedAt), delivered: current?.lastDeliveredMessageId === opts.messageId, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else say(`通道已隔离：${task.lastDeliveryError}`);
   });
 
