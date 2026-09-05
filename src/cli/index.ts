@@ -85,6 +85,8 @@ import {
   readTaskSession,
   recordTaskDeliveryPending,
   recordTaskReadResult,
+  recordTaskHostControl,
+  type HostControlObservation,
   restoreTaskConversation,
   quarantineStandbyConversation,
   readStandbyPool,
@@ -1379,6 +1381,37 @@ session.command("mark-unavailable")
     else check(`第 ${task.generation} 代会话已归档；下一次建档将创建新一代`);
   });
 
+session.command("host-control")
+  .description("Record current executor tool availability or exact Chat recovery; never sends a message")
+  .option("-w, --workspace <path>").option("--task-id <id>")
+  .requiredOption("--result <result>", "probe, read-ok, timeout, call-failed, or not-invoked")
+  .option("--tools <names>", "comma-separated callable host tool names; use none if both are absent")
+  .option("--conversation-id <id>")
+  .option("--observed-task-id <id>").option("--observed-workspace-id <id>")
+  .option("--message-id <id>")
+  .option("--confirm-not-invoked", "attest that the send tool was never called for this reservation", false)
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; taskId?: string; result: HostControlObservation["result"]; tools?: string;
+    conversationId?: string; observedTaskId?: string; observedWorkspaceId?: string; messageId?: string; confirmNotInvoked: boolean; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    if (opts.result === "not-invoked" && !opts.confirmNotInvoked) throw new Error("HOST_CONTROL_NOT_INVOKED_ATTESTATION_REQUIRED");
+    const task = await recordTaskHostControl(workspace.id, resolved.taskId, {
+      result: opts.result, tools: opts.tools === "none" ? [] : opts.tools?.split(",").map(x => x.trim()),
+      conversationId: opts.conversationId, observedTaskId: opts.observedTaskId,
+      observedWorkspaceId: opts.observedWorkspaceId, messageId: opts.messageId,
+    });
+    const status = task.hostControl!.status;
+    const nextAction = status === "tools_missing" ? "restore_host_tools_then_read_bound_chat" :
+      status === "ready" ? (task.pendingMessageId ? "read_pending_message_do_not_resend" : "begin_send") : "probe_then_read_bound_chat";
+    const result = { ok: status === "ready", owner: "codex_host", status, nextAction,
+      workspaceId: workspace.id, task, reserved: Boolean(task.pendingMessageId),
+      accepted: Boolean(task.pendingMessageId && task.sendAcceptedAt),
+      delivered: Boolean(task.pendingMessageId && task.lastDeliveredMessageId === task.pendingMessageId),
+      replied: false };
+    say(opts.json ? JSON.stringify(result) : `${status}: ${nextAction}`);
+  });
+
 session.command("record-read")
   .description("Record the health of the saved exact ChatGPT conversation")
   .option("-w, --workspace <path>").option("--task-id <id>")
@@ -1427,15 +1460,22 @@ addChannelCommandOptions(session.command("begin-send").description("Atomically r
   .requiredOption("--iteration <n>")
   .option("--probe", "allow one recovery probe for a degraded channel", false)
   .option("--bootstrap", "reserve the workspace_info boot message before ready", false)
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; iteration: string; probe: boolean; bootstrap: boolean; json: boolean }) => {
+  .option("--review-head <sha>", "bind this review to an exact full Git HEAD")
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; iteration: string; probe: boolean; bootstrap: boolean; reviewHead?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
+    const current = readTaskSession(workspace.id, resolved.taskId);
+    if (current?.hostControl?.status !== "ready" ||
+      !Number.isFinite(Date.parse(current.hostControl.checkedAt)) ||
+      Date.now() - Date.parse(current.hostControl.checkedAt) > 60_000 || Date.parse(current.hostControl.checkedAt) > Date.now()) {
+      throw new Error("HOST_CONTROL_PREFLIGHT_REQUIRED: record current callable tools and exact bound Chat readback before begin-send");
+    }
     const task = await beginTaskSend(
       workspace.id,
       resolved.taskId,
       opts.messageId,
       parseInt(opts.iteration, 10),
-      { probe: opts.probe, bootstrap: opts.bootstrap }
+      { probe: opts.probe, bootstrap: opts.bootstrap, reviewHead: opts.reviewHead }
     );
     if (opts.json) say(JSON.stringify({ ok: true, reserved: true, accepted: false, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`已保留发送 ${task.pendingMessageId}；尚未确认送达`);
@@ -1476,7 +1516,8 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-del
 
 addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-reply").description("Confirm a matching ChatGPT reply and complete the iteration")))
   .requiredOption("--state <state>")
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; state: string; json: boolean }) => {
+  .option("--observed-review-head <sha>", "exact REVIEW_HEAD echoed by the reply")
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; state: string; observedReviewHead?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const current = readTaskSession(workspace.id, resolved.taskId);
@@ -1485,7 +1526,7 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-rep
       { messageId: current.pendingMessageId, taskId: current.taskId, workspaceId: workspace.id, iteration: current.pendingIteration },
       { messageId: opts.messageId, taskId: opts.observedTaskId, workspaceId: opts.observedWorkspaceId, iteration: parseInt(opts.observedIteration, 10) }
     );
-    const task = await confirmTaskReply(workspace.id, resolved.taskId, opts.messageId, opts.state);
+    const task = await confirmTaskReply(workspace.id, resolved.taskId, opts.messageId, opts.state, opts.observedReviewHead);
     if (opts.json) say(JSON.stringify({ ok: true, accepted: true, delivered: true, replied: true, identityVerified: true, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`已确认回复；任务迭代推进到 ${task.iteration}`);
   });
@@ -1496,8 +1537,9 @@ addChannelCommandOptions(session.command("fail-delivery").description("Quarantin
   .action(async (opts: { workspace?: string; taskId?: string; messageId: string; kind: string; reason: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
+    const current = readTaskSession(workspace.id, resolved.taskId);
     const task = await failTaskDelivery(workspace.id, resolved.taskId, opts.messageId, opts.kind, opts.reason);
-    if (opts.json) say(JSON.stringify({ ok: false, accepted: true, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    if (opts.json) say(JSON.stringify({ ok: false, accepted: Boolean(current?.sendAcceptedAt), delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else say(`通道已隔离：${task.lastDeliveryError}`);
   });
 

@@ -176,6 +176,72 @@ standby Chats. A removed exact Chat is retired and the same task claims the next
 compatible standby Chat; a temporary tool timeout only makes the channel
 `degraded` and keeps the original binding.
 
+## Host control preflight and recovery
+
+Before every `begin-send`, and again after a task continuation, inspect the
+coordinator's actual callable tool inventory. Resolve deferred tools if the
+host provides discovery. Require both `read_thread` and
+`send_message_to_thread`; `list_threads` is additionally needed for pool
+inventory, not for an existing binding. A proxy tools/list result or Tunnel
+health does not prove those tools are exposed to the current coordinator.
+
+Record the exact available names (strip only their verified host namespace):
+
+```text
+node "__C2C_CHECKOUT__/bin/c2c.js" session host-control \
+  -w <workspace> --task-id <task-id> --result probe \
+  --tools read_thread,send_message_to_thread --json
+```
+
+Use `--tools none` when both are absent, or the single available name. This
+records `tools_missing`, missing names and `channelState: degraded`, preserving
+the task/workspace/conversation/generation, pool ownership and any in-flight
+receipt. Stop before reserving or sending. The dependency belongs to the Codex
+host; C2C cannot inject tools into a running task. Report the Codex version,
+task id, timestamp and missing tool names through Codex feedback/support. Check
+the host's tool configuration and re-open/resume the same task when available.
+Do not rotate credentials, restart a Tunnel, change transport, or claim another
+Chat just because control tools are absent.
+
+When both return, the result is `readback_required`, not ready. Call
+`read_thread` on the saved conversation id and verify its task/workspace
+identity. For a newly claimed Chat before BOOT, verify its exact user standby
+marker and the ledger owner instead (no task identity has been sent yet).
+Then record those verified ids:
+
+```text
+node "__C2C_CHECKOUT__/bin/c2c.js" session host-control \
+  -w <workspace> --task-id <task-id> --result read-ok \
+  --conversation-id <bound-id> --observed-task-id <task-id> \
+  --observed-workspace-id <workspace-id> --json
+```
+
+The CLI requires this fresh preflight within 60 seconds before `begin-send`.
+If a pending message exists, first search the original user turn and matching
+reply, including older pages. Confirm only the existing message-id/iteration.
+An empty/truncated read is not proof of non-delivery; do not resend.
+
+Record a host call timeout with `host-control --result timeout` or another
+temporary call error with `--result call-failed` (same workspace/task options).
+Both preserve in-flight messages, including sends whose outcome is unknown.
+Re-probe and read the same Chat before continuing. An explicit missing Chat or
+identity mismatch uses the existing terminal retirement/quarantine contract;
+these are different from tool absence. Tunnel errors use `runtime diagnose`.
+
+If tools disappear after reservation and the send tool was **never called**,
+release only that reservation with `host-control --result not-invoked
+--message-id <reserved-id> --confirm-not-invoked` and the same workspace/task
+options. Never use this for a timeout or uncertain invocation. No accepted,
+delivered, iteration advance, or reply is recorded. Recovery uses a new id.
+
+For review requests pass `begin-send --review-head <full SHA>`, include
+`REVIEW_HEAD: <full SHA>` in the user turn and require the reply to echo it.
+Pass `confirm-reply --observed-review-head <echoed SHA>`; the ledger rejects
+missing or mismatching HEAD values. Confirm `DONE` only when that SHA and all four
+receipt identity fields match the current request. An older HEAD's DONE is
+historical evidence only. Automated fixtures and a real host read/send/readback
+review must be reported separately.
+
 ## Boot Prompt and Router capability
 
 For a newly claimed Chat, generate a receipt id and reserve the outbound Boot
@@ -260,7 +326,7 @@ Only a `ready` task may receive task content.
 
 Every message includes `TASK_ID`, `WORKSPACE_ID`, `ITERATION`, and a fresh
 `MESSAGE_ID`. Always generate it with `session new-message-id`; never write a
-handmade `c2c_msg_*` value. Call `session begin-send`, then
+handmade `c2c_msg_*` value. Complete host preflight above, call `session begin-send`, then
 `send_message_to_thread`, then `confirm-send-accepted`, then poll `read_thread`
 and use `confirm-delivery` / `confirm-reply`.
 

@@ -210,6 +210,10 @@ ChatGPT 侧不存在写文件、删除、Shell、安装依赖或 Git 提交工�
 详细说明见 [HARDENING.md](HARDENING.md)、[安全文档](docs/security.md) 和
 [故障排查](docs/troubleshooting.md)。
 
+如果续接任务后缺少 `read_thread` / `send_message_to_thread`，参见
+[宿主控制工具诊断与恢复](docs/host-control.md)。先检查当前执行器工具清单，
+保留原绑定和在途消息；工具恢复后先读取原 Chat，再继续对应 HEAD 的回执。
+
 ## 开发与发布门禁
 
 ```bash

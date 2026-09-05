@@ -12,6 +12,21 @@ export type SettingsDialogState = "pending" | "confirmed" | "later";
 export type ChannelState = "ready" | "sending" | "delivered" | "awaiting_reply" | "degraded";
 export type DeliveryFailureKind = "host_rejected" | "conversation_gone" | "identity_mismatch";
 
+export interface HostControlState {
+  status: "tools_missing" | "readback_required" | "ready" | "call_timeout" | "call_failed" | "not_invoked";
+  missingTools: string[];
+  checkedAt: string;
+}
+
+export interface HostControlObservation {
+  result: "probe" | "read-ok" | "timeout" | "call-failed" | "not-invoked";
+  tools?: string[];
+  conversationId?: string;
+  observedTaskId?: string;
+  observedWorkspaceId?: string;
+  messageId?: string;
+}
+
 export interface LegacySavedSession {
   url?: string;
   title?: string;
@@ -54,8 +69,13 @@ export interface SavedTaskSession {
   settingsConfirmedAt?: string;
   verificationState: VerificationState;
   channelState: ChannelState;
+  hostControl?: HostControlState;
   pendingMessageId?: string;
   pendingIteration?: number;
+  /** Sticky until this message is resolved; a timed-out call may have sent it. */
+  pendingDispatchUncertain?: boolean;
+  pendingReviewHead?: string;
+  lastReviewHead?: string;
   /** The direct host accepted the outbound request, but ChatGPT has not yet exposed its user turn. */
   sendAcceptedAt?: string;
   /** The first readback check that found the accepted message still absent. */
@@ -114,6 +134,7 @@ export interface SessionReadResult {
 export interface BeginSendOptions {
   probe?: boolean;
   bootstrap?: boolean;
+  reviewHead?: string;
 }
 
 export interface ReceiptIdentity {
@@ -1126,6 +1147,8 @@ function unavailableTask(task: SavedTaskSession, reason: string): SavedTaskSessi
     channelState: "degraded",
     pendingMessageId: undefined,
     pendingIteration: undefined,
+    pendingReviewHead: undefined,
+    pendingDispatchUncertain: undefined,
     sendAcceptedAt: undefined,
     deliveryPendingSince: undefined,
     replacedConversations,
@@ -1145,6 +1168,8 @@ function quarantineTask(task: SavedTaskSession, reason: string): SavedTaskSessio
     channelState: "degraded",
     pendingMessageId: undefined,
     pendingIteration: undefined,
+    pendingReviewHead: undefined,
+    pendingDispatchUncertain: undefined,
     sendAcceptedAt: undefined,
     deliveryPendingSince: undefined,
     replacementReason: reason,
@@ -1227,6 +1252,51 @@ export async function restoreTaskConversation(
   });
 }
 
+/** Observations come from the coordinator's callable tool inventory, not the Tunnel. */
+export async function recordTaskHostControl(
+  workspaceId: string, taskId: string, observation: HostControlObservation
+): Promise<SavedTaskSession> {
+  return updateTaskChannel(workspaceId, taskId, task => {
+    if (task.bindingState !== "bound") throw new Error("HOST_CONTROL_BINDING_UNAVAILABLE");
+    const checkedAt = new Date().toISOString();
+    let status: HostControlState["status"];
+    let missingTools = task.hostControl?.missingTools ?? [];
+    if (observation.result === "probe") {
+      if (!Array.isArray(observation.tools) || !observation.tools.every(x => typeof x === "string")) {
+        throw new Error("HOST_CONTROL_TOOLS_REQUIRED");
+      }
+      missingTools = ["read_thread", "send_message_to_thread"].filter(name => !observation.tools!.includes(name));
+      status = missingTools.length ? "tools_missing" : "readback_required";
+    } else if (observation.result === "read-ok") {
+      if (task.hostControl?.status !== "readback_required" || missingTools.length) {
+        throw new Error("HOST_CONTROL_PROBE_REQUIRED");
+      }
+      if (observation.conversationId !== task.conversationId || observation.observedTaskId !== taskId ||
+        observation.observedWorkspaceId !== workspaceId) throw new Error("HOST_CONTROL_IDENTITY_MISMATCH");
+      status = "ready";
+    } else if (observation.result === "not-invoked") {
+      if (!task.pendingMessageId || observation.messageId !== task.pendingMessageId || task.sendAcceptedAt ||
+        task.lastDeliveredMessageId === task.pendingMessageId ||
+        task.pendingDispatchUncertain) {
+        throw new Error("HOST_CONTROL_NOT_INVOKED_UNPROVEN");
+      }
+      return { ...task, pendingMessageId: undefined, pendingIteration: undefined,
+        pendingReviewHead: undefined, pendingDispatchUncertain: undefined,
+        deliveryPendingSince: undefined, channelState: "degraded",
+        hostControl: { status: "not_invoked", missingTools, checkedAt }, savedAt: checkedAt };
+    } else if (observation.result === "timeout") status = "call_timeout";
+    else if (observation.result === "call-failed") status = "call_failed";
+    else throw new Error("HOST_CONTROL_RESULT_INVALID");
+    // Recover the delivery phase from its receipts; tool visibility alone never resumes it.
+    const channelState: ChannelState = status !== "ready" ? "degraded" : !task.pendingMessageId ? "ready" :
+      task.lastDeliveredMessageId === task.pendingMessageId ? "awaiting_reply" : "sending";
+    return { ...task, channelState,
+      pendingDispatchUncertain: task.pendingDispatchUncertain ||
+        (Boolean(task.pendingMessageId) && (status === "call_timeout" || status === "call_failed")),
+      hostControl: { status, missingTools, checkedAt }, savedAt: checkedAt };
+  });
+}
+
 export async function recordTaskReadResult(
   workspaceId: string,
   taskId: string,
@@ -1246,7 +1316,7 @@ export async function recordTaskReadResult(
     if (result === "ok") {
       return {
         ...task,
-        channelState: "ready",
+        channelState: task.hostControl && task.hostControl.status !== "ready" ? "degraded" : "ready",
         consecutiveReadFailures: 0,
         lastReadError: undefined,
         lastReadCheckedAt: checkedAt,
@@ -1293,8 +1363,10 @@ export async function beginTaskSend(
   const id = validateMessageId(messageId);
   if (!Number.isSafeInteger(iteration) || iteration < 0) throw new Error("iteration must be a non-negative integer");
   const flags = typeof options === "boolean" ? { probe: options } : options;
+  if (flags.reviewHead !== undefined && !/^[0-9a-f]{40}$/u.test(flags.reviewHead)) throw new Error("REVIEW_HEAD_INVALID");
   return updateTaskChannel(workspaceId, taskId, (task) => {
     if (task.bindingState !== "bound") throw new Error("task conversation binding is unavailable");
+    if (task.hostControl && task.hostControl.status !== "ready") throw new Error("HOST_CONTROL_NOT_READY: probe tools and read the exact bound Chat");
     if (task.settingsSource !== "user_confirmed") throw new Error("task conversation settings lack user confirmation");
     if (!flags.bootstrap && task.verificationState !== "ready") {
       throw new Error("task conversation requires workspace verification before task content");
@@ -1314,6 +1386,8 @@ export async function beginTaskSend(
       channelState: "sending",
       pendingMessageId: id,
       pendingIteration: iteration,
+      pendingDispatchUncertain: undefined,
+      pendingReviewHead: flags.reviewHead,
       sendAcceptedAt: undefined,
       deliveryPendingSince: undefined,
       lastDeliveryError: undefined,
@@ -1389,7 +1463,8 @@ export async function confirmTaskReply(
   workspaceId: string,
   taskId: string,
   messageId: string,
-  state: string
+  state: string,
+  observedReviewHead?: string
 ): Promise<SavedTaskSession> {
   const id = validateMessageId(messageId);
   const normalizedState = state.trim().toUpperCase();
@@ -1400,13 +1475,17 @@ export async function confirmTaskReply(
     if (task.channelState !== "awaiting_reply" || task.pendingMessageId !== id || task.pendingIteration === undefined) {
       throw new Error("reply receipt does not match the delivered in-flight message");
     }
+    if (task.pendingReviewHead && observedReviewHead !== task.pendingReviewHead) throw new Error("REVIEW_HEAD_MISMATCH");
     return {
       ...task,
       channelState: "ready",
       iteration: task.pendingIteration,
       lastState: normalizedState,
+      lastReviewHead: task.pendingReviewHead,
       pendingMessageId: undefined,
       pendingIteration: undefined,
+      pendingReviewHead: undefined,
+      pendingDispatchUncertain: undefined,
       sendAcceptedAt: undefined,
       deliveryPendingSince: undefined,
       lastDeliveryError: undefined,
@@ -1430,7 +1509,7 @@ export async function failTaskDelivery(
   const normalizedReason = reason.trim().slice(0, 500);
   if (!normalizedReason) throw new Error("delivery failure requires a reason");
   const task = await updateTaskChannel(workspaceId, taskId, (task) => {
-    if (task.pendingMessageId !== id || !["sending", "delivered", "awaiting_reply"].includes(task.channelState)) {
+    if (task.pendingMessageId !== id || !["sending", "delivered", "awaiting_reply", "degraded"].includes(task.channelState)) {
       throw new Error("delivery failure does not match the in-flight message");
     }
     const terminalReason = `${failureKind}: ${normalizedReason}`;
@@ -1443,6 +1522,8 @@ export async function failTaskDelivery(
       channelState: "degraded",
       pendingMessageId: undefined,
       pendingIteration: undefined,
+      pendingReviewHead: undefined,
+      pendingDispatchUncertain: undefined,
       sendAcceptedAt: undefined,
       deliveryPendingSince: undefined,
       lastDeliveryError: terminalReason,
