@@ -86,6 +86,7 @@ describe("Router diagnostic context", () => {
     expect(result).toMatchObject({
       ok: false, running: true, router: true,
       workspaceId: consumer.id, anchorWorkspaceId: anchor.id,
+      workspaceRoot: consumer.root, anchorWorkspaceRoot: anchor.root,
       workspaceRegistration: "unregistered", errorClass: "workspace_not_registered",
     });
     expect(snapshot(stateDir)).toEqual(before);

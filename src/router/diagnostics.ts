@@ -34,7 +34,9 @@ export function resolveWorkspaceRuntimeContext(root: string): WorkspaceRuntimeCo
 export function runtimeContextSummary(context: WorkspaceRuntimeContext) {
   return {
     workspaceId: context.workspace.id,
+    workspaceRoot: context.workspace.root,
     anchorWorkspaceId: context.anchor.id,
+    anchorWorkspaceRoot: context.anchor.root,
     router: context.router,
     workspaceRegistration: context.workspaceRegistration,
     ...(context.errorClass ? { errorClass: context.errorClass } : {}),
