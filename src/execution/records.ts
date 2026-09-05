@@ -10,8 +10,8 @@ import { ensureDir, getStateDir } from "../config/paths.js";
  */
 export const executionRecordSchema = z.object({
   taskId: z.string(),
-  iteration: z.number().int().nonnegative(),
-  changedFiles: z.union([z.array(z.string()), z.number().int().nonnegative()]),
+  iteration: z.number().int().nonnegative().safe(),
+  changedFiles: z.union([z.array(z.string()), z.number().int().nonnegative().safe()]),
   tests: z.string().nullable(),
   exitStatus: z.string(),
   timestamp: z.string(),

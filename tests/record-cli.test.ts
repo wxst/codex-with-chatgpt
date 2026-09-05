@@ -144,14 +144,19 @@ describe("execution record persistence", () => {
     expect(schema?.safeParse(valid).success).toBe(true);
     expect(schema?.safeParse({ ...valid, iteration: -1 }).success).toBe(false);
     expect(schema?.safeParse({ ...valid, changedFiles: Number.POSITIVE_INFINITY }).success).toBe(false);
+    for (const value of [Number.MAX_SAFE_INTEGER + 1, Number.MAX_VALUE]) {
+      expect(schema?.safeParse({ ...valid, iteration: value }).success).toBe(false);
+      expect(schema?.safeParse({ ...valid, changedFiles: value }).success).toBe(false);
+    }
   });
 
   it("rejects invalid records before creating the executions directory", () => {
     withRecordEnvironment((_root, stateDir, workspace) => {
-      const invalidRecord: ExecutionRecord = { ...makeRecord(1), iteration: Number.NaN };
       const executionsDir = path.dirname(recordFile(stateDir, workspace));
-
-      expect(() => appendExecutionRecord(workspace.id, invalidRecord)).toThrow();
+      for (const value of [Number.NaN, Number.MAX_SAFE_INTEGER + 1, Number.MAX_VALUE]) {
+        expect(() => appendExecutionRecord(workspace.id, { ...makeRecord(1), iteration: value })).toThrow();
+        expect(() => appendExecutionRecord(workspace.id, { ...makeRecord(1), changedFiles: value })).toThrow();
+      }
       expect(fs.existsSync(executionsDir)).toBe(false);
     });
   });
@@ -163,6 +168,8 @@ describe("execution record persistence", () => {
       appendExecutionRecord(workspace.id, makeRecord(3));
       const file = recordFile(stateDir, workspace);
       fs.appendFileSync(file, "not-json\nnull\n[]\n{\"iteration\":null}\n");
+      fs.appendFileSync(file, JSON.stringify({ ...makeRecord(1), iteration: Number.MAX_SAFE_INTEGER + 1 }) + "\n");
+      fs.appendFileSync(file, JSON.stringify({ ...makeRecord(1), changedFiles: Number.MAX_VALUE }) + "\n");
       const before = fs.readFileSync(file, "utf8");
 
       expect(readExecutionRecords(workspace.id, 2).map((record) => record.iteration)).toEqual([2, 3]);
