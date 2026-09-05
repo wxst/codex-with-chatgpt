@@ -1538,7 +1538,7 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-rep
     else check(`已确认回复；任务迭代推进到 ${task.iteration}`);
   });
 
-addChannelCommandOptions(session.command("fail-delivery").description("Quarantine an unconfirmed direct ChatGPT channel"))
+addChannelCommandOptions(session.command("fail-delivery").description("Record an explicit terminal host failure and its binding state"))
   .requiredOption("--kind <kind>", "host_rejected, conversation_gone, or identity_mismatch")
   .requiredOption("--reason <reason>")
   .action(async (opts: { workspace?: string; taskId?: string; messageId: string; kind: string; reason: string; json: boolean }) => {
@@ -1547,7 +1547,9 @@ addChannelCommandOptions(session.command("fail-delivery").description("Quarantin
     const current = readTaskSession(workspace.id, resolved.taskId);
     const task = await failTaskDelivery(workspace.id, resolved.taskId, opts.messageId, opts.kind, opts.reason);
     if (opts.json) say(JSON.stringify({ ok: false, accepted: Boolean(current?.sendAcceptedAt), delivered: current?.lastDeliveredMessageId === opts.messageId, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
-    else say(`通道已隔离：${task.lastDeliveryError}`);
+    else if (task.bindingState === "unavailable") say(`会话已退役：${task.replacementReason}`);
+    else if (task.bindingState === "quarantined") say(`会话已隔离：${task.lastDeliveryError}`);
+    else say(`通道已降级：${task.lastDeliveryError}`);
   });
 
 session.command("new-message-id").description("Generate a unique C2C delivery receipt id")

@@ -159,3 +159,22 @@ it.each(["accepted", "delivered"])("rejects conflicting host rejection after %s"
     .rejects.toThrow(/CONFLICT/);
   expect(readTaskSession(w, t)?.pendingMessageId).toBe(id);
 });
+
+it.each([
+  ["conversation_gone", "会话已退役"],
+  ["identity_mismatch", "会话已隔离"],
+  ["host_rejected", "通道已降级"],
+])("CLI names terminal state %s accurately", async (kind, label) => {
+  const cli = (...args: string[]) => spawnSync(process.execPath,
+    ["--import", "tsx/esm", "src/cli/index.ts", "session", ...args],
+    { encoding: "utf8", windowsHide: true, env: { ...process.env, CODEX_THREAD_ID: "", C2C_INTERNAL_STATE_DIR: "test" } });
+  const workspaceId = JSON.parse(cli("get", "--task-id", "cli-terminal", "--json").stdout).workspaceId;
+  await importStandbyConversation({ conversationId: "cli-terminal-chat", projectId: "g-p-host", markerText: "C2C_STANDBY_READY", markerMessageId: "terminal-marker", markerRole: "user" });
+  await claimStandbyConversation({ workspaceId, taskId: "cli-terminal", connectorName: "C2C", workspaceName: "repo", branch: "main" });
+  const id = newMessageId();
+  await beginTaskSend(workspaceId, "cli-terminal", id, 0, { bootstrap: true });
+  const result = cli("fail-delivery", "--task-id", "cli-terminal", "--message-id", id, "--kind", kind, "--reason", "explicit host result");
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain(`${label}：${kind}: explicit host result`);
+  expect(result.stdout).not.toContain("undefined");
+});
