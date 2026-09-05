@@ -60,6 +60,7 @@ current connected workspace:
 
 ```text
 node "__C2C_CHECKOUT__/bin/c2c.js" router migrate -w <anchor-workspace> --json
+node "__C2C_CHECKOUT__/bin/c2c.js" session migrate --json
 ```
 
 `router ensure` registers a new workspace without creating a new connector or
@@ -116,6 +117,10 @@ Classic, or ChatGPT Work.
 Resolve the task id in this order: `CODEX_THREAD_ID`, explicit `--task-id`, then
 one generated `c2c_task_<uuid>` retained for the current task.
 
+When both `CODEX_THREAD_ID` and `--task-id` are present, they must match
+exactly. A mismatch returns `TASK_ID_IDENTITY_MISMATCH` before any registry or
+pool operation; it never silently substitutes one task identity for another.
+
 ```text
 node "__C2C_CHECKOUT__/bin/c2c.js" session get -w <workspace> --task-id <task-id> --json
 ```
@@ -123,6 +128,21 @@ node "__C2C_CHECKOUT__/bin/c2c.js" session get -w <workspace> --task-id <task-id
 If the task has a bound Chat, keep that exact id. If it is absent or explicitly
 retired, synchronize inventory before every pool claim. Use Codex App
 background tools only:
+
+For a migrated legacy record marked `unavailable`, first call `read_thread` on
+its exact retired conversation id. If the Chat still exists and its readback
+matches the task and workspace ids, restore that exact owner before considering
+stock:
+
+```text
+node "__C2C_CHECKOUT__/bin/c2c.js" session restore \
+  -w <workspace> --task-id <task-id> --conversation-id <old-conversation-id> \
+  --observed-task-id <task-id> --observed-workspace-id <workspace-id> \
+  --confirm --json
+```
+
+Run the recovery probe and `workspace_info` verification after restoration. A
+direct host deletion result proceeds to the usual replacement claim.
 
 1. Call `list_threads`.
 2. Keep only `kind: "chatgpt"` entries in the configured
@@ -183,7 +203,9 @@ CONNECTOR: <connector-name>
 
 Use only the C2C MCP connector. Every MCP call must include
 route_token: <route-token>. First call workspace_info. Echo all four identity
-fields and reply STATE: DONE.
+fields, then echo `WORKSPACE_NAME`, `BRANCH`, and `CONNECTOR` from that tool
+result before replying STATE: DONE. A reply missing any of those observed
+workspace fields does not promote the task to `ready`.
 ```
 
 The Router resolves the capability to exactly one fresh workspace instance.
@@ -210,8 +232,9 @@ node "__C2C_CHECKOUT__/bin/c2c.js" session confirm-delivery \
   --observed-iteration 0 --json
 ```
 
-Use short polling for 30 seconds. If the original message has not appeared,
-Keep the task in `sending` and record the late-delivery wait:
+Poll the exact Chat every 5 seconds for the first 60 seconds. If the original
+message has not appeared, keep the task in `sending` and record the
+late-delivery wait:
 
 ```text
 node "__C2C_CHECKOUT__/bin/c2c.js" session record-delivery-pending \
@@ -220,9 +243,13 @@ node "__C2C_CHECKOUT__/bin/c2c.js" session record-delivery-pending \
 
 Continue reading for up to five minutes while the task is active. After that,
 leave the same message in flight and read it again before any later task
-message. Do not resend, change Chats, or call `fail-delivery` because a short
-readback window is empty. `fail-delivery` is only for an explicit
-`host_rejected`, `conversation_gone`, or `identity_mismatch` result.
+message. Keep the same Chat after temporary `missing`, timeout, or delayed
+readback results; record each as `degraded` and continue exact readback. Do not
+resend, change Chats, or call `fail-delivery` because a short readback window
+is empty. `fail-delivery` is only for an explicit
+`host_rejected`, `conversation_gone`, or `identity_mismatch` result. An
+identity mismatch quarantines the exact Chat; use `session clear --confirm`
+only after an operator decides to retire it and claim a next generation.
 
 Then wait for the matching ChatGPT reply and run `session confirm-reply` with
 the same observed identity fields. After `workspace_info` reports the expected
@@ -281,7 +308,8 @@ can be stale.
 3. Only one in-flight request exists per task Chat. Parallel subagents do not
    write to it. ChatGPT reviews only after their results are merged into a
    stable workspace checkpoint.
-4. Use a second standby Chat only when the exact bound id is deleted or has a
-   proven identity mismatch. Do not replace a healthy or degraded Chat.
+4. Use a second standby Chat only after the exact bound id is deleted, or after
+   an operator confirms retirement of an identity-mismatched Chat. Do not
+   replace a healthy or degraded Chat.
 5. Do not auto-switch transport. OpenAI Secure MCP Tunnel is the default;
    Cloudflare remains an explicit user-chosen fallback.

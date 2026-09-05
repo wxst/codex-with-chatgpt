@@ -73,16 +73,19 @@ import {
   confirmTaskDelivery,
   confirmTaskReply,
   confirmTaskWorkspace,
+  deliveryReadbackPhase,
   attachTaskRouteCapability,
   claimStandbyConversation,
   failTaskDelivery,
   importStandbyConversation,
   markTaskUnavailable,
+  migrateSessionLedger,
   newMessageId,
   readSessionRegistry,
   readTaskSession,
   recordTaskDeliveryPending,
   recordTaskReadResult,
+  restoreTaskConversation,
   quarantineStandbyConversation,
   readStandbyPool,
   resolveCodexTaskId,
@@ -1165,8 +1168,10 @@ session.command("get", { isDefault: true })
       connectorName: read.registry.connectorName ?? null,
       legacyDetected: read.legacyDetected,
       requiresPoolClaim: !task || task.bindingState === "unavailable",
+      requiresManualRetirement: task?.bindingState === "quarantined",
       requiresSettingsConfirmation: Boolean(task && task.bindingState === "bound" && task.settingsSource !== "user_confirmed"),
       requiresWorkspaceVerification: Boolean(task && task.bindingState === "bound" && task.verificationState !== "ready"),
+      deliveryReadbackPhase: task ? deliveryReadbackPhase(task) : "none",
     };
     if (opts.json) say(JSON.stringify(result));
     else {
@@ -1182,6 +1187,45 @@ session.command("get", { isDefault: true })
         say(`通道：${task.channelState}`);
       }
     }
+  });
+
+session.command("migrate")
+  .description("Atomically migrate legacy pool and task records into the global assignment ledger")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { json: boolean }) => {
+    const result = await migrateSessionLedger();
+    const payload = {
+      ok: true,
+      migrated: result.migrated,
+      registryCount: result.ledger.registries.length,
+      poolEntryCount: result.ledger.pool.entries.length,
+    };
+    if (opts.json) say(JSON.stringify(payload));
+    else check(payload.migrated
+      ? `已迁移 ${payload.registryCount} 个工作区与 ${payload.poolEntryCount} 个备用 Chat`
+      : "全局归属账本已是当前版本");
+  });
+
+session.command("restore")
+  .description("Restore a legacy read-miss retirement after exact Chat identity readback")
+  .option("-w, --workspace <path>").option("--task-id <id>")
+  .requiredOption("--conversation-id <id>")
+  .requiredOption("--observed-task-id <id>")
+  .requiredOption("--observed-workspace-id <id>")
+  .requiredOption("--confirm", "confirm that exact read_thread identity was verified")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: {
+    workspace?: string; taskId?: string; conversationId: string;
+    observedTaskId: string; observedWorkspaceId: string; confirm: boolean; json: boolean;
+  }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    if (opts.observedTaskId !== resolved.taskId || opts.observedWorkspaceId !== workspace.id) {
+      throw new Error("observed exact Chat identity does not match the requested task");
+    }
+    const task = await restoreTaskConversation(workspace.id, resolved.taskId, opts.conversationId);
+    if (opts.json) say(JSON.stringify({ ok: true, workspaceId: workspace.id, taskId: resolved.taskId, taskIdSource: resolved.source, task }));
+    else check(`已恢复第 ${task.generation} 代精确 Chat；下一步执行恢复探测和 workspace_info 核对`);
   });
 
 const pool = session.command("pool").description("Manage manually prepared global standby Chats");
@@ -1249,7 +1293,19 @@ pool.command("claim")
     });
     let routeToken: string | null = null;
     let task = claimed.task;
-    if (!claimed.reused || !task.routeCapabilityId) {
+    const activeRoute = task.routeCapabilityId
+      ? readWorkspaceRouter()?.capabilities.find((candidate) =>
+        candidate.id === task.routeCapabilityId &&
+        candidate.workspaceId === workspace.id &&
+        candidate.taskId === resolved.taskId &&
+        candidate.conversationId === task.conversationId &&
+        !candidate.revokedAt && Date.parse(candidate.expiresAt) > Date.now()
+      )
+      : undefined;
+    // A pending Boot Prompt needs a fresh raw token that the coordinator can
+    // place in that exact Chat. Reissuing it updates the task owner id, so an
+    // interrupted earlier preparation never causes a second pool claim.
+    if (!task.pendingMessageId && (!activeRoute || task.verificationState !== "ready")) {
       const route = await issueRouteCapability({
         workspaceId: workspace.id,
         taskId: resolved.taskId,
@@ -1310,11 +1366,12 @@ session.command("confirm-workspace")
   });
 
 session.command("mark-unavailable")
-  .description("Archive an unavailable conversation and require a replacement generation")
+  .description("Explicitly retire a task conversation and require a replacement generation")
   .option("-w, --workspace <path>").option("--task-id <id>")
   .requiredOption("--reason <reason>")
+  .requiredOption("--confirm", "confirm explicit task Chat retirement")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; taskId?: string; reason: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; reason: string; confirm: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const task = await markTaskUnavailable(workspace.id, resolved.taskId, opts.reason);
@@ -1451,16 +1508,17 @@ session.command("new-message-id").description("Generate a unique C2C delivery re
     if (opts.json) say(JSON.stringify({ ok: true, messageId })); else say(messageId);
   });
 
-session.command("clear").description("Forget only this task's ChatGPT conversation and provision")
+session.command("clear").description("Retire this task's ChatGPT conversation while preserving its permanent ownership record")
   .option("-w, --workspace <path>").option("--task-id <id>")
+  .requiredOption("--confirm", "confirm explicit retirement of this task Chat")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; taskId?: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; confirm: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const result = await clearTaskSession(workspace.id, resolved.taskId);
     if (opts.json) say(JSON.stringify({ ok: true, workspaceId: workspace.id, taskId: resolved.taskId, taskIdSource: resolved.source, ...result }));
     else if (!result.cleared) say("当前任务尚未记录 ChatGPT 会话。");
-    else check("已清除当前任务会话；项目绑定保持不变");
+    else check("已归档当前任务会话；永久归属记录已保留");
   });
 
 const runtime = program.command("runtime").description("Diagnose the managed OpenAI runtime without exposing credentials");

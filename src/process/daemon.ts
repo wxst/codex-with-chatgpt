@@ -40,6 +40,7 @@ const LEGACY_EXIT_CONFIRM_MS = 750;
 const STOP_POLL_MS = 50;
 const PENDING_START_ENV = "C2C_PENDING_START_ID";
 const STATE_DIR_ENV = "C2C_STATE_DIR";
+const INTERNAL_STATE_DIR_ENV = "C2C_INTERNAL_STATE_DIR";
 
 function cliEntry(): { cmd: string; args: string[] } {
   const distEntry = path.resolve(moduleDir, "..", "cli", "index.js");
@@ -68,7 +69,7 @@ export function bridgeDaemonEnvironment(
   const environment = { ...base };
   for (const key of Object.keys(environment)) {
     const normalizedKey = key.toUpperCase();
-    if (normalizedKey === STATE_DIR_ENV || normalizedKey === OPENAI_TUNNEL_TOKEN_FILE_ENV) {
+    if (normalizedKey === STATE_DIR_ENV || normalizedKey === INTERNAL_STATE_DIR_ENV || normalizedKey === OPENAI_TUNNEL_TOKEN_FILE_ENV) {
       delete environment[key];
     }
   }

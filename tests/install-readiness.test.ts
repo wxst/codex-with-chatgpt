@@ -367,6 +367,7 @@ describe("release automation contract", () => {
     expect(installSmokeScript).toContain("record-delivery-pending");
     expect(installSmokeScript).toContain('["session", "fail-delivery", "--help"]');
     expect(installSmokeScript).toContain("CODEX_THREAD_ID: \"install-smoke-task\"");
+    expect(installSmokeScript).toContain("TASK_ID_IDENTITY_MISMATCH");
   });
 
   it("bounds Windows integration concurrency to a stable level", () => {

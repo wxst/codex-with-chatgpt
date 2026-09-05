@@ -4,6 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startWorkspaceRouter, type WorkspaceRouterBridge } from "../src/router/server.js";
 import { createWorkspaceRouter, issueRouteCapability } from "../src/router/state.js";
+import { attachTaskRouteCapability, claimStandbyConversation, importStandbyConversation } from "../src/session/state.js";
 import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 let stateRoot: string;
@@ -33,16 +34,34 @@ beforeAll(async () => {
   const router = await createWorkspaceRouter(alphaRoot);
   const alpha = await router.register(alphaRoot);
   const beta = await router.register(betaRoot);
-  alphaToken = (await issueRouteCapability({
+  await importStandbyConversation({
+    conversationId: "alpha-chat", projectId: "g-p-routerpool123", markerText: "C2C_STANDBY_READY",
+    markerMessageId: "router-mcp-alpha-marker", markerRole: "user",
+  });
+  await importStandbyConversation({
+    conversationId: "beta-chat", projectId: "g-p-routerpool123", markerText: "C2C_STANDBY_READY",
+    markerMessageId: "router-mcp-beta-marker", markerRole: "user",
+  });
+  const alphaTask = await claimStandbyConversation({
+    workspaceId: alpha.workspaceId, taskId: "alpha-task", connectorName: "C2C", workspaceName: "alpha", branch: "main",
+  });
+  const betaTask = await claimStandbyConversation({
+    workspaceId: beta.workspaceId, taskId: "beta-task", connectorName: "C2C", workspaceName: "beta", branch: "main",
+  });
+  const alphaRoute = await issueRouteCapability({
     workspaceId: alpha.workspaceId,
     taskId: "alpha-task",
-    conversationId: "alpha-chat",
-  })).token;
-  betaToken = (await issueRouteCapability({
+    conversationId: alphaTask.task.conversationId,
+  });
+  const betaRoute = await issueRouteCapability({
     workspaceId: beta.workspaceId,
     taskId: "beta-task",
-    conversationId: "beta-chat",
-  })).token;
+    conversationId: betaTask.task.conversationId,
+  });
+  await attachTaskRouteCapability(alpha.workspaceId, "alpha-task", alphaRoute.id);
+  await attachTaskRouteCapability(beta.workspaceId, "beta-task", betaRoute.id);
+  alphaToken = alphaRoute.token;
+  betaToken = betaRoute.token;
 
   bridge = await startWorkspaceRouter({
     anchorRoot: alphaRoot,

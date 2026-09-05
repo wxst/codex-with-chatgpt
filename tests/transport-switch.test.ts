@@ -78,14 +78,14 @@ describe("transactional transport switching", () => {
     const workspace = new Workspace(root);
     writeTransportMode(workspace.id, "cloudflare");
     const stateFile = transportStateFile(workspace.id);
-    const originalWrite = fs.writeFileSync;
-    let writes = 0;
-    vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
-      if (path.resolve(String(file)) === path.resolve(stateFile)) {
-        writes += 1;
-        if (writes === 2) throw new Error("rollback write failed");
+    const originalRename = fs.renameSync;
+    let commits = 0;
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (path.resolve(String(destination)) === path.resolve(stateFile)) {
+        commits += 1;
+        if (commits === 2) throw new Error("rollback write failed");
       }
-      return originalWrite(file, data, options);
+      return originalRename(source, destination);
     });
 
     await expect(
@@ -102,7 +102,7 @@ describe("transactional transport switching", () => {
       );
     });
 
-    expect(writes).toBe(2);
+    expect(commits).toBe(2);
   });
 
   it("does not stop or rewrite an unchanged mode", async () => {

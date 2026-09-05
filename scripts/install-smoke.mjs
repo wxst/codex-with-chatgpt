@@ -58,6 +58,7 @@ try {
   const env = {
     ...process.env,
     C2C_STATE_DIR: stateDir,
+    C2C_INTERNAL_STATE_DIR: "test",
     NO_COLOR: "1",
   };
 
@@ -73,17 +74,26 @@ try {
   assert.match(sessionHelp, /record-read/u, "session help did not expose exact-conversation health tracking");
   assert.match(sessionHelp, /confirm-send-accepted/u, "session help did not expose host acceptance tracking");
   assert.match(sessionHelp, /record-delivery-pending/u, "session help did not expose late-delivery tracking");
+  assert.match(sessionHelp, /migrate/u, "session help did not expose assignment-ledger migration");
 
   const failDeliveryHelp = runCli(["session", "fail-delivery", "--help"], env);
   assert.match(failDeliveryHelp, /--kind <kind>/u, "fail-delivery did not require a terminal failure kind");
   const sessionState = parseLastJson(runCli(
-    ["session", "get", "-w", workspace, "--task-id", "lower-priority-task", "--json"],
+    ["session", "get", "-w", workspace, "--task-id", "install-smoke-task", "--json"],
     { ...env, CODEX_THREAD_ID: "install-smoke-task" }
   ));
   assert.equal(sessionState.ok, true);
   assert.equal(sessionState.taskId, "install-smoke-task");
   assert.equal(sessionState.taskIdSource, "CODEX_THREAD_ID");
   assert.equal(sessionState.requiresPoolClaim, true);
+  const conflictingTask = spawnSync(process.execPath, [cli, "session", "get", "-w", workspace, "--task-id", "other-task", "--json"], {
+    cwd: checkout,
+    env: { ...env, CODEX_THREAD_ID: "install-smoke-task" },
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  assert.notEqual(conflictingTask.status, 0, "a conflicting explicit task id was accepted");
+  assert.match(`${conflictingTask.stdout}\n${conflictingTask.stderr}`, /TASK_ID_IDENTITY_MISMATCH/u);
 
   const poolHelp = runCli(["session", "pool", "--help"], env);
   assert.match(poolHelp, /claim/u, "standby pool help did not expose claim");

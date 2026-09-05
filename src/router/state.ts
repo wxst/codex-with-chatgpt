@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import path from "node:path";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
+import { assertTaskConversationOwner } from "../session/state.js";
 import { Workspace } from "../workspace/manager.js";
 
 export interface RegisteredWorkspace {
@@ -205,6 +206,7 @@ export async function issueRouteCapability(input: {
   const workspaceId = input.workspaceId.trim();
   const taskId = validTaskId(input.taskId);
   const conversationId = validConversationId(input.conversationId);
+  assertTaskConversationOwner(workspaceId, taskId, conversationId);
   return withWorkspaceLifecycleLock(ROUTER_LOCK_ID, async () => {
     const state = requireRouterState();
     const workspace = state.workspaces.find((entry) => entry.workspaceId === workspaceId && !entry.revokedAt);
@@ -240,6 +242,12 @@ export async function resolveRouteCapability(tokenInput: string): Promise<Resolv
     (entry) => !entry.revokedAt && Date.parse(entry.expiresAt) > Date.now() && safeHashEqual(entry.tokenHash, hash)
   );
   if (!capability) throw new Error("ROUTE_ACCESS_DENIED");
+  try {
+    const task = assertTaskConversationOwner(capability.workspaceId, capability.taskId, capability.conversationId);
+    if (task.routeCapabilityId !== capability.id) throw new Error("ROUTE_ACCESS_DENIED");
+  } catch {
+    throw new Error("ROUTE_ACCESS_DENIED");
+  }
   const registration = state.workspaces.find((entry) => entry.workspaceId === capability.workspaceId && !entry.revokedAt);
   if (!registration) throw new Error("ROUTE_ACCESS_DENIED");
   let workspace: Workspace;

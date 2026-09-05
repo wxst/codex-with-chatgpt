@@ -61,9 +61,10 @@ OpenAI Tunnel 凭证时才能打断我，而且一次只让我做一个动作。
    且 stale 为 false，才把已有 runtime 视为健康。所有参数以当前客户端 help 输出为准，禁止猜测命令行参数。
 7. 如果当前账号或环境缺少 OpenAI Secure MCP Tunnel 访问条件，停止并准确报告阻断点。
    未经我明确同意，不得启用 Cloudflare。
-8. 首次建档由 Codex App 在后台创建普通 Chat 并自动发送身份消息，然后打开这个精确
-   会话。你只需将思考强度设为“极高”，再确认提示框。禁止向 ChatGPT 粘贴仓库文件、diff、密钥、
-   Token、Cookie 或长日志；ChatGPT 必须通过只读 MCP 自己读取所需上下文。
+8. 首次使用前，在 **Codex-with-ChatGPT** Project 手工准备备用普通 Chat：选择非 Pro、
+   思考强度“极高”，并发送一条只含 `C2C_STANDBY_READY` 的用户消息。后续任务由后台领取
+   精确会话。禁止向 ChatGPT 粘贴仓库文件、diff、密钥、Token、Cookie 或长日志；ChatGPT 必须
+   通过只读 MCP 自己读取所需上下文。
 9. 安装和正常使用期间禁止自动更新仓库、升级依赖、执行自动更新命令或自动同步上游。
 10. 最后给出有证据的验收清单，包括：实际 commit、依赖安装、typecheck、全部测试、
     build、安装烟雾测试、CLI 版本、传输模式、Bridge 状态和 MCP 文件读取验证。
@@ -135,6 +136,10 @@ node bin/c2c.js transport -w <workspace> --mode openai --json
 `node bin/c2c.js router migrate -w <anchor-workspace> --json`。后续项目运行
 `router ensure` 即可注册，复用原来的 OpenAI Secure MCP Tunnel 和 ChatGPT
 连接器。
+随后运行 `node bin/c2c.js session migrate --json`，它会在全局锁内备份旧记录并
+写入统一归属账本。
+旧版“三次读取缺失”留下的 `unavailable` 记录，先通过后台 `read_thread` 核对原 Chat；
+身份一致时使用 `session restore --confirm` 恢复原会话，避免额外消耗库存。
 
 每个 Codex 任务会从全局 **Codex-with-ChatGPT** Project 领取一个普通 Chat 并永久
 绑定。用户先手工准备库存：选择非 Pro、思考强度“极高”，并发送一条只含
@@ -144,15 +149,19 @@ node bin/c2c.js transport -w <workspace> --mode openai --json
 
 Skill 每次领取前都通过 Codex App 后台的 `list_threads` 和 `read_thread` 同步库存，
 使用带原始用户标记的 `session pool import --marker-text` 导入，再执行 `session pool
-claim`。领取按 FIFO 并在全局锁中完成；标题猜测、最近会话和跨任务复用均不参与。
+claim`。领取按 FIFO 并在全局锁中完成；库存与任务归属写入同一个原子账本；标题猜测、最近会话和跨任务复用均不参与。
 库存为空会返回 `POOL_EXHAUSTED`，任务正文不会发送。
 
 领取结果包含一次性的任务路由 token。Boot Prompt 以 `C2C_ROUTE_TOKEN` 携带它；8 个
 MCP 工具调用都要附加 `route_token`。Router 只会将该 token 解析到它绑定的工作区。
 日常控制消息只用 `list_threads`、`send_message_to_thread` 和 `read_thread`，必须先
-回读送达和回复，才推进状态。发送工具返回仅表示宿主已接受；前 30 秒未读到原消息时，
-任务会保持 `sending` 并继续读取，不会重发或切换会话。活跃等待最多 5 分钟；超时后
+回读送达和回复，才推进状态。发送工具返回仅表示宿主已接受；前 60 秒每 5 秒读取一次，未读到原消息时，
+任务会保持 `sending` 并继续读取，重复读取缺失只会标记 `degraded`。活跃等待最多 5 分钟；超时后
 下一次任务先读取同一条在途消息。
+
+同时给出 `CODEX_THREAD_ID` 和 `--task-id` 时，两者必须完全一致；值不同时会先返回
+`TASK_ID_IDENTITY_MISMATCH`，账本保持原样。Boot 回复还要带上 `workspace_info` 实际返回的
+`WORKSPACE_NAME`、`BRANCH` 与 `CONNECTOR`；只有回执字段时，验证继续保持 pending。
 
 修改托管 Runtime 前，运行 `node bin/c2c.js runtime diagnose -w <workspace> --json`。
 Runtime 唯一 Key 来源是 `%USERPROFILE%/.config/codex-with-chatgpt/tunnel-runtime-key.dpapi`。

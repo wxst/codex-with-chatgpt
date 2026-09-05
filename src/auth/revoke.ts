@@ -166,9 +166,11 @@ export async function revokeLegacyWindowsWorkspaceAccess(
   }
 
   const previousStateDir = process.env.C2C_STATE_DIR;
+  const previousInternalStateDir = process.env.C2C_INTERNAL_STATE_DIR;
   let removedArtifacts: number | null = null;
   try {
     process.env.C2C_STATE_DIR = preflight.legacyRoot;
+    process.env.C2C_INTERNAL_STATE_DIR = "legacy-cleanup";
     const stopLegacyRuntime: StopBridgeRuntime =
       deps.stopBridge ??
       ((_workspaceRoot, runtime) =>
@@ -211,6 +213,8 @@ export async function revokeLegacyWindowsWorkspaceAccess(
   } finally {
     if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
     else process.env.C2C_STATE_DIR = previousStateDir;
+    if (previousInternalStateDir === undefined) delete process.env.C2C_INTERNAL_STATE_DIR;
+    else process.env.C2C_INTERNAL_STATE_DIR = previousInternalStateDir;
   }
 }
 

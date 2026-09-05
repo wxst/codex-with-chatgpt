@@ -6,7 +6,7 @@ import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
 
 export type VerificationState = "pending" | "ready";
 export type SettingsSource = "pending" | "user_confirmed";
-export type BindingState = "bound" | "unavailable";
+export type BindingState = "bound" | "quarantined" | "unavailable";
 export type BootstrapCreationState = "idle" | "dispatching" | "pending" | "created";
 export type SettingsDialogState = "pending" | "confirmed" | "later";
 export type ChannelState = "ready" | "sending" | "delivered" | "awaiting_reply" | "degraded";
@@ -139,6 +139,31 @@ const STANDBY_MARKER = "C2C_STANDBY_READY";
 const STANDBY_PRO_MARKER = "C2C_STANDBY_READY_PRO";
 const PROJECT_ID_PATTERN = /^g-p-[A-Za-z0-9]+$/u;
 
+/** Coordinator protocol timing; Codex App's read_thread endpoint has no timeout option. */
+export const FAST_DELIVERY_READBACK_WINDOW_MS = 60_000;
+export const FAST_DELIVERY_READBACK_INTERVAL_MS = 5_000;
+export const ACTIVE_DELIVERY_READBACK_WINDOW_MS = 5 * 60_000;
+
+export type DeliveryReadbackPhase = "none" | "fast" | "active" | "deferred";
+
+/**
+ * Classify receipt polling without mutating a task. The coordinator owns the
+ * actual reads; this keeps its 60-second and five-minute boundaries stable and
+ * independently testable.
+ */
+export function deliveryReadbackPhase(
+  task: Pick<SavedTaskSession, "channelState" | "sendAcceptedAt">,
+  nowMs = Date.now()
+): DeliveryReadbackPhase {
+  if (task.channelState !== "sending" || !task.sendAcceptedAt) return "none";
+  const acceptedAt = Date.parse(task.sendAcceptedAt);
+  if (!Number.isFinite(acceptedAt)) return "active";
+  const elapsedMs = Math.max(0, nowMs - acceptedAt);
+  if (elapsedMs < FAST_DELIVERY_READBACK_WINDOW_MS) return "fast";
+  if (elapsedMs < ACTIVE_DELIVERY_READBACK_WINDOW_MS) return "active";
+  return "deferred";
+}
+
 export type StandbyMarker = typeof STANDBY_MARKER | typeof STANDBY_PRO_MARKER;
 export type StandbyConversationStatus = "available" | "claimed" | "retired" | "quarantined";
 
@@ -161,6 +186,20 @@ export interface StandbyPool {
   version: 1;
   projectId: string | null;
   entries: StandbyConversation[];
+  savedAt: string;
+}
+
+/**
+ * The sole durable owner index for ordinary ChatGPT conversations.
+ *
+ * Legacy per-workspace files remain readable only as migration input. Every
+ * mutating session operation writes this one document, so a pool lease and its
+ * task binding always become visible together.
+ */
+export interface SessionLedger {
+  version: 1;
+  pool: StandbyPool;
+  registries: SessionRegistry[];
   savedAt: string;
 }
 
@@ -217,11 +256,16 @@ export function resolveCodexTaskId(
   env: Record<string, string | undefined> = process.env
 ): ResolvedTaskId {
   const hostTaskId = env.CODEX_THREAD_ID?.trim();
+  const explicit = explicitTaskId?.trim();
   if (hostTaskId) {
-    return { taskId: validateTaskId(hostTaskId), source: "CODEX_THREAD_ID", generated: false };
+    const host = validateTaskId(hostTaskId);
+    if (explicit && validateTaskId(explicit) !== host) {
+      throw new Error("TASK_ID_IDENTITY_MISMATCH: explicit task id conflicts with CODEX_THREAD_ID");
+    }
+    return { taskId: host, source: "CODEX_THREAD_ID", generated: false };
   }
-  if (explicitTaskId?.trim()) {
-    return { taskId: validateTaskId(explicitTaskId), source: "explicit", generated: false };
+  if (explicit) {
+    return { taskId: validateTaskId(explicit), source: "explicit", generated: false };
   }
   return { taskId: newTaskId(), source: "generated", generated: true };
 }
@@ -289,6 +333,10 @@ export function sessionFile(workspaceId: string): string {
   return path.join(getStateDir(), "sessions", `${validateWorkspaceId(workspaceId)}.json`);
 }
 
+export function sessionLedgerFile(): string {
+  return path.join(getStateDir(), "sessions", "assignment-ledger.json");
+}
+
 function standbyPoolFile(): string {
   return path.join(getStateDir(), "sessions", "standby-pool.json");
 }
@@ -311,12 +359,12 @@ function isStandbyPool(value: unknown): value is StandbyPool {
 }
 
 export function readStandbyPool(): StandbyPool {
-  const raw = readJsonIfExists<unknown>(standbyPoolFile());
-  return isStandbyPool(raw) ? raw : emptyStandbyPool();
+  return readSessionLedger().pool;
 }
 
 function writeStandbyPool(pool: StandbyPool): StandbyPool {
-  writeSecureJson(standbyPoolFile(), pool);
+  const ledger = readSessionLedger();
+  writeSessionLedger({ ...ledger, pool: normalizeStandbyPool(pool), savedAt: new Date().toISOString() });
   return pool;
 }
 
@@ -415,17 +463,232 @@ function normalizeRegistry(registry: SessionRegistry): SessionRegistry {
   };
 }
 
+function normalizeStandbyPool(pool: StandbyPool): StandbyPool {
+  return {
+    ...pool,
+    projectId: pool.projectId ?? null,
+    entries: pool.entries.map((entry) => ({ ...entry, claimedBy: entry.claimedBy ? { ...entry.claimedBy } : undefined })),
+  };
+}
+
+function emptySessionLedger(): SessionLedger {
+  return {
+    version: 1,
+    pool: emptyStandbyPool(),
+    registries: [],
+    savedAt: new Date().toISOString(),
+  };
+}
+
+function readJsonStrict(file: string, label: string): unknown | null {
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`SESSION_LEDGER_CORRUPT: ${label} is unreadable (${message})`);
+  }
+}
+
+function isStandbyEntry(value: unknown): value is StandbyConversation {
+  if (!value || typeof value !== "object") return false;
+  const entry = value as Partial<StandbyConversation>;
+  return typeof entry.id === "string" && typeof entry.conversationId === "string" &&
+    typeof entry.projectId === "string" && (entry.marker === STANDBY_MARKER || entry.marker === STANDBY_PRO_MARKER) &&
+    typeof entry.markerMessageId === "string" && typeof entry.createdAt === "string" &&
+    typeof entry.importedAt === "string" &&
+    (entry.status === "available" || entry.status === "claimed" || entry.status === "retired" || entry.status === "quarantined") &&
+    (entry.claimedBy === undefined || (
+      typeof entry.claimedBy?.workspaceId === "string" && typeof entry.claimedBy.taskId === "string" &&
+      typeof entry.claimedBy.generation === "number"
+    ));
+}
+
+function isSessionLedger(value: unknown): value is SessionLedger {
+  if (!value || typeof value !== "object") return false;
+  const ledger = value as Partial<SessionLedger>;
+  return ledger.version === 1 && isStandbyPool(ledger.pool) &&
+    ledger.pool.entries.every(isStandbyEntry) &&
+    Array.isArray(ledger.registries) && ledger.registries.every(isRegistry) &&
+    typeof ledger.savedAt === "string";
+}
+
+function allLegacyRegistries(): SessionRegistry[] {
+  const directory = path.join(getStateDir(), "sessions");
+  let names: string[];
+  try {
+    names = fs.readdirSync(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  const registries: SessionRegistry[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".json") || name === "standby-pool.json" || name === "assignment-ledger.json" || name === "bootstrap-lease.json") continue;
+    const raw = readJsonStrict(path.join(directory, name), `legacy session ${name}`);
+    if (!isRegistry(raw)) continue;
+    registries.push(normalizeRegistry(raw));
+  }
+  return registries;
+}
+
+function readLegacyPool(): StandbyPool {
+  const raw = readJsonStrict(standbyPoolFile(), "legacy standby pool");
+  if (raw === null) return emptyStandbyPool();
+  if (!isStandbyPool(raw) || !raw.entries.every(isStandbyEntry)) {
+    throw new Error("SESSION_LEDGER_CORRUPT: legacy standby pool has an invalid shape");
+  }
+  return normalizeStandbyPool(raw);
+}
+
+function hasLegacySessionState(): boolean {
+  const directory = path.join(getStateDir(), "sessions");
+  try {
+    return fs.readdirSync(directory).some((name) =>
+      name === "standby-pool.json" ||
+      (name.endsWith(".json") && name !== "assignment-ledger.json" && name !== "bootstrap-lease.json")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function assertLedgerIntegrity(ledger: SessionLedger): void {
+  const workspaceIds = new Set<string>();
+  const owners = new Map<string, string>();
+  const poolByConversation = new Map<string, StandbyConversation>();
+  const poolById = new Map<string, StandbyConversation>();
+
+  for (const entry of ledger.pool.entries) {
+    validateConversationId(entry.conversationId);
+    if (poolByConversation.has(entry.conversationId) || poolById.has(entry.id)) {
+      throw new Error("SESSION_LEDGER_CONFLICT: duplicate standby conversation ownership");
+    }
+    poolByConversation.set(entry.conversationId, entry);
+    poolById.set(entry.id, entry);
+  }
+
+  for (const rawRegistry of ledger.registries) {
+    const registry = normalizeRegistry(rawRegistry);
+    const workspaceId = validateWorkspaceId(registry.workspaceId);
+    if (workspaceIds.has(workspaceId)) {
+      throw new Error("SESSION_LEDGER_CONFLICT: duplicate workspace registry");
+    }
+    workspaceIds.add(workspaceId);
+    const taskIds = new Set<string>();
+    for (const task of registry.tasks) {
+      const taskId = validateTaskId(task.taskId);
+      if (taskIds.has(taskId)) throw new Error("SESSION_LEDGER_CONFLICT: duplicate task binding");
+      taskIds.add(taskId);
+      const owner = `${workspaceId}:${taskId}`;
+      for (const conversationId of allConversationIds(task)) {
+        validateConversationId(conversationId);
+        const prior = owners.get(conversationId);
+        if (prior && prior !== owner) {
+          throw new Error("SESSION_LEDGER_CONFLICT: a Chat has multiple task owners");
+        }
+        owners.set(conversationId, owner);
+      }
+      if (task.bindingState === "bound") {
+        const poolEntry = task.poolEntryId ? poolById.get(task.poolEntryId) : undefined;
+        if (!poolEntry || poolEntry.conversationId !== task.conversationId || poolEntry.status !== "claimed" ||
+          poolEntry.claimedBy?.workspaceId !== workspaceId || poolEntry.claimedBy.taskId !== taskId ||
+          poolEntry.claimedBy.generation !== task.generation) {
+          throw new Error("SESSION_LEDGER_CONFLICT: bound task and standby owner disagree");
+        }
+      }
+      if (task.bindingState === "quarantined") {
+        const poolEntry = task.poolEntryId ? poolById.get(task.poolEntryId) : undefined;
+        if (!poolEntry || poolEntry.conversationId !== task.conversationId || poolEntry.status !== "quarantined" ||
+          poolEntry.claimedBy?.workspaceId !== workspaceId || poolEntry.claimedBy.taskId !== taskId ||
+          poolEntry.claimedBy.generation !== task.generation) {
+          throw new Error("SESSION_LEDGER_CONFLICT: quarantined task and standby owner disagree");
+        }
+      }
+    }
+  }
+
+  for (const entry of ledger.pool.entries) {
+    if (entry.status === "available" && owners.has(entry.conversationId)) {
+      throw new Error("SESSION_LEDGER_CONFLICT: available Chat already has an owner");
+    }
+    if (entry.status === "claimed" && !owners.has(entry.conversationId)) {
+      throw new Error("SESSION_LEDGER_CONFLICT: claimed Chat has no task owner");
+    }
+  }
+}
+
+function normalizeSessionLedger(ledger: SessionLedger): SessionLedger {
+  const normalized: SessionLedger = {
+    ...ledger,
+    pool: normalizeStandbyPool(ledger.pool),
+    registries: ledger.registries.map(normalizeRegistry),
+  };
+  assertLedgerIntegrity(normalized);
+  return normalized;
+}
+
+function readSessionLedger(): SessionLedger {
+  const raw = readJsonStrict(sessionLedgerFile(), "assignment ledger");
+  if (raw !== null) {
+    if (!isSessionLedger(raw)) throw new Error("SESSION_LEDGER_CORRUPT: assignment ledger has an invalid shape");
+    return normalizeSessionLedger(raw);
+  }
+  return normalizeSessionLedger({
+    ...emptySessionLedger(),
+    pool: readLegacyPool(),
+    registries: allLegacyRegistries(),
+  });
+}
+
+function backupLegacySessionState(): void {
+  if (fs.existsSync(sessionLedgerFile()) || !hasLegacySessionState()) return;
+  const directory = path.join(getStateDir(), "sessions");
+  const backup = path.join(directory, `legacy-backup-${new Date().toISOString().replace(/[:.]/gu, "-")}`);
+  fs.mkdirSync(backup, { recursive: true, mode: 0o700 });
+  for (const name of fs.readdirSync(directory)) {
+    if (!name.endsWith(".json") || name === "assignment-ledger.json") continue;
+    fs.copyFileSync(path.join(directory, name), path.join(backup, name));
+  }
+}
+
+function writeSessionLedger(ledger: SessionLedger): SessionLedger {
+  const normalized = normalizeSessionLedger({ ...ledger, savedAt: new Date().toISOString() });
+  backupLegacySessionState();
+  writeSecureJson(sessionLedgerFile(), normalized);
+  return normalized;
+}
+
+export async function migrateSessionLedger(): Promise<{ migrated: boolean; ledger: SessionLedger }> {
+  return withWorkspaceLifecycleLock(SESSION_REGISTRY_LOCK_ID, async () => {
+    const migrated = !fs.existsSync(sessionLedgerFile());
+    const ledger = readSessionLedger();
+    return { migrated, ledger: migrated ? writeSessionLedger(ledger) : ledger };
+  });
+}
+
+function registryFromLedger(ledger: SessionLedger, workspaceId: string): SessionRegistry {
+  return ledger.registries.find((entry) => entry.workspaceId === workspaceId) ?? emptyRegistry(workspaceId);
+}
+
 export function readSessionRegistry(workspaceId: string): SessionReadResult {
   const id = validateWorkspaceId(workspaceId);
+  const ledger = readSessionLedger();
+  const registry = ledger.registries.find((entry) => entry.workspaceId === id);
+  if (registry) return { registry: normalizeRegistry(registry), legacyDetected: false };
   const raw = readJsonIfExists<unknown>(sessionFile(id));
-  if (isRegistry(raw) && raw.workspaceId === id) return { registry: normalizeRegistry(raw), legacyDetected: false };
   return { registry: emptyRegistry(id), legacyDetected: raw !== null };
 }
 
 export function writeSessionRegistry(registry: SessionRegistry): SessionRegistry {
   if (registry.version !== 3) throw new Error("session registry version must be 3");
-  writeSecureJson(sessionFile(registry.workspaceId), registry);
-  return registry;
+  const normalized = normalizeRegistry(registry);
+  const ledger = readSessionLedger();
+  writeSessionLedger({
+    ...ledger,
+    registries: [...ledger.registries.filter((entry) => entry.workspaceId !== normalized.workspaceId), normalized],
+  });
+  return normalized;
 }
 
 function allConversationIds(task: SavedTaskSession): string[] {
@@ -433,18 +696,7 @@ function allConversationIds(task: SavedTaskSession): string[] {
 }
 
 function findConversationOwner(conversationId: string): { workspaceId: string; taskId: string } | null {
-  const directory = path.join(getStateDir(), "sessions");
-  let files: string[];
-  try {
-    files = fs.readdirSync(directory);
-  } catch {
-    return null;
-  }
-  for (const file of files) {
-    if (!file.endsWith(".json") || file === "bootstrap-lease.json") continue;
-    const candidate = readJsonIfExists<unknown>(path.join(directory, file));
-    if (!isRegistry(candidate)) continue;
-    const registry = normalizeRegistry(candidate);
+  for (const registry of readSessionLedger().registries) {
     const task = registry.tasks.find((entry) => allConversationIds(entry).includes(conversationId));
     if (task) return { workspaceId: registry.workspaceId, taskId: task.taskId };
     const provision = registry.provisions.find((entry) => entry.serverConversationId === conversationId);
@@ -566,13 +818,17 @@ export async function claimStandbyConversation(
     const connectorName = input.connectorName.trim();
     const workspaceName = input.workspaceName.trim();
     if (!connectorName || !workspaceName) throw new Error("standby claim requires connector and workspace names");
-    const { registry } = readSessionRegistry(workspaceId);
+    const ledger = readSessionLedger();
+    const registry = registryFromLedger(ledger, workspaceId);
     const existing = registry.tasks.find((entry) => entry.taskId === taskId);
-    const pool = readStandbyPool();
+    const pool = ledger.pool;
     if (existing?.bindingState === "bound") {
       const entry = pool.entries.find((candidate) => candidate.conversationId === existing.conversationId);
       if (!entry) throw new Error("bound task conversation is missing from the standby pool");
       return { task: existing, entry, reused: true };
+    }
+    if (existing?.bindingState === "quarantined") {
+      throw new Error("TASK_CHAT_QUARANTINED: retire the exact task Chat with session clear --confirm before replacement");
     }
 
     const desiredMarker: StandbyMarker = input.userExplicitPro ? STANDBY_PRO_MARKER : STANDBY_MARKER;
@@ -611,14 +867,19 @@ export async function claimStandbyConversation(
       return entry;
     });
     const claimed = entries.find((entry) => entry.id === candidate.id)!;
-    writeStandbyPool({ ...pool, entries, savedAt: now });
-    writeSessionRegistry({
+    const nextRegistry: SessionRegistry = {
       ...registry,
       projectUrl: `https://chatgpt.com/g/${candidate.projectId}/project`,
       connectorName,
       tasks: [...registry.tasks.filter((entry) => entry.taskId !== taskId), task],
       // Legacy fake-creation provisions must not participate in standby allocation.
       provisions: registry.provisions.filter((entry) => entry.taskId !== taskId),
+      savedAt: now,
+    };
+    writeSessionLedger({
+      ...ledger,
+      pool: { ...pool, entries, savedAt: now },
+      registries: [...ledger.registries.filter((entry) => entry.workspaceId !== workspaceId), nextRegistry],
       savedAt: now,
     });
     return { task, entry: claimed, reused: false };
@@ -633,31 +894,78 @@ export async function quarantineStandbyConversation(
     const conversationId = validateConversationId(conversationIdInput);
     const reason = reasonInput.trim().slice(0, 500);
     if (!reason) throw new Error("standby quarantine requires a reason");
-    const pool = readStandbyPool();
+    const ledger = readSessionLedger();
+    const pool = ledger.pool;
     const current = pool.entries.find((entry) => entry.conversationId === conversationId);
     if (!current) throw new Error("standby conversation is not in the pool");
     const now = new Date().toISOString();
     const updated: StandbyConversation = { ...current, status: "quarantined", retiredAt: now, reason };
-    writeStandbyPool({ ...pool, entries: pool.entries.map((entry) => entry.id === current.id ? updated : entry), savedAt: now });
+    const registries = ledger.registries.map((registry) => ({
+      ...registry,
+      tasks: registry.tasks.map((task) =>
+        task.conversationId === conversationId && task.bindingState === "bound"
+          ? quarantineTask(task, `quarantined: ${reason}`)
+          : task
+      ),
+    }));
+    writeSessionLedger({
+      ...ledger,
+      pool: { ...pool, entries: pool.entries.map((entry) => entry.id === current.id ? updated : entry), savedAt: now },
+      registries,
+      savedAt: now,
+    });
     return updated;
   });
 }
 
-async function retireClaimedStandbyEntry(task: SavedTaskSession, reason: string): Promise<void> {
-  if (!task.poolEntryId) return;
-  await withWorkspaceLifecycleLock(SESSION_REGISTRY_LOCK_ID, async () => {
-    const pool = readStandbyPool();
-    const current = pool.entries.find((entry) => entry.id === task.poolEntryId);
-    if (!current || current.status === "retired") return;
-    const now = new Date().toISOString();
-    const updated: StandbyConversation = {
-      ...current,
-      status: "retired",
-      retiredAt: now,
-      reason: reason.slice(0, 500),
-    };
-    writeStandbyPool({ ...pool, entries: pool.entries.map((entry) => entry.id === updated.id ? updated : entry), savedAt: now });
-  });
+function retireClaimedStandbyEntryInLedger(
+  ledger: SessionLedger,
+  task: SavedTaskSession,
+  reason: string
+): SessionLedger {
+  if (!task.poolEntryId) return ledger;
+  const current = ledger.pool.entries.find((entry) => entry.id === task.poolEntryId);
+  if (!current || current.status === "retired") return ledger;
+  const now = new Date().toISOString();
+  const updated: StandbyConversation = {
+    ...current,
+    status: "retired",
+    retiredAt: now,
+    reason: reason.slice(0, 500),
+  };
+  return {
+    ...ledger,
+    pool: {
+      ...ledger.pool,
+      entries: ledger.pool.entries.map((entry) => entry.id === updated.id ? updated : entry),
+      savedAt: now,
+    },
+  };
+}
+
+function quarantineClaimedStandbyEntryInLedger(
+  ledger: SessionLedger,
+  task: SavedTaskSession,
+  reason: string
+): SessionLedger {
+  if (!task.poolEntryId) return ledger;
+  const current = ledger.pool.entries.find((entry) => entry.id === task.poolEntryId);
+  if (!current || current.status === "quarantined") return ledger;
+  const now = new Date().toISOString();
+  const updated: StandbyConversation = {
+    ...current,
+    status: "quarantined",
+    retiredAt: now,
+    reason: reason.slice(0, 500),
+  };
+  return {
+    ...ledger,
+    pool: {
+      ...ledger.pool,
+      entries: ledger.pool.entries.map((entry) => entry.id === updated.id ? updated : entry),
+      savedAt: now,
+    },
+  };
 }
 
 export async function attachTaskRouteCapability(
@@ -673,6 +981,22 @@ export async function attachTaskRouteCapability(
 export function readTaskSession(workspaceId: string, taskId: string): SavedTaskSession | null {
   const id = validateTaskId(taskId);
   return readSessionRegistry(workspaceId).registry.tasks.find((task) => task.taskId === id) ?? null;
+}
+
+/** Verify that Router capabilities always point at the ledger's current generation. */
+export function assertTaskConversationOwner(
+  workspaceIdInput: string,
+  taskIdInput: string,
+  conversationIdInput: string
+): SavedTaskSession {
+  const workspaceId = validateWorkspaceId(workspaceIdInput);
+  const taskId = validateTaskId(taskIdInput);
+  const conversationId = validateConversationId(conversationIdInput);
+  const task = readTaskSession(workspaceId, taskId);
+  if (!task || task.bindingState !== "bound" || task.conversationId !== conversationId) {
+    throw new Error("SESSION_CONVERSATION_OWNER_MISMATCH");
+  }
+  return task;
 }
 
 export async function confirmTaskSettings(
@@ -712,12 +1036,27 @@ async function updateTaskChannel(
   return withWorkspaceLifecycleLock(SESSION_REGISTRY_LOCK_ID, async () => {
     const workspace = validateWorkspaceId(workspaceId);
     const id = validateTaskId(taskId);
-    const { registry } = readSessionRegistry(workspace);
+    const ledger = readSessionLedger();
+    const registry = registryFromLedger(ledger, workspace);
     const current = registry.tasks.find((task) => task.taskId === id);
     if (!current) throw new Error("task has no ChatGPT conversation binding");
     const task = update({ ...current, channelState: current.channelState ?? "ready" });
     const tasks = registry.tasks.map((entry) => entry.taskId === id ? task : entry);
-    writeSessionRegistry({ ...registry, tasks, savedAt: new Date().toISOString() });
+    let nextLedger: SessionLedger = {
+      ...ledger,
+      registries: [...ledger.registries.filter((entry) => entry.workspaceId !== workspace), {
+        ...registry,
+        tasks,
+        savedAt: new Date().toISOString(),
+      }],
+    };
+    if (task.bindingState === "unavailable" && current.bindingState !== "unavailable") {
+      nextLedger = retireClaimedStandbyEntryInLedger(nextLedger, task, task.replacementReason ?? "retired");
+    }
+    if (task.bindingState === "quarantined" && current.bindingState !== "quarantined") {
+      nextLedger = quarantineClaimedStandbyEntryInLedger(nextLedger, task, task.replacementReason ?? "quarantined");
+    }
+    writeSessionLedger(nextLedger);
     return task;
   });
 }
@@ -795,6 +1134,26 @@ function unavailableTask(task: SavedTaskSession, reason: string): SavedTaskSessi
   };
 }
 
+function quarantineTask(task: SavedTaskSession, reason: string): SavedTaskSession {
+  if (task.bindingState === "quarantined") {
+    return { ...task, replacementReason: reason, savedAt: new Date().toISOString() };
+  }
+  return {
+    ...task,
+    bindingState: "quarantined",
+    verificationState: "pending",
+    channelState: "degraded",
+    pendingMessageId: undefined,
+    pendingIteration: undefined,
+    sendAcceptedAt: undefined,
+    deliveryPendingSince: undefined,
+    replacementReason: reason,
+    lastDeliveryError: reason,
+    lastDeliveryCheckedAt: new Date().toISOString(),
+    savedAt: new Date().toISOString(),
+  };
+}
+
 export async function markTaskUnavailable(
   workspaceId: string,
   taskId: string,
@@ -802,9 +1161,70 @@ export async function markTaskUnavailable(
 ): Promise<SavedTaskSession> {
   const normalizedReason = reason.trim().slice(0, 500);
   if (!normalizedReason) throw new Error("replacement requires a reason");
-  const task = await updateTaskChannel(workspaceId, taskId, (current) => unavailableTask(current, normalizedReason));
-  await retireClaimedStandbyEntry(task, normalizedReason);
-  return task;
+  return updateTaskChannel(workspaceId, taskId, (current) => unavailableTask(current, normalizedReason));
+}
+
+/**
+ * Re-adopt a legacy retirement only after the coordinator has directly read
+ * this exact Chat and verified its task/workspace identity. This never selects
+ * a replacement Chat and never changes the task generation.
+ */
+export async function restoreTaskConversation(
+  workspaceIdInput: string,
+  taskIdInput: string,
+  conversationIdInput: string
+): Promise<SavedTaskSession> {
+  return withWorkspaceLifecycleLock(SESSION_REGISTRY_LOCK_ID, async () => {
+    const workspaceId = validateWorkspaceId(workspaceIdInput);
+    const taskId = validateTaskId(taskIdInput);
+    const conversationId = validateConversationId(conversationIdInput);
+    const ledger = readSessionLedger();
+    const registry = registryFromLedger(ledger, workspaceId);
+    const current = registry.tasks.find((task) => task.taskId === taskId);
+    if (!current || current.bindingState !== "unavailable" || current.conversationId !== conversationId) {
+      throw new Error("TASK_CHAT_RESTORE_INELIGIBLE");
+    }
+    if (!current.replacedConversations.some((entry) => entry.conversationId === conversationId)) {
+      throw new Error("TASK_CHAT_RESTORE_INELIGIBLE");
+    }
+    const entry = current.poolEntryId ? ledger.pool.entries.find((candidate) => candidate.id === current.poolEntryId) : undefined;
+    if (!entry || entry.conversationId !== conversationId || entry.status !== "retired" ||
+      entry.claimedBy?.workspaceId !== workspaceId || entry.claimedBy.taskId !== taskId ||
+      entry.claimedBy.generation !== current.generation) {
+      throw new Error("TASK_CHAT_RESTORE_INELIGIBLE");
+    }
+    const now = new Date().toISOString();
+    const restored: SavedTaskSession = {
+      ...current,
+      bindingState: "bound",
+      verificationState: "pending",
+      channelState: "degraded",
+      replacedConversations: current.replacedConversations.filter((item) => item.conversationId !== conversationId),
+      replacementReason: undefined,
+      consecutiveReadFailures: 0,
+      lastReadError: undefined,
+      lastReadCheckedAt: now,
+      savedAt: now,
+    };
+    const claimed: StandbyConversation = {
+      ...entry,
+      status: "claimed",
+      retiredAt: undefined,
+      reason: undefined,
+      claimedAt: entry.claimedAt ?? now,
+    };
+    writeSessionLedger({
+      ...ledger,
+      pool: { ...ledger.pool, entries: ledger.pool.entries.map((candidate) => candidate.id === entry.id ? claimed : candidate), savedAt: now },
+      registries: [...ledger.registries.filter((candidate) => candidate.workspaceId !== workspaceId), {
+        ...registry,
+        tasks: registry.tasks.map((task) => task.taskId === taskId ? restored : task),
+        savedAt: now,
+      }],
+      savedAt: now,
+    });
+    return restored;
+  });
 }
 
 export async function recordTaskReadResult(
@@ -851,14 +1271,6 @@ export async function recordTaskReadResult(
       };
     }
     const failures = task.consecutiveReadFailures + 1;
-    if (failures >= 3) {
-      return {
-        ...unavailableTask(task, normalizedReason),
-        consecutiveReadFailures: failures,
-        lastReadError: normalizedReason,
-        lastReadCheckedAt: checkedAt,
-      };
-    }
     return {
       ...task,
       channelState: "degraded",
@@ -868,7 +1280,6 @@ export async function recordTaskReadResult(
       savedAt: checkedAt,
     };
   });
-  if (task.bindingState === "unavailable") await retireClaimedStandbyEntry(task, normalizedReason);
   return task;
 }
 
@@ -1023,9 +1434,10 @@ export async function failTaskDelivery(
       throw new Error("delivery failure does not match the in-flight message");
     }
     const terminalReason = `${failureKind}: ${normalizedReason}`;
-    if (failureKind === "conversation_gone" || failureKind === "identity_mismatch") {
+    if (failureKind === "conversation_gone") {
       return unavailableTask(task, terminalReason);
     }
+    if (failureKind === "identity_mismatch") return quarantineTask(task, terminalReason);
     return {
       ...task,
       channelState: "degraded",
@@ -1038,7 +1450,6 @@ export async function failTaskDelivery(
       savedAt: new Date().toISOString(),
     };
   });
-  if (task.bindingState === "unavailable") await retireClaimedStandbyEntry(task, `${failureKind}: ${normalizedReason}`);
   return task;
 }
 
@@ -1053,12 +1464,31 @@ export async function clearTaskSession(
   return withWorkspaceLifecycleLock(SESSION_REGISTRY_LOCK_ID, async () => {
     const workspace = validateWorkspaceId(workspaceId);
     const id = validateTaskId(taskId);
-    const { registry } = readSessionRegistry(workspace);
-    const tasks = registry.tasks.filter((task) => task.taskId !== id);
+    const ledger = readSessionLedger();
+    const registry = registryFromLedger(ledger, workspace);
+    const current = registry.tasks.find((task) => task.taskId === id);
+    const tasks = current
+      ? registry.tasks.map((task) => task.taskId === id
+        ? unavailableTask(task, "operator retired the task conversation")
+        : task)
+      : registry.tasks;
     const provisions = registry.provisions.filter((provision) => provision.taskId !== id);
-    const cleared = tasks.length !== registry.tasks.length || provisions.length !== registry.provisions.length;
+    const cleared = Boolean(current) || provisions.length !== registry.provisions.length;
     if (!cleared) return { cleared: false, keptProject: Boolean(registry.projectUrl) };
-    writeSessionRegistry({ ...registry, tasks, provisions, savedAt: new Date().toISOString() });
+    let nextLedger: SessionLedger = {
+      ...ledger,
+      registries: [...ledger.registries.filter((entry) => entry.workspaceId !== workspace), {
+        ...registry,
+        tasks,
+        provisions,
+        savedAt: new Date().toISOString(),
+      }],
+    };
+    if (current) {
+      const retired = tasks.find((task) => task.taskId === id)!;
+      nextLedger = retireClaimedStandbyEntryInLedger(nextLedger, retired, retired.replacementReason ?? "operator retired");
+    }
+    writeSessionLedger(nextLedger);
     return { cleared: true, keptProject: Boolean(registry.projectUrl) };
   });
 }
@@ -1068,5 +1498,8 @@ export async function clearTaskSessionAfterMismatch(workspaceId: string, taskId:
 }
 
 export function removeSessionRegistry(workspaceId: string): void {
+  if (fs.existsSync(sessionLedgerFile())) {
+    throw new Error("global assignment ledger owns session records; retire the exact task instead");
+  }
   fs.rmSync(sessionFile(workspaceId), { force: true });
 }

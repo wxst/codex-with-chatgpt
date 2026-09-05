@@ -15,6 +15,16 @@ ChatGPT connector. `c2c router ensure -w <workspace>` registers each new local
 workspace. The gateway keeps one transport runtime; requests are stateless and
 resolve a new `Workspace` instance from a task capability on every call.
 
+On upgrade, `c2c session migrate --json` takes the existing global session lock,
+backs up legacy pool and workspace records, and writes the assignment ledger
+before ordinary pool claims resume.
+
+An old `unavailable` record created by the retired read-miss rule stays out of
+stock. After direct `read_thread` confirms the original Chat and its task and
+workspace identity, `c2c session restore --confirm` re-adopts that exact
+conversation in the same generation. Explicit host deletion proceeds to a new
+claim.
+
 A route capability binds:
 
 ```text
@@ -43,7 +53,11 @@ whole raw user-turn text; assistant echoes and extra text do not qualify. Model
 names stay unknown because the host does not return verified model fields.
 
 `session pool claim` holds the global session lock, uses FIFO `createdAt`, and
-atomically saves a permanent `workspaceId + taskId → conversationId` binding.
+atomically saves a permanent `workspaceId + taskId → conversationId` binding in
+the single assignment ledger. The ledger contains both inventory and task
+owners, validates that each Chat has one owner, and uses an atomic replacement
+write. Malformed or conflicting ledger state pauses claims and sends while the
+original evidence remains intact.
 A claimed Chat is never returned to stock. If it is deleted, it becomes retired
 and the same task may claim a next generation. A temporary direct-tool failure
 only sets `degraded`; it does not replace the Chat. Empty compatible stock yields
@@ -78,10 +92,19 @@ ITERATION
 MESSAGE_ID: c2c_msg_<uuid>
 ```
 
+Task identity comes from `CODEX_THREAD_ID` when the host provides it. An
+explicit `--task-id` may repeat that value for automation, while a different
+value stops before any registry or pool write with `TASK_ID_IDENTITY_MISMATCH`.
+
 The new Chat's Boot Prompt additionally contains `C2C_ROUTE_TOKEN` and tells
 ChatGPT to call `workspace_info` first with `route_token`. The task becomes
 `ready` only after delivery and reply readback plus matching workspace id, name,
 branch, connector, and all four identity fields.
+
+The Boot reply must echo `WORKSPACE_NAME`, `BRANCH`, and `CONNECTOR` as returned
+by `workspace_info`, alongside `TASK_ID`, `WORKSPACE_ID`, `ITERATION`, and
+`MESSAGE_ID`. A reply that only echoes the receipt fields leaves workspace
+verification pending.
 
 `send_message_to_thread` means accepted only. The coordinator records that
 acceptance, then polls `read_thread` on the exact conversation. It confirms
@@ -89,16 +112,20 @@ delivery after the matching user message appears, and confirms reply only after
 the matching ChatGPT reply appears. `wait_threads` is not used for ordinary
 ChatGPT conversations.
 
-The first 30 seconds are a fast check. A missing user turn in that period is a
+The first 60 seconds are a fast check, with an exact read every 5 seconds. A missing user turn in that period is a
 late delivery, not a terminal failure: the task remains `sending`, retains its
 same message id and write lock, and records `deliveryPendingSince`. Active work
 may continue reading for five minutes. If it is still absent, the next task
 operation reads that exact in-flight message before any new send. There is no
-automatic resend or Chat replacement.
+automatic resend or Chat replacement. Repeated `missing` and timeout results
+remain `degraded`; only explicit deletion evidence or an identity mismatch
+retires the exact Chat.
 
 `fail-delivery` requires terminal evidence: `host_rejected`,
-`conversation_gone`, or `identity_mismatch`. The last two retire the exact
-binding; a host rejection quarantines the channel while retaining it.
+`conversation_gone`, or `identity_mismatch`. Explicit deletion retires the
+exact binding. An identity mismatch quarantines the binding and requires
+`session clear --confirm` before a replacement claim; a host rejection keeps
+the existing binding degraded.
 
 Channel states:
 

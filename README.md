@@ -69,9 +69,9 @@ CAPTCHA, two-factor authentication, or a required OpenAI Tunnel credential.
 7. If this account or environment is missing OpenAI Secure MCP Tunnel access,
    stop and explain the exact blocker. Do not enable Cloudflare unless I give
    explicit approval.
-8. On first use, the ordinary Chat is created in the background and its binding
-   message is sent automatically. The Skill opens that exact Chat. Set the thinking level to xhigh
-   and confirm the small reminder. Never paste
+8. Before first use, prepare ordinary standby Chats in the **Codex-with-ChatGPT**
+   Project: choose non-Pro xhigh and send one user message containing exactly
+   `C2C_STANDBY_READY`. Later tasks claim their exact Chat in the background. Never paste
    repository files, diffs, secrets, tokens, cookies, or long logs into ChatGPT;
    ChatGPT must read workspace context through the read-only MCP tools.
 9. Do not run git pull, dependency upgrades, automatic updater commands, or
@@ -154,6 +154,11 @@ mode.
 Run `node bin/c2c.js router migrate -w <anchor-workspace> --json` once when
 upgrading an existing connection. Later projects use `router ensure`; they share
 the original OpenAI Secure MCP Tunnel and ChatGPT connector.
+Then run `node bin/c2c.js session migrate --json`; it backs up legacy records
+under the global lock and writes the unified ownership ledger.
+For an old `unavailable` record from the former repeated-read-miss rule, first
+verify the exact Chat through background `read_thread`, then use `session
+restore --confirm` to retain that original conversation.
 
 Every Codex task permanently claims one ordinary Chat from the global
 **Codex-with-ChatGPT** Project. Users prepare stock Chats at non-Pro xhigh and
@@ -164,15 +169,22 @@ recognized. An explicitly Pro task uses a separate `C2C_STANDBY_READY_PRO` Chat.
 The Skill synchronizes stock before every pool claim with Codex App background
 `list_threads` and `read_thread`, imports each exact user marker with `session
 pool import --marker-text`, then uses `session pool claim`. Claims are FIFO and
-globally locked; title guesses, recent conversations, and cross-task reuse are
+globally locked; inventory and task ownership are committed in one atomic ledger;
+title guesses, recent conversations, and cross-task reuse are
 excluded. Empty stock returns `POOL_EXHAUSTED` before task content is sent.
 
 The claim returns a one-time task route token. The Boot Prompt places it in
 `C2C_ROUTE_TOKEN`; every one of the eight MCP calls then includes `route_token`.
 The Router resolves that token to only its bound workspace. Normal Chat control
 uses only `list_threads`, `send_message_to_thread`, and `read_thread`, with
-readback receipts before state advances. An accepted send whose user turn is
-late stays in flight; it is not resent or moved to another Chat.
+readback receipts before state advances. The first 60 seconds poll every 5 seconds.
+An accepted send whose user turn is late stays in flight; repeated temporary
+read misses mark the channel degraded and retain the same Chat.
+
+When both `CODEX_THREAD_ID` and `--task-id` are supplied, they must be identical;
+`TASK_ID_IDENTITY_MISMATCH` occurs before a ledger write when they differ. The
+Boot reply also reports the `WORKSPACE_NAME`, `BRANCH`, and `CONNECTOR` observed
+from `workspace_info`; receipt fields alone leave verification pending.
 
 Run `node bin/c2c.js runtime diagnose -w <workspace> --json` before changing a
 managed runtime. The Runtime Key source is always the canonical CurrentUser
