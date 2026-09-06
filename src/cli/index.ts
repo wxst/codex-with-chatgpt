@@ -1514,26 +1514,32 @@ session.command("confirm-workspace")
   .description("Promote a user-confirmed binding after workspace_info matches")
   .option("-w, --workspace <path>").option("--task-id <id>")
   .requiredOption("--observed-workspace-id <id>")
-  .requiredOption("--observed-connector-name <name>")
+  .option("--observed-route-task-id <id>", "exact routeTaskId returned by workspace_info")
+  .option("--observed-connector-name <name>", "legacy display value; not used for identity verification")
   .requiredOption("--observed-workspace-name <name>")
   .option("--observed-branch <branch>")
   .option("--json", "machine-readable output", false)
   .action(async (opts: {
-    workspace?: string; taskId?: string; observedWorkspaceId: string; observedConnectorName: string;
+    workspace?: string; taskId?: string; observedWorkspaceId: string; observedRouteTaskId?: string; observedConnectorName?: string;
     observedWorkspaceName: string; observedBranch?: string; json: boolean;
   }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
+    if (!opts.observedRouteTaskId?.trim()) {
+      throw new Error("WORKSPACE_INFO_ROUTE_TASK_ID_REQUIRED: reread workspace_info and pass its routeTaskId with --observed-route-task-id");
+    }
     const task = await confirmTaskWorkspace(
       workspace.id,
       resolved.taskId,
-      opts.observedWorkspaceId,
-      opts.observedConnectorName,
-      opts.observedWorkspaceName,
-      opts.observedBranch ?? null
+      {
+        workspaceId: opts.observedWorkspaceId,
+        routeTaskId: opts.observedRouteTaskId,
+        workspaceName: opts.observedWorkspaceName,
+        branch: opts.observedBranch ?? null,
+      },
     );
     if (opts.json) say(JSON.stringify({ ok: true, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
-    else check("工作区和连接器已核对；会话进入 ready");
+    else check("工作区及路由任务身份已核对；会话进入 ready");
   });
 
 session.command("mark-unavailable")

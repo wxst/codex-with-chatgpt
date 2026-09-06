@@ -148,6 +148,14 @@ export interface ReceiptIdentity {
   iteration: number;
 }
 
+/** Exact structured fields observed from the routed workspace_info tool. */
+export interface WorkspaceConfirmationObservation {
+  workspaceId: string;
+  routeTaskId?: string;
+  workspaceName: string;
+  branch: string | null;
+}
+
 export interface ResolvedTaskId {
   taskId: string;
   source: "CODEX_THREAD_ID" | "explicit" | "generated";
@@ -1324,27 +1332,27 @@ async function updateTaskChannel(
 export async function confirmTaskWorkspace(
   workspaceId: string,
   taskId: string,
-  observedWorkspaceId: string,
-  observedConnectorName: string,
-  observedWorkspaceName?: string,
-  observedBranch?: string | null
+  observation: WorkspaceConfirmationObservation,
 ): Promise<SavedTaskSession> {
   const expectedWorkspace = validateWorkspaceId(workspaceId);
   return updateTaskChannel(expectedWorkspace, taskId, (task) => {
     if (task.bindingState !== "bound") throw new Error("task conversation binding is unavailable");
-    if (observedWorkspaceId.trim() !== expectedWorkspace) {
+    if (observation.workspaceId.trim() !== expectedWorkspace) {
       throw new Error("workspace identity returned by workspace_info does not match");
     }
-    if (observedConnectorName.trim() !== task.connectorName) {
-      throw new Error("connector returned by workspace_info does not match");
+    if (!observation.routeTaskId?.trim()) {
+      throw new Error("workspace_info route task identity is required; reread workspace_info");
+    }
+    if (observation.routeTaskId.trim() !== task.taskId) {
+      throw new Error("route task identity returned by workspace_info does not match");
     }
     if (!task.workspaceName || task.branch === undefined) {
       throw new Error("expected workspace name or branch is missing from the binding");
     }
-    if (observedWorkspaceName?.trim() !== task.workspaceName) {
+    if (observation.workspaceName.trim() !== task.workspaceName) {
       throw new Error("workspace name returned by workspace_info does not match");
     }
-    if ((observedBranch ?? null) !== task.branch) {
+    if (observation.branch !== task.branch) {
       throw new Error("branch returned by workspace_info does not match");
     }
     if (task.settingsSource !== "user_confirmed") throw new Error("thinking settings lack user confirmation");

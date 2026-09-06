@@ -302,10 +302,13 @@ C2C_ROUTE_TOKEN: <route-token>
 CONNECTOR: <connector-name>
 
 Use only the C2C MCP connector. Every MCP call must include
-route_token: <route-token>. First call workspace_info. Echo all four identity
-fields, then echo `WORKSPACE_NAME`, `BRANCH`, and `CONNECTOR` from that tool
-result before replying STATE: DONE. A reply missing any of those observed
-workspace fields does not promote the task to `ready`.
+route_token: <route-token>. `CONNECTOR` names the selected connection; it is
+not a field returned by workspace_info. First call workspace_info. Echo all
+four receipt identity fields, then echo the returned `routeTaskId`,
+`workspaceName`, and `git.branch` before replying STATE: DONE. Do not copy an
+expected value from this prompt or the ledger as an observed result. A reply
+missing any of those observed workspace fields does not promote the task to
+`ready`.
 ```
 
 The Router resolves the capability to exactly one fresh workspace instance.
@@ -353,7 +356,10 @@ only after an operator decides to retire it and claim a next generation.
 
 Then wait for the matching ChatGPT reply and run `session confirm-reply` with
 the same observed identity fields. After `workspace_info` reports the expected
-workspace id, name, branch, and connector, run `session confirm-workspace`.
+workspace id, route task id, name, and branch, run `session confirm-workspace`
+with `--observed-route-task-id <routeTaskId>`. The optional
+`--observed-connector-name` is legacy display input only; it is never an
+identity proof.
 Only a `ready` task may receive task content.
 
 ## Normal control loop

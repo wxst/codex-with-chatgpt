@@ -183,8 +183,9 @@ read misses mark the channel degraded and retain the same Chat.
 
 When both `CODEX_THREAD_ID` and `--task-id` are supplied, they must be identical;
 `TASK_ID_IDENTITY_MISMATCH` occurs before a ledger write when they differ. The
-Boot reply also reports the `WORKSPACE_NAME`, `BRANCH`, and `CONNECTOR` observed
-from `workspace_info`; receipt fields alone leave verification pending.
+Boot reply also reports `routeTaskId`, `workspaceName`, and `git.branch`
+observed from `workspace_info`; the connector label is not a tool result or an
+identity proof. Receipt fields alone leave verification pending.
 
 Run `node bin/c2c.js runtime diagnose -w <workspace> --json` before changing a
 managed runtime. The Runtime Key source is always the canonical CurrentUser

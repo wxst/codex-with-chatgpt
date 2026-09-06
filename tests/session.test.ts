@@ -88,6 +88,36 @@ describe("task-scoped standby session registry", () => {
     expect(claimed.task.thinkingLevel).toBe("xhigh");
   });
 
+  it("confirms workspace identity from routeTaskId without treating the connector title as identity", async () => {
+    reset();
+    const claimed = await claimedTask();
+    const bootId = newMessageId();
+    await beginTaskSend("workspace123", "task-a", bootId, 0, { bootstrap: true });
+    await confirmTaskDelivery("workspace123", "task-a", bootId);
+    await confirmTaskReply("workspace123", "task-a", bootId, "DONE");
+
+    const observation = {
+      workspaceId: "workspace123",
+      routeTaskId: "task-a",
+      workspaceName: "repo",
+      branch: "main" as string | null,
+    };
+    for (const [label, invalid] of [
+      ["missing route task", { ...observation, routeTaskId: undefined }],
+      ["wrong route task", { ...observation, routeTaskId: "another-task" }],
+      ["wrong workspace", { ...observation, workspaceId: "another-workspace" }],
+      ["wrong workspace name", { ...observation, workspaceName: "another-repo" }],
+      ["wrong branch", { ...observation, branch: "other" }],
+    ] as const) {
+      await expect(confirmTaskWorkspace("workspace123", "task-a", invalid), label).rejects.toThrow();
+      expect(readTaskSession("workspace123", "task-a")?.verificationState).toBe("pending");
+    }
+
+    const ready = await confirmTaskWorkspace("workspace123", "task-a", observation);
+    expect(ready.verificationState).toBe("ready");
+    expect(ready.connectorName).toBe(claimed.task.connectorName);
+  });
+
   it("keeps an accepted send in flight when the initial delivery check sees no message", async () => {
     reset();
     await claimedTask();
@@ -365,7 +395,12 @@ describe("task-scoped standby session registry", () => {
       await beginTaskSend(workspaceId, taskId, boot, 0, { bootstrap: true });
       await confirmTaskDelivery(workspaceId, taskId, boot);
       await confirmTaskReply(workspaceId, taskId, boot, "DONE");
-      await confirmTaskWorkspace(workspaceId, taskId, workspaceId, task.connectorName, task.workspaceName, task.branch);
+      await confirmTaskWorkspace(workspaceId, taskId, {
+        workspaceId,
+        routeTaskId: taskId,
+        workspaceName: task.workspaceName!,
+        branch: task.branch,
+      });
     }
     const pool = readStandbyPool();
     const firstEntry = pool.entries.find(entry => entry.conversationId === first.task.conversationId)!;

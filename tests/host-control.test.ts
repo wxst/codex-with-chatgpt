@@ -107,6 +107,10 @@ it("CLI refuses missing preflight and reports actual unaccepted failures", async
   const blocked = cli("begin-send", "--task-id", "cli-task", "--message-id", id, "--iteration", "0", "--bootstrap");
   expect(blocked.status).not.toBe(0);
   expect(blocked.stdout + blocked.stderr).toContain("HOST_CONTROL_PREFLIGHT_REQUIRED");
+  const missingRouteTask = cli("confirm-workspace", "--task-id", "cli-task",
+    "--observed-workspace-id", workspaceId, "--observed-workspace-name", "repo", "--observed-branch", "main", "--json");
+  expect(missingRouteTask.status).not.toBe(0);
+  expect(missingRouteTask.stdout + missingRouteTask.stderr).toContain("WORKSPACE_INFO_ROUTE_TASK_ID_REQUIRED");
   const missing = cli("host-control", "--task-id", "cli-task", "--result", "probe", "--tools", "none", "--json");
   expect(JSON.parse(missing.stdout)).toMatchObject({ status: "tools_missing", accepted: false, reserved: false });
   await recordTaskHostControl(workspaceId, "cli-task", { result: "probe", tools });
@@ -132,6 +136,10 @@ it("CLI refuses missing preflight and reports actual unaccepted failures", async
   expect(cli("confirm-reply", ...observed, "--observed-iteration", "0junk", "--state", "DONE", "--json").status).not.toBe(0);
   expect(JSON.parse(cli("confirm-reply", ...observed, "--observed-iteration", "0", "--state", "DONE", "--json").stdout))
     .toMatchObject({ accepted: false, delivered: true, replied: true });
+  const workspaceReady = cli("confirm-workspace", "--task-id", "cli-task",
+    "--observed-workspace-id", workspaceId, "--observed-route-task-id", "cli-task",
+    "--observed-workspace-name", "repo", "--observed-branch", "main", "--json");
+  expect(JSON.parse(workspaceReady.stdout)).toMatchObject({ ok: true, task: { verificationState: "ready" } });
 });
 
 it.each([

@@ -98,13 +98,14 @@ value stops before any registry or pool write with `TASK_ID_IDENTITY_MISMATCH`.
 
 The new Chat's Boot Prompt additionally contains `C2C_ROUTE_TOKEN` and tells
 ChatGPT to call `workspace_info` first with `route_token`. The task becomes
-`ready` only after delivery and reply readback plus matching workspace id, name,
-branch, connector, and all four identity fields.
+`ready` only after delivery and reply readback plus matching workspace id,
+routed task id, name, branch, and all four receipt identity fields.
 
-The Boot reply must echo `WORKSPACE_NAME`, `BRANCH`, and `CONNECTOR` as returned
-by `workspace_info`, alongside `TASK_ID`, `WORKSPACE_ID`, `ITERATION`, and
-`MESSAGE_ID`. A reply that only echoes the receipt fields leaves workspace
-verification pending.
+The Boot reply must echo `routeTaskId`, `workspaceName`, and `git.branch` as
+returned by `workspace_info`, alongside `TASK_ID`, `WORKSPACE_ID`, `ITERATION`,
+and `MESSAGE_ID`. `CONNECTOR` is a local display/selection label, not a
+`workspace_info` field and never an identity proof. A reply that only echoes
+receipt fields leaves workspace verification pending.
 
 `send_message_to_thread` means accepted only. The coordinator records that
 acceptance, then polls `read_thread` on the exact conversation. It confirms

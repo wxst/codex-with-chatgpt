@@ -18,9 +18,11 @@ describe("delayed direct ChatGPT delivery protocol", () => {
     expect(skill).toContain("record-delivery-pending");
     expect(skill).toContain("every 5 seconds for the first 60 seconds");
     expect(skill).toContain("keep the task in `sending`");
-    expect(skill).toContain("WORKSPACE_NAME");
-    expect(skill).toContain("BRANCH");
+    expect(skill).toContain("routeTaskId");
+    expect(skill).toContain("workspaceName");
+    expect(skill).toContain("git.branch");
     expect(skill).toContain("CONNECTOR");
+    expect(skill).toContain("not a field returned by workspace_info");
     expect(skill).not.toContain("If delivery is absent after the polling window, use");
     expect(protocol).toContain("late delivery");
     expect(protocol).toContain("first 60 seconds");

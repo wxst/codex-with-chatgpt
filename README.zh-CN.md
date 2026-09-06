@@ -161,7 +161,8 @@ MCP 工具调用都要附加 `route_token`。Router 只会将该 token 解析到
 
 同时给出 `CODEX_THREAD_ID` 和 `--task-id` 时，两者必须完全一致；值不同时会先返回
 `TASK_ID_IDENTITY_MISMATCH`，账本保持原样。Boot 回复还要带上 `workspace_info` 实际返回的
-`WORKSPACE_NAME`、`BRANCH` 与 `CONNECTOR`；只有回执字段时，验证继续保持 pending。
+`routeTaskId`、`workspaceName` 与 `git.branch`；`CONNECTOR` 只是本地显示和选择名称，
+不是工具返回值，也不参与身份验证。只有回执字段时，验证继续保持 pending。
 
 修改托管 Runtime 前，运行 `node bin/c2c.js runtime diagnose -w <workspace> --json`。
 Runtime 唯一 Key 来源是 `%USERPROFILE%/.config/codex-with-chatgpt/tunnel-runtime-key.dpapi`。
