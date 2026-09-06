@@ -85,10 +85,15 @@ import {
   newMessageId,
   readSessionRegistry,
   readTaskSession,
+  resolveTaskBinding,
+  resumeTaskSession,
+  finishTaskSession,
+  switchTaskWorkspace,
   recordTaskDeliveryPending,
   recordTaskReadResult,
   recordTaskHostControl,
   type HostControlObservation,
+  type ReclaimObservation,
   restoreTaskConversation,
   quarantineStandbyConversation,
   readStandbyPool,
@@ -1191,19 +1196,62 @@ function resolvedSessionTaskId(explicitTaskId?: string) {
   return resolveCodexTaskId(explicitTaskId);
 }
 
+function standbyPoolStatusPayload() {
+  const standby = readStandbyPool();
+  const registries = new Map(readSessionRegistryEntries().map(registry => [registry.workspaceId, registry]));
+  let localReclaimCandidate = 0; let pendingOrActive = 0; let hostObservationRequired = 0;
+  for (const entry of standby.entries.filter(entry => entry.status === "claimed")) {
+    const owner = entry.claimedBy ? registries.get(entry.claimedBy.workspaceId)?.tasks.find(task => task.taskId === entry.claimedBy?.taskId) : undefined;
+    if (!owner || owner.bindingState !== "bound" || owner.generation !== entry.claimedBy?.generation) continue;
+    if (owner.pendingMessageId || owner.pendingDispatchUncertain || owner.sendAcceptedAt || owner.deliveryPendingSince || owner.activeUse || owner.channelState !== "ready") pendingOrActive += 1;
+    else if (owner.verificationState === "ready") { localReclaimCandidate += 1; hostObservationRequired += 1; }
+  }
+  return { ok: true, projectId: standby.projectId, entries: standby.entries,
+    available: standby.entries.filter(entry => entry.status === "available").length,
+    claimed: standby.entries.filter(entry => entry.status === "claimed").length,
+    localReclaimCandidate, pendingOrActive, hostObservationRequired };
+}
+
+function readSessionRegistryEntries() {
+  const pool = readStandbyPool();
+  const owners = pool.entries.filter(entry => entry.claimedBy).map(entry => entry.claimedBy!.workspaceId);
+  return [...new Set(owners)].map(workspaceId => readSessionRegistry(workspaceId).registry);
+}
+
+function parseReclaimObservations(input: string | undefined): ReclaimObservation[] | undefined {
+  if (input === undefined) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(input);
+    if (!Array.isArray(parsed)) throw new Error("not array");
+    return parsed as ReclaimObservation[];
+  } catch {
+    throw new InvalidArgumentError("reclaim observations must be a JSON array from fresh exact host readback");
+  }
+}
+
 session.command("get", { isDefault: true })
   .description("Show the task-scoped ChatGPT conversation")
   .option("-w, --workspace <path>").option("--task-id <id>", "stable Codex task id")
+  .option("--brief", "emit only continuation decisions", false)
   .option("--json", "machine-readable output", false)
-  .action((opts: { workspace?: string; taskId?: string; json: boolean }) => {
+  .action((opts: { workspace?: string; taskId?: string; brief: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const read = readSessionRegistry(workspace.id);
-    const task = readTaskSession(workspace.id, resolved.taskId);
+    const binding = resolveTaskBinding(workspace.id, resolved.taskId);
+    const task = binding.task;
     const provision = read.registry.provisions.find((entry) => entry.taskId === resolved.taskId) ?? null;
+    const nextAction = binding.resolution === "exact"
+      ? (task?.pendingMessageId || task?.pendingDispatchUncertain || task?.sendAcceptedAt || task?.deliveryPendingSince || task?.channelState !== "ready"
+        ? "read_bound_chat" : "resume_bound_chat")
+      : binding.resolution === "workspace_switch_required" ? "switch_workspace"
+        : binding.resolution === "ambiguous" ? "stop_manual_resolution" : "claim_pool_chat";
     const result = {
       ok: true,
       workspaceId: workspace.id,
+      requestedWorkspaceId: binding.requestedWorkspaceId,
+      boundWorkspaceId: binding.boundWorkspaceId,
+      resolution: binding.resolution,
       taskId: resolved.taskId,
       taskIdSource: resolved.source,
       generatedTaskId: resolved.generated,
@@ -1212,26 +1260,96 @@ session.command("get", { isDefault: true })
       projectUrl: read.registry.projectUrl ?? null,
       connectorName: read.registry.connectorName ?? null,
       legacyDetected: read.legacyDetected,
-      requiresPoolClaim: !task || task.bindingState === "unavailable",
+      requiresPoolClaim: binding.resolution === "unbound",
       requiresManualRetirement: task?.bindingState === "quarantined",
       requiresSettingsConfirmation: Boolean(task && task.bindingState === "bound" && task.settingsSource !== "user_confirmed"),
       requiresWorkspaceVerification: Boolean(task && task.bindingState === "bound" && task.verificationState !== "ready"),
       deliveryReadbackPhase: task ? deliveryReadbackPhase(task) : "none",
+      nextAction,
     };
-    if (opts.json) say(JSON.stringify(result));
+    if (opts.json) say(JSON.stringify(opts.brief ? {
+      ok: result.ok, taskId: result.taskId, requestedWorkspaceId: result.requestedWorkspaceId,
+      boundWorkspaceId: result.boundWorkspaceId, resolution: result.resolution,
+      conversationId: task?.conversationId ?? null, generation: task?.generation ?? null,
+      pendingMessageId: task?.pendingMessageId ?? null, nextAction: result.nextAction,
+    } : result));
     else {
       say(`工作区：${workspace.id}`);
       say(`任务：${resolved.taskId}${resolved.generated ? "（新生成，请在本任务内复用）" : ""}`);
       if (read.legacyDetected) say("检测到旧版会话记录；当前任务从新的人工建档开始。");
-      if (!task) say("当前任务尚未绑定普通 ChatGPT 会话。");
+      if (!task && binding.resolution === "ambiguous") say("当前任务存在多个工作区绑定；已停止，需人工处理。");
+      else if (!task) say("当前任务尚未绑定普通 ChatGPT 会话。");
       else {
         say(`对话：${task.url}`);
         say(`代次：${task.generation} / ${task.bindingState}`);
         say(`思考：${task.thinkingLevel ?? "待确认"} / ${task.settingsSource}${task.proMode ? " / Pro" : ""}`);
         say(`验证：${task.verificationState}`);
         say(`通道：${task.channelState}`);
+        if (binding.resolution === "workspace_switch_required") say(`需要切换工作区：${binding.boundWorkspaceId}`);
       }
     }
+  });
+
+session.command("resume")
+  .description("Acquire one continuation lease after resolving the current task binding")
+  .option("-w, --workspace <path>").option("--task-id <id>").option("--brief", "emit only continuation decision", false)
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; taskId?: string; brief: boolean; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const binding = resolveTaskBinding(workspace.id, resolved.taskId);
+    if (binding.resolution !== "exact") {
+      const nextAction = binding.resolution === "workspace_switch_required" ? "switch_workspace"
+        : binding.resolution === "ambiguous" ? "stop_manual_resolution" : "claim_pool_chat";
+      const payload = { ok: true, taskId: resolved.taskId, requestedWorkspaceId: workspace.id, boundWorkspaceId: binding.boundWorkspaceId, resolution: binding.resolution, nextAction };
+      if (opts.json) say(JSON.stringify(payload)); else say(`续接：${nextAction}`);
+      return;
+    }
+    const current = binding.task!;
+    if (current.activeUse) throw new Error("TASK_CHAT_BUSY: the bound Chat already has an active coordinator lease");
+    if (current.pendingMessageId || current.pendingDispatchUncertain || current.sendAcceptedAt || current.deliveryPendingSince || current.channelState !== "ready") {
+      const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, resolution: "exact", conversationId: current.conversationId, generation: current.generation, useId: null, nextAction: "read_bound_chat" };
+      if (opts.json) say(JSON.stringify(opts.brief ? payload : { ...payload, task: current })); else check("已定位同一 Chat；先读取未完成或降级状态。");
+      return;
+    }
+    const task = await resumeTaskSession(workspace.id, resolved.taskId);
+    const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, resolution: "exact", conversationId: task.conversationId, generation: task.generation, useId: task.useId, nextAction: task.pendingMessageId ? "read_bound_chat" : "send_or_read_bound_chat" };
+    if (opts.json) say(JSON.stringify(opts.brief ? payload : { ...payload, task })); else check(`已续接同一 Chat；use-id：${task.useId}`);
+  });
+
+session.command("finish")
+  .description("Release the current continuation lease while preserving the exact Chat binding")
+  .option("-w, --workspace <path>").option("--task-id <id>").requiredOption("--use-id <id>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; taskId?: string; useId: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const task = await finishTaskSession(workspace.id, resolved.taskId, opts.useId);
+    const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, conversationId: task.conversationId, activeUse: null };
+    if (opts.json) say(JSON.stringify(payload)); else check("已释放本轮使用占用，Chat 绑定保留。");
+  });
+
+session.command("switch-workspace")
+  .description("Move one idle exact Chat binding to the actual continuation workspace")
+  .requiredOption("--from-workspace-id <id>").option("-w, --workspace <path>").option("--task-id <id>")
+  .requiredOption("--expected-generation <n>").requiredOption("--observed-conversation-id <id>")
+  .requiredOption("--observed-task-id <id>").requiredOption("--observed-workspace-id <id>").requiredOption("--observed-at <iso>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { fromWorkspaceId: string; workspace?: string; taskId?: string; expectedGeneration: string; observedConversationId: string; observedTaskId: string; observedWorkspaceId: string; observedAt: string; json: boolean }) => {
+    const root = resolveWorkspace(opts.workspace); const workspace = new Workspace(root); const resolved = resolvedSessionTaskId(opts.taskId);
+    const binding = resolveTaskBinding(workspace.id, resolved.taskId);
+    if (binding.resolution !== "workspace_switch_required" || binding.boundWorkspaceId !== opts.fromWorkspaceId || !binding.task) throw new Error("TASK_WORKSPACE_SWITCH_NOT_REQUIRED");
+    const observedAt = Date.parse(opts.observedAt);
+    if (opts.observedConversationId !== binding.task.conversationId || opts.observedTaskId !== resolved.taskId || opts.observedWorkspaceId !== opts.fromWorkspaceId || !Number.isFinite(observedAt) || observedAt > Date.now() || Date.now() - observedAt > 60_000) {
+      throw new Error("TASK_WORKSPACE_SWITCH_READBACK_INVALID");
+    }
+    await ensureWorkspaceRouter(root);
+    const task = await switchTaskWorkspace({ taskId: resolved.taskId, fromWorkspaceId: opts.fromWorkspaceId, toWorkspaceId: workspace.id,
+      expectedGeneration: Number(opts.expectedGeneration), connectorName: binding.task.connectorName, workspaceName: workspace.name, branch: gitInfo(workspace.root).branch });
+    const route = await issueRouteCapability({ workspaceId: workspace.id, taskId: resolved.taskId, conversationId: task.conversationId });
+    const attached = await attachTaskRouteCapability(workspace.id, resolved.taskId, route.id);
+    const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, boundWorkspaceId: workspace.id, conversationId: attached.conversationId, generation: attached.generation, routeToken: route.token, nextAction: "send_boot_prompt" };
+    if (opts.json) say(JSON.stringify(payload)); else check("已切换同一 Chat 到当前工作区；请发送新的 BOOT Prompt。");
   });
 
 session.command("migrate")
@@ -1277,17 +1395,20 @@ const pool = session.command("pool").description("Manage manually prepared globa
 
 pool.command("status", { isDefault: true })
   .description("Show available, claimed and retired standby Chats")
+  .option("--brief", "omit entry details", false)
   .option("--json", "machine-readable output", false)
-  .action((opts: { json: boolean }) => {
-    const standby = readStandbyPool();
-    const payload = {
-      ok: true,
-      projectId: standby.projectId,
-      entries: standby.entries,
-      available: standby.entries.filter((entry) => entry.status === "available").length,
-      claimed: standby.entries.filter((entry) => entry.status === "claimed").length,
-    };
-    if (opts.json) say(JSON.stringify(payload));
+  .action((opts: { brief: boolean; json: boolean }) => {
+    const payload = standbyPoolStatusPayload();
+    if (opts.json) say(JSON.stringify(opts.brief ? { ...payload, entries: undefined } : payload));
+    else say(`备用 Chat：可用 ${payload.available}，已领取 ${payload.claimed}`);
+  });
+
+pool.command("list")
+  .description("Alias for pool status")
+  .option("--brief", "omit entry details", false).option("--json", "machine-readable output", false)
+  .action((opts: { brief: boolean; json: boolean }) => {
+    const payload = standbyPoolStatusPayload();
+    if (opts.json) say(JSON.stringify(opts.brief ? { ...payload, entries: undefined } : payload));
     else say(`备用 Chat：可用 ${payload.available}，已领取 ${payload.claimed}`);
   });
 
@@ -1317,11 +1438,15 @@ pool.command("claim")
   .option("-w, --workspace <path>")
   .option("--task-id <id>")
   .option("--pro", "this task explicitly requests Pro", false)
+  .option("--reclaim-observations <json>", "fresh exact idle observations from host readback")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; taskId?: string; pro: boolean; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; pro: boolean; reclaimObservations?: string; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
     const resolved = resolvedSessionTaskId(opts.taskId);
+    const binding = resolveTaskBinding(workspace.id, resolved.taskId);
+    if (binding.resolution === "workspace_switch_required") throw new Error("TASK_WORKSPACE_SWITCH_REQUIRED: reuse the bound Chat with session switch-workspace");
+    if (binding.resolution === "ambiguous") throw new Error("TASK_BINDING_AMBIGUOUS: stop for manual resolution");
     const routed = await ensureWorkspaceRouter(root);
     const connectorName = readLastEndpoint(routed.anchor.id)?.connectorName ?? connectorNameFor({
       workspaceName: routed.anchor.name,
@@ -1335,6 +1460,7 @@ pool.command("claim")
       workspaceName: workspace.name,
       branch: gitInfo(workspace.root).branch,
       userExplicitPro: opts.pro,
+      reclaimObservations: parseReclaimObservations(opts.reclaimObservations),
     });
     let routeToken: string | null = null;
     let task = claimed.task;
@@ -1511,7 +1637,9 @@ addChannelCommandOptions(session.command("begin-send").description("Atomically r
   .option("--probe", "allow one recovery probe for a degraded channel", false)
   .option("--bootstrap", "reserve the workspace_info boot message before ready", false)
   .option("--review-head <sha>", "bind this review to an exact full Git HEAD")
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; iteration: string; probe: boolean; bootstrap: boolean; reviewHead?: string; json: boolean }) => {
+  .option("--expected-generation <n>", "fence this send to the resumed binding generation")
+  .option("--use-id <id>", "fence this send to the active session resume lease")
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; iteration: string; probe: boolean; bootstrap: boolean; reviewHead?: string; expectedGeneration?: string; useId?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const current = readTaskSession(workspace.id, resolved.taskId);
@@ -1525,7 +1653,8 @@ addChannelCommandOptions(session.command("begin-send").description("Atomically r
       resolved.taskId,
       opts.messageId,
       parseReceiptIteration(opts.iteration),
-      { probe: opts.probe, bootstrap: opts.bootstrap, reviewHead: opts.reviewHead }
+      { probe: opts.probe, bootstrap: opts.bootstrap, reviewHead: opts.reviewHead,
+        expectedGeneration: opts.expectedGeneration === undefined ? undefined : parseReceiptIteration(opts.expectedGeneration), useId: opts.useId }
     );
     if (opts.json) say(JSON.stringify({ ok: true, reserved: true, accepted: false, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`已保留发送 ${task.pendingMessageId}；尚未确认送达`);

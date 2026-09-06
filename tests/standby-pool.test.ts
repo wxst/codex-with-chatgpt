@@ -76,7 +76,7 @@ describe("global standby Chat pool", () => {
     });
     const normal = await claimStandbyConversation({ workspaceId: "workspace", taskId: "normal-task", connectorName: "C2C", workspaceName: "repo", branch: "main" });
     expect(normal.task.conversationId).toBe("normal-marker");
-    await expect(claimStandbyConversation({ workspaceId: "workspace", taskId: "pro-task", connectorName: "C2C", workspaceName: "repo", branch: "main" })).rejects.toThrow(/POOL_EXHAUSTED/);
+    await expect(claimStandbyConversation({ workspaceId: "workspace", taskId: "pro-task", connectorName: "C2C", workspaceName: "repo", branch: "main" })).rejects.toThrow(/POOL_(EXHAUSTED|BUSY)/);
     const pro = await claimStandbyConversation({ workspaceId: "workspace", taskId: "pro-task", connectorName: "C2C", workspaceName: "repo", branch: "main", userExplicitPro: true });
     expect(pro.task.conversationId).toBe("pro-marker");
     expect(pro.task.proMode).toBe(true);

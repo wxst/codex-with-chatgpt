@@ -11,6 +11,7 @@ import {
   confirmTaskSendAccepted,
   confirmTaskDelivery,
   confirmTaskReply,
+  confirmTaskWorkspace,
   failTaskDelivery,
   importStandbyConversation,
   newMessageId,
@@ -19,6 +20,11 @@ import {
   recordTaskDeliveryPending,
   sessionLedgerFile,
   readSessionRegistry,
+  readTaskSession,
+  resolveTaskBinding,
+  resumeTaskSession,
+  finishTaskSession,
+  switchTaskWorkspace,
   readStandbyPool,
   recordTaskReadResult,
   restoreTaskConversation,
@@ -302,6 +308,86 @@ describe("task-scoped standby session registry", () => {
     const state = readSessionRegistry("workspace123");
     expect(state.legacyDetected).toBe(true);
     expect(state.registry.tasks).toEqual([]);
+  });
+
+  it("resolves one bound task from another workspace without claiming another Chat", async () => {
+    reset();
+    const claimed = await claimedTask("old-workspace", "same-task");
+    const before = fs.readFileSync(sessionLedgerFile(), "utf8");
+
+    const resolved = resolveTaskBinding("new-workspace", "same-task");
+
+    expect(resolved).toMatchObject({ resolution: "workspace_switch_required", boundWorkspaceId: "old-workspace" });
+    expect(resolved.task?.conversationId).toBe(claimed.task.conversationId);
+    expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
+  });
+
+  it("switches an idle task binding atomically and refuses a pending one", async () => {
+    reset();
+    const claimed = await claimedTask("old-workspace", "same-task");
+    const switched = await switchTaskWorkspace({
+      taskId: "same-task", fromWorkspaceId: "old-workspace", toWorkspaceId: "new-workspace",
+      expectedGeneration: claimed.task.generation, connectorName: "C2C Router", workspaceName: "new-repo", branch: "main",
+    });
+    expect(readTaskSession("old-workspace", "same-task")).toBeNull();
+    expect(switched).toMatchObject({ conversationId: claimed.task.conversationId, generation: claimed.task.generation + 1, verificationState: "pending" });
+    expect(resolveTaskBinding("new-workspace", "same-task").resolution).toBe("exact");
+
+    const boot = newMessageId();
+    await beginTaskSend("new-workspace", "same-task", boot, 0, { bootstrap: true });
+    await expect(switchTaskWorkspace({
+      taskId: "same-task", fromWorkspaceId: "new-workspace", toWorkspaceId: "third-workspace",
+      expectedGeneration: switched.generation, connectorName: "C2C Router", workspaceName: "third", branch: "main",
+    })).rejects.toThrow(/TASK_CHAT_BUSY/);
+  });
+
+  it("leases and releases an idle task without changing its Chat binding", async () => {
+    reset();
+    const claimed = await claimedTask();
+    const resumed = await resumeTaskSession("workspace123", "task-a");
+    expect(resumed.useId).toMatch(/^c2c_use_/);
+    await expect(beginTaskSend("workspace123", "task-a", newMessageId(), 0, { bootstrap: true }))
+      .rejects.toThrow(/TASK_USE_STALE/);
+    const finished = await finishTaskSession("workspace123", "task-a", resumed.useId!);
+    expect(finished.activeUse).toBeUndefined();
+    const resumedAgain = await resumeTaskSession("workspace123", "task-a");
+    await beginTaskSend("workspace123", "task-a", newMessageId(), 0, { bootstrap: true, expectedGeneration: resumedAgain.generation, useId: resumedAgain.useId });
+    await expect(finishTaskSession("workspace123", "task-a", resumedAgain.useId!)).rejects.toThrow(/TASK_CHAT_BUSY/);
+    expect(readTaskSession("workspace123", "task-a")?.conversationId).toBe(claimed.task.conversationId);
+  });
+
+  it("reclaims only the least recently used ready Chat with a fresh exact idle observation", async () => {
+    reset();
+    const first = await claimedTask("owner-one", "first-task");
+    const second = await claimedTask("owner-two", "second-task");
+    for (const [workspaceId, taskId, task] of [["owner-one", "first-task", first.task], ["owner-two", "second-task", second.task]] as const) {
+      const boot = newMessageId();
+      await beginTaskSend(workspaceId, taskId, boot, 0, { bootstrap: true });
+      await confirmTaskDelivery(workspaceId, taskId, boot);
+      await confirmTaskReply(workspaceId, taskId, boot, "DONE");
+      await confirmTaskWorkspace(workspaceId, taskId, workspaceId, task.connectorName, task.workspaceName, task.branch);
+    }
+    const pool = readStandbyPool();
+    const firstEntry = pool.entries.find(entry => entry.conversationId === first.task.conversationId)!;
+    const secondEntry = pool.entries.find(entry => entry.conversationId === second.task.conversationId)!;
+    const observedAt = new Date().toISOString();
+    const observations = [firstEntry, secondEntry].map(entry => ({
+      conversationId: entry.conversationId,
+      workspaceId: entry.claimedBy!.workspaceId,
+      taskId: entry.claimedBy!.taskId,
+      generation: entry.claimedBy!.generation,
+      assignmentEpoch: entry.assignmentEpoch ?? 0,
+      observedAt, taskStatus: "idle" as const, chatStatus: "idle" as const, readbackClean: true as const,
+    }));
+
+    const reclaimed = await claimStandbyConversation({
+      workspaceId: "new-owner", taskId: "new-task", connectorName: "C2C", workspaceName: "new", branch: "main", reclaimObservations: observations,
+    });
+    expect(reclaimed.task.conversationId).toBe(first.task.conversationId);
+    expect(readTaskSession("owner-one", "first-task")).toBeNull();
+    await expect(claimStandbyConversation({
+      workspaceId: "another-owner", taskId: "another-task", connectorName: "C2C", workspaceName: "another", branch: "main",
+    })).rejects.toThrow(/POOL_BUSY/);
   });
 
   it("keeps a v3 legacy provision inert and lets the task claim standby inventory", async () => {

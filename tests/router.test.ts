@@ -7,7 +7,7 @@ import {
   resolveRouteCapability,
   routerStateFile,
 } from "../src/router/state.js";
-import { attachTaskRouteCapability, claimStandbyConversation, clearTaskSession, importStandbyConversation } from "../src/session/state.js";
+import { attachTaskRouteCapability, claimStandbyConversation, clearTaskSession, importStandbyConversation, switchTaskWorkspace } from "../src/session/state.js";
 
 const dirs: string[] = [];
 
@@ -80,6 +80,23 @@ describe("global workspace router", () => {
 
     await clearTaskSession(alphaRegistration.workspaceId, "task-alpha");
     await expect(resolveRouteCapability(alphaRoute.token)).rejects.toThrow("ROUTE_ACCESS_DENIED");
+  });
+
+  it("rejects the old route token after moving an idle Chat to another workspace", async () => {
+    const state = isolateStateDir(); dirs.push(state);
+    const alpha = workspace("router-switch-alpha"); const beta = workspace("router-switch-beta");
+    const router = await createWorkspaceRouter(alpha);
+    const alphaRegistration = await router.register(alpha); const betaRegistration = await router.register(beta);
+    await importStandbyConversation({ conversationId: "chat-switch", projectId: "g-p-routerpool123", markerText: "C2C_STANDBY_READY", markerMessageId: "marker-switch", markerRole: "user" });
+    const task = await claimStandbyConversation({ workspaceId: alphaRegistration.workspaceId, taskId: "task-switch", connectorName: "C2C", workspaceName: "alpha", branch: "main" });
+    const oldRoute = await issueRouteCapability({ workspaceId: alphaRegistration.workspaceId, taskId: "task-switch", conversationId: task.task.conversationId });
+    await attachTaskRouteCapability(alphaRegistration.workspaceId, "task-switch", oldRoute.id);
+    const moved = await switchTaskWorkspace({ taskId: "task-switch", fromWorkspaceId: alphaRegistration.workspaceId, toWorkspaceId: betaRegistration.workspaceId,
+      expectedGeneration: task.task.generation, connectorName: "C2C", workspaceName: "beta", branch: "main" });
+    await expect(resolveRouteCapability(oldRoute.token)).rejects.toThrow("ROUTE_ACCESS_DENIED");
+    const newRoute = await issueRouteCapability({ workspaceId: betaRegistration.workspaceId, taskId: "task-switch", conversationId: moved.conversationId });
+    await attachTaskRouteCapability(betaRegistration.workspaceId, "task-switch", newRoute.id);
+    await expect(resolveRouteCapability(newRoute.token)).resolves.toMatchObject({ workspace: { id: betaRegistration.workspaceId } });
   });
 
   it("rejects expired and malformed capabilities", async () => {

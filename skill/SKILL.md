@@ -23,9 +23,9 @@ state and identity fields.
 - Only the main coordinating agent calls `session pool claim`, sends ChatGPT
   control messages, and confirms receipts. Subagents return findings only to the
   coordinator.
-- A claimed Chat stays with its task through normal work, completion, and
-  `degraded` status. Mark it retired only after the exact conversation is gone
-  or its identity is proven wrong.
+- A bound Chat stays with its task while it has a pending receipt, uncertain
+  dispatch, active coordinator lease, or degraded channel. An idle, verified
+  Chat can later be safely reclaimed only through the fixed-pool contract below.
 - ChatGPT Work, browser control, UIA, ChatGPT Classic, drafts, and clipboard
   workflows are outside this Skill.
 
@@ -112,7 +112,8 @@ Interpret the result exactly:
   `router_state_invalid` or `router_state_unavailable` stops diagnostics and
   repair; an unreadable, corrupt or conflicting Router registry is never
   treated as the absence of a Router.
-- `POOL_EXHAUSTED`: standby inventory is empty; synchronize it before a claim.
+- `POOL_EXHAUSTED`: no compatible Chat exists. `POOL_BUSY` means the fixed pool
+  has no candidate with fresh safe-reclaim evidence; stop for manual handling.
 - A runtime lookup error does not prove that the Tunnel is stopped. Inspect
   `runtime.errorClass` first. Restart the existing launcher only when runtime
   status actually confirms it is stopped and the task authorizes recovery.
@@ -141,11 +142,17 @@ exactly. A mismatch returns `TASK_ID_IDENTITY_MISMATCH` before any registry or
 pool operation; it never silently substitutes one task identity for another.
 
 ```text
-node "__C2C_CHECKOUT__/bin/c2c.js" session get -w <workspace> --task-id <task-id> --json
+node "__C2C_CHECKOUT__/bin/c2c.js" session resume -w <workspace> --task-id <task-id> --brief --json
 ```
 
-If the task has a bound Chat, keep that exact id. If it is absent or explicitly
-retired, synchronize inventory before every pool claim. Use Codex App
+`session resume` is the normal continuation entry point. It resolves the exact
+task binding before any runtime or pool check. `exact` resumes the bound Chat;
+`workspace_switch_required` means read the original Chat, then move the same
+binding with `session switch-workspace`; `ambiguous` stops for manual handling;
+only `unbound` may claim stock. Never move a Git worktree or change a task id to
+fit an old binding.
+
+For an unbound task, synchronize inventory once before claim. Use Codex App
 background tools only:
 
 For a migrated legacy record marked `unavailable`, first call `read_thread` on
@@ -185,15 +192,18 @@ node "__C2C_CHECKOUT__/bin/c2c.js" session pool claim \
 
 For an explicitly Pro task, pass `--pro` to `pool claim` only. The user marker
 selects the inventory class. Never pass `--pro` from an inferred preference.
-`pool claim` is globally locked,
-uses FIFO order, permanently binds `workspaceId + taskId`, and returns a raw
-`routeToken` once. The token is shown only in this result and must be placed in
-the task Chat's Boot Prompt; do not save, log, or paste it elsewhere.
+Run this check before every pool claim: resolve the task binding first; only an `unbound` task
+may request stock. `pool claim` is globally locked. It selects FIFO unclaimed stock first. With ten
+live pool entries already allocated, it requires a fresh (at most 60 seconds)
+exact host observation proving both owner task and Chat idle plus a clean Chat
+readback before it may reclaim the least-recently-used safe candidate. Pending,
+accepted, uncertain, awaiting-reply, degraded, active, missing or unobserved
+entries are never reclaimed. If no safe candidate exists, stop at `POOL_BUSY`;
+do not create another Chat, poll indefinitely, or force a takeover.
 
-`POOL_EXHAUSTED` means stop before task content. Ask the user to prepare more
-standby Chats. A removed exact Chat is retired and the same task claims the next
-compatible standby Chat; a temporary tool timeout only makes the channel
-`degraded` and keeps the original binding.
+Use `session finish --use-id <id>` after a normal turn to release only the
+coordinator lease while retaining the task binding. A pending delivery cannot
+be finished as reusable.
 
 ## Host control preflight and recovery
 

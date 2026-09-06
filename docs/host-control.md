@@ -19,7 +19,7 @@ not proof of model-visible tools or ChatGPT delivery.
 | mismatching Chat identity | existing identity_mismatch | Quarantine via terminal handling |
 | unhealthy Tunnel | runtime diagnosis | Diagnose data plane independently |
 
-All failure observations preserve the permanent pool owner. Temporary host
+All failure observations preserve the current pool owner. Temporary host
 failures set `channelState: degraded` without removing pending receipt fields.
 Recovery derives `sending` versus `awaiting_reply` from those fields; it never
 infers delivery from restored capability. Uncertain invocation is sticky across
@@ -46,6 +46,22 @@ claiming a Chat just to save a host observation. A different worktree's existing
 owner is not transferable. A completed host turn with no readable messages is
 an observation gap; neither completion metadata nor another task's available
 tools proves consumer recovery.
+
+## Continuation and fixed-pool reuse
+
+Begin a normal continuation with `session resume --brief --json`, not a Router
+diagnosis or pool scan. The resolver first finds the current task's exact
+binding. A unique binding in another workspace returns
+`workspace_switch_required`; after a fresh exact Chat readback, use
+`session switch-workspace` to move that same binding. Do not move a worktree,
+change the task id, or claim another Chat to work around the path change.
+
+The ten live pool entries are reusable only when a candidate is locally ready,
+has no pending/accepted/uncertain delivery and no active coordinator lease, and
+has a fresh 60-second host observation proving both task and Chat idle plus a
+clean readback. The CLI accepts that structured observation; it does not pretend
+to call Codex App tools itself. Otherwise `POOL_BUSY` stops for manual handling.
+`session finish` releases the active lease but keeps the same task binding.
 
 `status` and `runtime diagnose` report `workspaceRegistration` independently of
 the global anchor's health. Unregistered/revoked workspaces return

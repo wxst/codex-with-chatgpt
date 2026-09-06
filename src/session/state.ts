@@ -90,6 +90,8 @@ export interface SavedTaskSession {
   poolEntryId?: string;
   /** Public id only. The route token itself is never persisted here. */
   routeCapabilityId?: string;
+  /** An active coordinator lease prevents this Chat from being reclaimed. */
+  activeUse?: { useId: string; startedAt: string };
   lastReadError?: string;
   lastReadCheckedAt?: string;
   savedAt: string;
@@ -135,6 +137,8 @@ export interface BeginSendOptions {
   probe?: boolean;
   bootstrap?: boolean;
   reviewHead?: string;
+  expectedGeneration?: number;
+  useId?: string;
 }
 
 export interface ReceiptIdentity {
@@ -201,6 +205,9 @@ export interface StandbyConversation {
   claimedBy?: { workspaceId: string; taskId: string; generation: number };
   retiredAt?: string;
   reason?: string;
+  /** Activity time is distinct from import/claim time for deterministic LRU reuse. */
+  lastUsedAt?: string;
+  assignmentEpoch?: number;
 }
 
 export interface StandbyPool {
@@ -221,8 +228,40 @@ export interface SessionLedger {
   version: 1;
   pool: StandbyPool;
   registries: SessionRegistry[];
+  /** Audit-only snapshots; never participate in current conversation ownership. */
+  assignmentHistory?: AssignmentHistoryEntry[];
   savedAt: string;
 }
+
+export interface AssignmentHistoryEntry {
+  conversationId: string;
+  fromWorkspaceId: string;
+  taskId: string;
+  generation: number;
+  recordedAt: string;
+  reason: "workspace_switch" | "pool_reclaimed";
+}
+
+export type TaskBindingResolution = "exact" | "workspace_switch_required" | "unbound" | "ambiguous";
+export interface TaskBindingResult {
+  resolution: TaskBindingResolution;
+  requestedWorkspaceId: string;
+  boundWorkspaceId: string | null;
+  task: SavedTaskSession | null;
+  candidates: Array<{ workspaceId: string; task: SavedTaskSession }>;
+}
+
+export interface SwitchTaskWorkspaceOptions {
+  taskId: string;
+  fromWorkspaceId: string;
+  toWorkspaceId: string;
+  expectedGeneration: number;
+  connectorName: string;
+  workspaceName: string;
+  branch: string | null;
+}
+
+const USE_ID_PATTERN = /^c2c_use_[0-9a-f-]{36}$/u;
 
 export interface ImportStandbyConversationOptions {
   conversationId: string;
@@ -241,6 +280,19 @@ export interface ClaimStandbyConversationOptions {
   workspaceName: string;
   branch: string | null;
   userExplicitPro?: boolean;
+  reclaimObservations?: ReclaimObservation[];
+}
+
+export interface ReclaimObservation {
+  conversationId: string;
+  workspaceId: string;
+  taskId: string;
+  generation: number;
+  assignmentEpoch: number;
+  observedAt: string;
+  taskStatus: "idle";
+  chatStatus: "idle";
+  readbackClean: true;
 }
 
 export interface StandbyClaimResult {
@@ -463,6 +515,11 @@ function normalizeRegistry(registry: SessionRegistry): SessionRegistry {
         (typeof head !== "string" || !/^[0-9a-f]{40}$/u.test(head)))) {
       throw new Error("HOST_CONTROL_STATE_INVALID");
     }
+    if (task.activeUse !== undefined &&
+      (!task.activeUse || !USE_ID_PATTERN.test(task.activeUse.useId) ||
+        !Number.isFinite(Date.parse(task.activeUse.startedAt)))) {
+      throw new Error("TASK_USE_STATE_INVALID");
+    }
   }
   return {
     ...registry,
@@ -661,6 +718,7 @@ function normalizeSessionLedger(ledger: SessionLedger): SessionLedger {
     ...ledger,
     pool: normalizeStandbyPool(ledger.pool),
     registries: ledger.registries.map(normalizeRegistry),
+    assignmentHistory: ledger.assignmentHistory ?? [],
   };
   assertLedgerIntegrity(normalized);
   return normalized;
@@ -730,7 +788,7 @@ export function writeSessionRegistry(registry: SessionRegistry): SessionRegistry
 }
 
 function allConversationIds(task: SavedTaskSession): string[] {
-  return [task.conversationId, ...task.replacedConversations.map((item) => item.conversationId)];
+  return task.bindingState === "bound" || task.bindingState === "quarantined" ? [task.conversationId] : [];
 }
 
 function findConversationOwner(conversationId: string): { workspaceId: string; taskId: string } | null {
@@ -777,6 +835,9 @@ export async function importStandbyConversation(
     }
     if (pool.entries.some((entry) => entry.conversationId === conversationId)) {
       throw new Error("standby conversation already exists in the pool");
+    }
+    if (pool.entries.filter((entry) => entry.status !== "retired").length >= 10) {
+      throw new Error("POOL_CAPACITY_REACHED: the fixed Chat pool already has 10 live entries");
     }
     const owner = findConversationOwner(conversationId);
     if (owner) throw new Error("standby conversation is already owned by a workspace task");
@@ -843,9 +904,49 @@ function makeStandbyTask(input: {
   };
 }
 
+function currentConversationOwner(ledger: SessionLedger, conversationId: string): { workspaceId: string; task: SavedTaskSession } | null {
+  for (const registry of ledger.registries) {
+    const task = registry.tasks.find(candidate => candidate.bindingState === "bound" && candidate.conversationId === conversationId);
+    if (task) return { workspaceId: registry.workspaceId, task };
+  }
+  return null;
+}
+
+function observationAllowsReclaim(
+  entry: StandbyConversation,
+  owner: { workspaceId: string; task: SavedTaskSession },
+  observations: ReclaimObservation[],
+  nowMs: number,
+): boolean {
+  const observation = observations.find(item => item.conversationId === entry.conversationId);
+  if (!observation || observation.workspaceId !== owner.workspaceId || observation.taskId !== owner.task.taskId ||
+    observation.generation !== owner.task.generation || observation.assignmentEpoch !== (entry.assignmentEpoch ?? 0) ||
+    observation.taskStatus !== "idle" || observation.chatStatus !== "idle" || observation.readbackClean !== true) return false;
+  const observedAt = Date.parse(observation.observedAt);
+  return Number.isFinite(observedAt) && observedAt <= nowMs && nowMs - observedAt <= 60_000;
+}
+
+function reclaimableCandidate(
+  ledger: SessionLedger,
+  marker: StandbyMarker,
+  observations: ReclaimObservation[] | undefined,
+  nowMs: number,
+): { entry: StandbyConversation; owner: { workspaceId: string; task: SavedTaskSession } } | null {
+  if (!observations) return null;
+  const candidates = ledger.pool.entries.flatMap(entry => {
+    if (entry.status !== "claimed" || entry.marker !== marker) return [];
+    const owner = currentConversationOwner(ledger, entry.conversationId);
+    if (!owner || owner.task.bindingState !== "bound" || owner.task.verificationState !== "ready" || taskIsBusy(owner.task)) return [];
+    return observationAllowsReclaim(entry, owner, observations, nowMs) ? [{ entry, owner }] : [];
+  });
+  return candidates.sort((left, right) =>
+    (left.entry.lastUsedAt ?? left.entry.claimedAt ?? left.entry.importedAt).localeCompare(right.entry.lastUsedAt ?? right.entry.claimedAt ?? right.entry.importedAt) ||
+    left.entry.conversationId.localeCompare(right.entry.conversationId)
+  )[0] ?? null;
+}
+
 /**
- * Atomically lease the oldest compatible standby Chat. A claimed Chat never
- * returns to the pool, even if its channel is later degraded.
+ * Atomically use an unclaimed Chat, or reclaim one only after a fresh exact idle observation.
  */
 export async function claimStandbyConversation(
   input: ClaimStandbyConversationOptions
@@ -857,6 +958,9 @@ export async function claimStandbyConversation(
     const workspaceName = input.workspaceName.trim();
     if (!connectorName || !workspaceName) throw new Error("standby claim requires connector and workspace names");
     const ledger = readSessionLedger();
+    const resolution = resolveTaskBinding(workspaceId, taskId);
+    if (resolution.resolution === "workspace_switch_required") throw new Error("TASK_WORKSPACE_SWITCH_REQUIRED");
+    if (resolution.resolution === "ambiguous") throw new Error("TASK_BINDING_AMBIGUOUS");
     const registry = registryFromLedger(ledger, workspaceId);
     const existing = registry.tasks.find((entry) => entry.taskId === taskId);
     const pool = ledger.pool;
@@ -870,14 +974,18 @@ export async function claimStandbyConversation(
     }
 
     const desiredMarker: StandbyMarker = input.userExplicitPro ? STANDBY_PRO_MARKER : STANDBY_MARKER;
-    const candidate = pool.entries
+    let candidate = pool.entries
       .filter((entry) => entry.status === "available" && entry.marker === desiredMarker)
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.importedAt.localeCompare(right.importedAt))[0];
-    if (!candidate) throw new Error("POOL_EXHAUSTED: no compatible standby Chat is available");
-
-    const owner = findConversationOwner(candidate.conversationId);
-    if (owner) throw new Error("standby conversation is already owned by a workspace task");
     const now = new Date().toISOString();
+    const reclaim = candidate ? null : reclaimableCandidate(ledger, desiredMarker, input.reclaimObservations, Date.parse(now));
+    if (!candidate && !reclaim) {
+      const hasCompatibleClaim = pool.entries.some(entry => entry.status === "claimed" && entry.marker === desiredMarker);
+      throw new Error(hasCompatibleClaim ? "POOL_BUSY: no Chat has fresh safe-reclaim evidence; stop for manual handling" : "POOL_EXHAUSTED: no compatible standby Chat is available");
+    }
+    candidate = candidate ?? reclaim!.entry;
+    const owner = currentConversationOwner(ledger, candidate.conversationId);
+    if (owner && !reclaim) throw new Error("standby conversation is already owned by a workspace task");
     const task = makeStandbyTask({
       workspaceId,
       taskId,
@@ -896,7 +1004,7 @@ export async function claimStandbyConversation(
           status: "claimed" as const,
           claimedAt: now,
           claimedBy: { workspaceId, taskId, generation: task.generation },
-          reason: undefined,
+          reason: undefined, lastUsedAt: now, assignmentEpoch: (entry.assignmentEpoch ?? 0) + 1,
         };
       }
       if (retiredPriorId && entry.id === retiredPriorId && entry.status === "claimed") {
@@ -914,10 +1022,18 @@ export async function claimStandbyConversation(
       provisions: registry.provisions.filter((entry) => entry.taskId !== taskId),
       savedAt: now,
     };
+    const remainingRegistries = ledger.registries
+      .filter((entry) => entry.workspaceId !== workspaceId && entry.workspaceId !== reclaim?.owner.workspaceId);
+    const reclaimedRegistry = reclaim ? {
+      ...registryFromLedger(ledger, reclaim.owner.workspaceId),
+      tasks: registryFromLedger(ledger, reclaim.owner.workspaceId).tasks.filter(task => task.taskId !== reclaim.owner.task.taskId),
+      savedAt: now,
+    } : null;
     writeSessionLedger({
       ...ledger,
       pool: { ...pool, entries, savedAt: now },
-      registries: [...ledger.registries.filter((entry) => entry.workspaceId !== workspaceId), nextRegistry],
+      registries: [...remainingRegistries, ...(reclaimedRegistry ? [reclaimedRegistry] : []), nextRegistry],
+      assignmentHistory: reclaim ? [...(ledger.assignmentHistory ?? []), historyEntry(reclaim.owner.task, reclaim.owner.workspaceId, "pool_reclaimed", now)] : ledger.assignmentHistory,
       savedAt: now,
     });
     return { task, entry: claimed, reused: false };
@@ -1021,6 +1137,104 @@ export function readTaskSession(workspaceId: string, taskId: string): SavedTaskS
   return readSessionRegistry(workspaceId).registry.tasks.find((task) => task.taskId === id) ?? null;
 }
 
+/** Read-only resolver for continuation. It never lets historical ownership act as current ownership. */
+export function resolveTaskBinding(workspaceIdInput: string, taskIdInput: string): TaskBindingResult {
+  const requestedWorkspaceId = validateWorkspaceId(workspaceIdInput);
+  const taskId = validateTaskId(taskIdInput);
+  const ledger = readSessionLedger();
+  const exact = registryFromLedger(ledger, requestedWorkspaceId).tasks
+    .find(task => task.taskId === taskId && task.bindingState === "bound") ?? null;
+  if (exact) return { resolution: "exact", requestedWorkspaceId, boundWorkspaceId: requestedWorkspaceId, task: exact, candidates: [{ workspaceId: requestedWorkspaceId, task: exact }] };
+  const candidates = ledger.registries.flatMap(registry => registry.tasks
+    .filter(task => task.taskId === taskId && task.bindingState === "bound")
+    .map(task => ({ workspaceId: registry.workspaceId, task })));
+  if (candidates.length === 0) return { resolution: "unbound", requestedWorkspaceId, boundWorkspaceId: null, task: null, candidates: [] };
+  if (candidates.length === 1) return { resolution: "workspace_switch_required", requestedWorkspaceId, boundWorkspaceId: candidates[0].workspaceId, task: candidates[0].task, candidates };
+  return { resolution: "ambiguous", requestedWorkspaceId, boundWorkspaceId: null, task: null, candidates };
+}
+
+function taskIsBusy(task: SavedTaskSession): boolean {
+  return Boolean(task.pendingMessageId || task.pendingDispatchUncertain || task.sendAcceptedAt || task.deliveryPendingSince || task.activeUse || task.channelState !== "ready");
+}
+
+function historyEntry(task: SavedTaskSession, workspaceId: string, reason: AssignmentHistoryEntry["reason"], now: string): AssignmentHistoryEntry {
+  return { conversationId: task.conversationId, fromWorkspaceId: workspaceId, taskId: task.taskId, generation: task.generation, recordedAt: now, reason };
+}
+
+/** Move an idle exact Chat to a registered continuation workspace without changing its conversation id. */
+export async function switchTaskWorkspace(input: SwitchTaskWorkspaceOptions): Promise<SavedTaskSession> {
+  return withWorkspaceLifecycleLock(SESSION_REGISTRY_LOCK_ID, async () => {
+    const taskId = validateTaskId(input.taskId);
+    const fromWorkspaceId = validateWorkspaceId(input.fromWorkspaceId);
+    const toWorkspaceId = validateWorkspaceId(input.toWorkspaceId);
+    if (fromWorkspaceId === toWorkspaceId) throw new Error("TASK_WORKSPACE_SWITCH_NOOP");
+    if (!Number.isSafeInteger(input.expectedGeneration) || input.expectedGeneration < 1) throw new Error("TASK_GENERATION_INVALID");
+    const connectorName = input.connectorName.trim(); const workspaceName = input.workspaceName.trim();
+    if (!connectorName || !workspaceName) throw new Error("TASK_WORKSPACE_SWITCH_METADATA_INVALID");
+    const ledger = readSessionLedger();
+    const from = registryFromLedger(ledger, fromWorkspaceId);
+    const current = from.tasks.find(task => task.taskId === taskId);
+    if (!current || current.bindingState !== "bound" || current.generation !== input.expectedGeneration) throw new Error("TASK_BINDING_STALE");
+    if (taskIsBusy(current)) throw new Error("TASK_CHAT_BUSY: resolve the in-flight message or active use before switching workspace");
+    const target = registryFromLedger(ledger, toWorkspaceId);
+    if (target.tasks.some(task => task.taskId === taskId && task.bindingState === "bound")) throw new Error("TASK_BINDING_AMBIGUOUS");
+    const poolEntry = current.poolEntryId ? ledger.pool.entries.find(entry => entry.id === current.poolEntryId) : undefined;
+    if (!poolEntry || poolEntry.status !== "claimed" || poolEntry.conversationId !== current.conversationId ||
+      poolEntry.claimedBy?.workspaceId !== fromWorkspaceId || poolEntry.claimedBy.taskId !== taskId || poolEntry.claimedBy.generation !== current.generation) {
+      throw new Error("SESSION_CONVERSATION_OWNER_MISMATCH");
+    }
+    const now = new Date().toISOString();
+    const provisionId = newProvisionId();
+    const moved: SavedTaskSession = {
+      ...current,
+      generation: current.generation + 1,
+      provisionId,
+      bindingCodeDigest: bindingCodeDigest(bindingCodeFor(toWorkspaceId, taskId, provisionId)),
+      connectorName,
+      workspaceName,
+      branch: input.branch,
+      routeCapabilityId: undefined,
+      verificationState: "pending",
+      channelState: "ready",
+      hostControl: undefined,
+      lastReviewHead: undefined,
+      activeUse: undefined,
+      savedAt: now,
+    };
+    const nextTarget: SessionRegistry = { ...target, projectUrl: `https://chatgpt.com/g/${poolEntry.projectId}/project`, connectorName,
+      tasks: [...target.tasks.filter(task => task.taskId !== taskId), moved], provisions: target.provisions.filter(item => item.taskId !== taskId), savedAt: now };
+    const nextFrom: SessionRegistry = { ...from, tasks: from.tasks.filter(task => task.taskId !== taskId), savedAt: now };
+    writeSessionLedger({ ...ledger,
+      pool: { ...ledger.pool, entries: ledger.pool.entries.map(entry => entry.id === poolEntry.id ? { ...entry, claimedBy: { workspaceId: toWorkspaceId, taskId, generation: moved.generation }, lastUsedAt: now, assignmentEpoch: (entry.assignmentEpoch ?? 0) + 1 } : entry), savedAt: now },
+      registries: [...ledger.registries.filter(registry => registry.workspaceId !== fromWorkspaceId && registry.workspaceId !== toWorkspaceId), nextFrom, nextTarget],
+      assignmentHistory: [...(ledger.assignmentHistory ?? []), historyEntry(current, fromWorkspaceId, "workspace_switch", now)], savedAt: now });
+    return moved;
+  });
+}
+
+/** Obtain the single coordinator lease used to prevent automatic pool reclamation. */
+export async function resumeTaskSession(workspaceIdInput: string, taskIdInput: string): Promise<SavedTaskSession & { useId: string }> {
+  const useId = `c2c_use_${randomUUID()}`;
+  const task = await updateTaskChannel(workspaceIdInput, taskIdInput, current => {
+    if (current.bindingState !== "bound" || taskIsBusy(current)) throw new Error("TASK_CHAT_BUSY");
+    const now = new Date().toISOString();
+    return { ...current, activeUse: { useId, startedAt: now }, savedAt: now };
+  });
+  return { ...task, useId };
+}
+
+/** End a coordinator lease. A pending delivery can never be marked reusable. */
+export async function finishTaskSession(workspaceIdInput: string, taskIdInput: string, useIdInput: string): Promise<SavedTaskSession> {
+  const useId = useIdInput.trim();
+  if (!USE_ID_PATTERN.test(useId)) throw new Error("TASK_USE_ID_INVALID");
+  return updateTaskChannel(workspaceIdInput, taskIdInput, current => {
+    if (!current.activeUse || current.activeUse.useId !== useId) throw new Error("TASK_USE_STALE");
+    if (current.pendingMessageId || current.pendingDispatchUncertain || current.sendAcceptedAt || current.deliveryPendingSince) throw new Error("TASK_CHAT_BUSY");
+    const now = new Date().toISOString();
+    return { ...current, activeUse: undefined, savedAt: now };
+  });
+}
+
 /** Verify that Router capabilities always point at the ledger's current generation. */
 export function assertTaskConversationOwner(
   workspaceIdInput: string,
@@ -1080,8 +1294,16 @@ async function updateTaskChannel(
     if (!current) throw new Error("task has no ChatGPT conversation binding");
     const task = update({ ...current, channelState: current.channelState ?? "ready" });
     const tasks = registry.tasks.map((entry) => entry.taskId === id ? task : entry);
+    const usedNow = (task.activeUse !== undefined && current.activeUse?.useId !== task.activeUse.useId) ||
+      current.pendingMessageId !== task.pendingMessageId ||
+      (current.pendingMessageId !== undefined && task.pendingMessageId === undefined);
+    const now = new Date().toISOString();
+    const poolEntries = usedNow && task.poolEntryId
+      ? ledger.pool.entries.map(entry => entry.id === task.poolEntryId ? { ...entry, lastUsedAt: now } : entry)
+      : ledger.pool.entries;
     let nextLedger: SessionLedger = {
       ...ledger,
+      pool: poolEntries === ledger.pool.entries ? ledger.pool : { ...ledger.pool, entries: poolEntries, savedAt: now },
       registries: [...ledger.registries.filter((entry) => entry.workspaceId !== workspace), {
         ...registry,
         tasks,
@@ -1382,6 +1604,9 @@ export async function beginTaskSend(
   const flags = typeof options === "boolean" ? { probe: options } : options;
   if (flags.reviewHead !== undefined && !/^[0-9a-f]{40}$/u.test(flags.reviewHead)) throw new Error("REVIEW_HEAD_INVALID");
   return updateTaskChannel(workspaceId, taskId, (task) => {
+    if (flags.expectedGeneration !== undefined && task.generation !== flags.expectedGeneration) throw new Error("TASK_GENERATION_STALE");
+    if (task.activeUse && flags.useId !== task.activeUse.useId) throw new Error("TASK_USE_STALE");
+    if (flags.useId !== undefined && !USE_ID_PATTERN.test(flags.useId)) throw new Error("TASK_USE_ID_INVALID");
     if (task.bindingState !== "bound") throw new Error("task conversation binding is unavailable");
     if (task.hostControl && task.hostControl.status !== "ready") throw new Error("HOST_CONTROL_NOT_READY: probe tools and read the exact bound Chat");
     if (task.settingsSource !== "user_confirmed") throw new Error("task conversation settings lack user confirmation");

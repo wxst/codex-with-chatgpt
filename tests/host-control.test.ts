@@ -113,6 +113,8 @@ it("CLI refuses missing preflight and reports actual unaccepted failures", async
   await recordTaskHostControl(workspaceId, "cli-task", { result: "read-ok", conversationId: "cli-chat", observedTaskId: "cli-task", observedWorkspaceId: workspaceId });
   const started = cli("begin-send", "--task-id", "cli-task", "--message-id", id, "--iteration", "0", "--bootstrap", "--json");
   expect(started.status).toBe(0);
+  const resumedPending = cli("resume", "--task-id", "cli-task", "--brief", "--json");
+  expect(JSON.parse(resumedPending.stdout)).toMatchObject({ ok: true, useId: null, nextAction: "read_bound_chat" });
   const failed = cli("fail-delivery", "--task-id", "cli-task", "--message-id", id, "--kind", "host_rejected", "--reason", "explicit rejection", "--json");
   expect(JSON.parse(failed.stdout).accepted).toBe(false);
 
