@@ -35,6 +35,19 @@ pass `--no-fix` for diagnosis.
 
 ## Common situations
 
+### Quick Tunnel prints an address but never becomes ready
+
+An address in cloudflared output alone is not proof of readiness. C2C waits for
+the public `/health` response to identify `c2c-bridge` with `status: ok` and
+rejects `api.trycloudflare.com` as a tunnel address. A startup timeout or child
+exit leaves the provider stopped, without publishing a usable URL. Check the
+reported health error and executable path before retrying. An accessible custom
+cloudflared binary can be selected through `C2C_CLOUDFLARED_PATH`.
+
+An inconclusive local probe does not authorize deleting a connector or replacing
+a potentially live Bridge. Current startup guards check persisted process
+generations before accepting another Bridge. Diagnose the exact runtime first.
+
 ### "Bridge 未运行"
 `c2c start` (or let doctor do it). Bridge logs:
 `c2c logs`, or verbose: `c2c logs --verbose`.

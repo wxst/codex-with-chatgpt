@@ -105,8 +105,11 @@ describe("task-scoped standby session registry", () => {
     for (const [label, invalid] of [
       ["missing route task", { ...observation, routeTaskId: undefined }],
       ["wrong route task", { ...observation, routeTaskId: "another-task" }],
+      ["empty workspace", { ...observation, workspaceId: "" }],
       ["wrong workspace", { ...observation, workspaceId: "another-workspace" }],
+      ["empty workspace name", { ...observation, workspaceName: "" }],
       ["wrong workspace name", { ...observation, workspaceName: "another-repo" }],
+      ["missing branch", { ...observation, branch: null }],
       ["wrong branch", { ...observation, branch: "other" }],
     ] as const) {
       await expect(confirmTaskWorkspace("workspace123", "task-a", invalid), label).rejects.toThrow();
@@ -117,6 +120,33 @@ describe("task-scoped standby session registry", () => {
     expect(ready.verificationState).toBe("ready");
     expect(ready.connectorName).toBe(claimed.task.connectorName);
   });
+
+  it.each(["unsent", "reserved", "accepted", "delivered", "PLAN", "BLOCKED", "new-pending"])(
+    "does not promote workspace verification with a %s BOOT receipt", async phase => {
+      reset();
+      await claimedTask();
+      const bootId = newMessageId();
+      if (phase !== "unsent") {
+        await beginTaskSend("workspace123", "task-a", bootId, 0, { bootstrap: true });
+        if (phase !== "reserved") await confirmTaskSendAccepted("workspace123", "task-a", bootId);
+        if (!["reserved", "accepted"].includes(phase)) {
+          await confirmTaskDelivery("workspace123", "task-a", bootId);
+        }
+        if (["PLAN", "BLOCKED", "new-pending"].includes(phase)) {
+          await confirmTaskReply("workspace123", "task-a", bootId,
+            phase === "new-pending" ? "DONE" : phase as "PLAN" | "BLOCKED");
+        }
+        if (phase === "new-pending") {
+          await beginTaskSend("workspace123", "task-a", newMessageId(), 0, { bootstrap: true });
+        }
+      }
+      const before = readTaskSession("workspace123", "task-a");
+      await expect(confirmTaskWorkspace("workspace123", "task-a", {
+        workspaceId: "workspace123", routeTaskId: "task-a", workspaceName: "repo", branch: "main",
+      })).rejects.toThrow(/boot reply/);
+      expect(readTaskSession("workspace123", "task-a")).toEqual(before);
+      expect(before?.verificationState).toBe("pending");
+    });
 
   it("keeps an accepted send in flight when the initial delivery check sees no message", async () => {
     reset();

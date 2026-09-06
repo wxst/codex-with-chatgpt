@@ -13,6 +13,8 @@ import {
   confirmTaskWorkspace,
   importStandbyConversation,
   newMessageId,
+  readTaskSession,
+  switchTaskWorkspace,
 } from "../src/session/state.js";
 import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
@@ -155,5 +157,36 @@ describe("router MCP capability boundary", () => {
       branch: info.git.branch,
     });
     expect(ready.verificationState).toBe("ready");
+  });
+
+  it("confirms a switched workspace using live MCP observations and rejects the old token", async () => {
+    const router = await createWorkspaceRouter(alphaRoot);
+    const alpha = await router.register(alphaRoot);
+    const beta = await router.register(betaRoot);
+    const old = readTaskSession(alpha.workspaceId, "alpha-task")!;
+    const moved = await switchTaskWorkspace({ taskId: "alpha-task",
+      fromWorkspaceId: alpha.workspaceId, toWorkspaceId: beta.workspaceId,
+      expectedGeneration: old.generation, connectorName: "C2C", workspaceName: path.basename(betaRoot), branch: "main" });
+    expect(moved.conversationId).toBe(old.conversationId);
+    expect(moved.generation).toBe(old.generation + 1);
+    const denied = await client.callTool({ name: "workspace_info", arguments: { route_token: alphaToken } });
+    expect(denied.isError).toBe(true);
+    expect(textOf(denied)).toContain("ROUTE_ACCESS_DENIED");
+    expect(denied.structuredContent).toBeUndefined();
+    const route = await issueRouteCapability({ workspaceId: beta.workspaceId, taskId: "alpha-task", conversationId: moved.conversationId });
+    await attachTaskRouteCapability(beta.workspaceId, "alpha-task", route.id);
+    const result = await client.callTool({ name: "workspace_info", arguments: { route_token: route.token } });
+    expect(result.isError).not.toBe(true);
+    const info = result.structuredContent as { workspaceId: string; routeTaskId: string; workspaceName: string; git: { branch: string | null } };
+    expect(info).toMatchObject({ workspaceId: beta.workspaceId, routeTaskId: "alpha-task", workspaceName: path.basename(betaRoot) });
+    const bootId = newMessageId();
+    await beginTaskSend(beta.workspaceId, "alpha-task", bootId, moved.iteration, { bootstrap: true });
+    await confirmTaskDelivery(beta.workspaceId, "alpha-task", bootId);
+    await confirmTaskReply(beta.workspaceId, "alpha-task", bootId, "DONE");
+    const ready = await confirmTaskWorkspace(beta.workspaceId, "alpha-task", {
+      workspaceId: info.workspaceId, routeTaskId: info.routeTaskId, workspaceName: info.workspaceName, branch: info.git.branch,
+    });
+    expect(ready).toMatchObject({ verificationState: "ready", conversationId: old.conversationId });
+    expect(ready.pendingMessageId).toBeUndefined();
   });
 });

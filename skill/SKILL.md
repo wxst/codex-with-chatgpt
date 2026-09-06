@@ -304,7 +304,7 @@ CONNECTOR: <connector-name>
 Use only the C2C MCP connector. Every MCP call must include
 route_token: <route-token>. `CONNECTOR` names the selected connection; it is
 not a field returned by workspace_info. First call workspace_info. Echo all
-four receipt identity fields, then echo the returned `routeTaskId`,
+four receipt identity fields, then separately echo the returned `workspaceId`, `routeTaskId`,
 `workspaceName`, and `git.branch` before replying STATE: DONE. Do not copy an
 expected value from this prompt or the ledger as an observed result. A reply
 missing any of those observed workspace fields does not promote the task to
@@ -359,7 +359,22 @@ the same observed identity fields. After `workspace_info` reports the expected
 workspace id, route task id, name, and branch, run `session confirm-workspace`
 with `--observed-route-task-id <routeTaskId>`. The optional
 `--observed-connector-name` is legacy display input only; it is never an
-identity proof.
+identity proof. Use the tool's observed `workspaceId` and `routeTaskId`, not the
+BOOT receipt's `WORKSPACE_ID` and `TASK_ID`, to fill this command:
+
+```text
+node "__C2C_CHECKOUT__/bin/c2c.js" session confirm-workspace \
+  -w <workspace-root> --task-id <own-task-id> \
+  --observed-workspace-id <workspace_info.workspaceId> \
+  --observed-route-task-id <workspace_info.routeTaskId> \
+  --observed-workspace-name <workspace_info.workspaceName> \
+  --observed-branch <workspace_info.git.branch> --json
+```
+
+Quote paths, names, and branches as required by the current shell. For a null
+`git.branch`, omit `--observed-branch`. Run the command only after the matching
+DONE receipt is registered, including after a workspace switch. Never fill a
+missing observation using an expected identity from the ledger or BOOT prompt.
 Only a `ready` task may receive task content.
 
 ## Normal control loop

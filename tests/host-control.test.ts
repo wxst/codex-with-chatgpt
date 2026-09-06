@@ -136,10 +136,21 @@ it("CLI refuses missing preflight and reports actual unaccepted failures", async
   expect(cli("confirm-reply", ...observed, "--observed-iteration", "0junk", "--state", "DONE", "--json").status).not.toBe(0);
   expect(JSON.parse(cli("confirm-reply", ...observed, "--observed-iteration", "0", "--state", "DONE", "--json").stdout))
     .toMatchObject({ accepted: false, delivered: true, replied: true });
-  const workspaceReady = cli("confirm-workspace", "--task-id", "cli-task",
-    "--observed-workspace-id", workspaceId, "--observed-route-task-id", "cli-task",
-    "--observed-workspace-name", "repo", "--observed-branch", "main", "--json");
-  expect(JSON.parse(workspaceReady.stdout)).toMatchObject({ ok: true, task: { verificationState: "ready" } });
+  const identityArgs = ["--task-id", "cli-task", "--observed-workspace-id", workspaceId,
+    "--observed-workspace-name", "repo", "--observed-branch", "main", "--json"];
+  for (const title of ["C2C", "C2C · read-only workspace", "arbitrary display name"]) {
+    const wrong = cli("confirm-workspace", ...identityArgs,
+      "--observed-route-task-id", "wrong-task", "--observed-connector-name", title);
+    expect(wrong.status).not.toBe(0);
+    expect(wrong.stdout + wrong.stderr).toContain("route task identity");
+    expect(readTaskSession(workspaceId, "cli-task")?.verificationState).toBe("pending");
+  }
+  for (const title of [undefined, "C2C", "C2C · read-only workspace"]) {
+    const workspaceReady = cli("confirm-workspace", ...identityArgs,
+      "--observed-route-task-id", "cli-task", ...(title ? ["--observed-connector-name", title] : []));
+    expect(workspaceReady.status).toBe(0);
+    expect(JSON.parse(workspaceReady.stdout)).toMatchObject({ ok: true, task: { verificationState: "ready", connectorName: "C2C" } });
+  }
 });
 
 it.each([

@@ -26,7 +26,7 @@ describe("Windows background process contract", () => {
       ["src/cli/index.ts", 'spawnSync("git", args'],
       ["src/process/daemon.ts", "child = spawn(entry.cmd"],
       ["src/tunnel/detect.ts", "spawnSync(exe"],
-      ["src/tunnel/cloudflared.ts", "const child = spawn("],
+      ["src/tunnel/cloudflared.ts", "child = this.spawnImpl("],
       ["src/tunnel/cloudflared-named.ts", "const child = spawn("],
       ["src/tunnel/named-provision.ts", "const child = spawn(bin"],
       ["src/tunnel/named-provision.ts", "const result = spawnSync(this.binary()"],
