@@ -112,8 +112,9 @@ Interpret the result exactly:
   `router_state_invalid` or `router_state_unavailable` stops diagnostics and
   repair; an unreadable, corrupt or conflicting Router registry is never
   treated as the absence of a Router.
-- `POOL_EXHAUSTED`: no compatible Chat exists. `POOL_BUSY` means the fixed pool
-  has no candidate with fresh safe-reclaim evidence; stop for manual handling.
+- `POOL_EXHAUSTED`: no compatible Chat exists. `POOL_OBSERVATION_REQUIRED`
+  means local rotation candidates exist: follow the mandatory rotation flow
+  below. `POOL_BUSY` means local candidates are blocked; inspect exclusion reasons.
 - A runtime lookup error does not prove that the Tunnel is stopped. Inspect
   `runtime.errorClass` first. Restart the existing launcher only when runtime
   status actually confirms it is stopped and the task authorizes recovery.
@@ -198,8 +199,69 @@ live pool entries already allocated, it requires a fresh (at most 60 seconds)
 exact host observation proving both owner task and Chat idle plus a clean Chat
 readback before it may reclaim the least-recently-used safe candidate. Pending,
 accepted, uncertain, awaiting-reply, degraded, active, missing or unobserved
-entries are never reclaimed. If no safe candidate exists, stop at `POOL_BUSY`;
-do not create another Chat, poll indefinitely, or force a takeover.
+entries are never reclaimed. Do not conclude that the pool is busy merely
+because available stock is zero. Run the following flow before reporting a blocker.
+
+### Mandatory rotation when unclaimed stock is empty
+
+1. Run `node "__C2C_CHECKOUT__/bin/c2c.js" session pool reclaim-candidates --json`
+   (add `--pro` only for an explicitly Pro request). Do not import a Chat already
+   in the pool. The ordered `candidates` are local candidates, not host idle proof.
+2. For each candidate in returned order, query its exact owner task with
+   `read_thread` or a fresh `wait_threads` snapshot, then `read_thread` the exact
+   `conversationId`. Both surfaces must explicitly be idle. A missing/archived
+   task without an explicit idle result, an active task, read failure, or unknown
+   status excludes that candidate for this pass; continue with the next one.
+3. Verify the latest Chat user message and completed assistant reply match the
+   candidate's `taskId`, `workspaceId`, `iteration`, `lastDeliveredMessageId`, and
+   `lastState` (and `lastReviewHead` when present). Follow read cursors when needed.
+   Any newer request, pending reply or mismatched identity excludes the candidate.
+   Never infer idle from ledger age, title, or lack of recent visible activity.
+4. Immediately write one verified observation to a UTF-8 JSON file outside the
+   repository and call claim below. Record `observedAt` when both host reads are
+   complete; both reads must be no more than 60 seconds old at claim time. Refresh
+   them if needed. Never populate idle/clean fields without the preceding proof.
+
+```json
+[
+  {
+    "conversationId": "<candidate.conversationId>",
+    "workspaceId": "<candidate.workspaceId>",
+    "taskId": "<candidate.taskId>",
+    "generation": 1,
+    "assignmentEpoch": 1,
+    "observedAt": "<actual UTC observation time>",
+    "taskStatus": "idle",
+    "chatStatus": "idle",
+    "readbackClean": true
+  }
+]
+```
+
+Replace the example integers with the exact candidate generation and epoch.
+The observation identifies the **old owner**, while the claim identifies your
+**own current task**:
+
+```text
+node "__C2C_CHECKOUT__/bin/c2c.js" session pool claim \
+  -w <your-workspace> --task-id <your-task-id> \
+  --reclaim-observations-file <absolute-json-file> --json
+```
+
+`--reclaim-observations` remains supported, but cannot be combined with the file
+option. Do not put route tokens in observations or copy them into diagnostics.
+
+5. The locked claim rechecks ownership, epoch, pending state and leases. If the
+   candidate changed, reread the candidate list and continue with remaining
+   candidates; inspect each candidate at most once per pass, with one additional
+   fresh attempt only for an expired observation. Do not loop indefinitely.
+6. After success, use only the newly returned binding/token for BOOT and the
+   normal accepted → exact delivery → matching reply → confirm-workspace flow.
+   Do not send task content until ready. A safely reclaimed Chat is an authorized
+   pool rotation, not an arbitrary takeover of another task's binding.
+7. If the pass finds no safe candidate, report exclusion/readback reasons and
+   counts. Do not clear pending or age out an `activeUse` lease; an old lease alone
+   is not reclaim permission. Do not create additional Chats or change transport.
 
 Use `session finish --use-id <id>` after a normal turn to release only the
 coordinator lease while retaining the task binding. A pending delivery cannot

@@ -94,6 +94,8 @@ import {
   recordTaskHostControl,
   type HostControlObservation,
   type ReclaimObservation,
+  readReclaimCandidates,
+  validateReclaimObservations,
   restoreTaskConversation,
   quarantineStandbyConversation,
   readStandbyPool,
@@ -1222,8 +1224,7 @@ function parseReclaimObservations(input: string | undefined): ReclaimObservation
   if (input === undefined) return undefined;
   try {
     const parsed: unknown = JSON.parse(input);
-    if (!Array.isArray(parsed)) throw new Error("not array");
-    return parsed as ReclaimObservation[];
+    return validateReclaimObservations(parsed);
   } catch {
     throw new InvalidArgumentError("reclaim observations must be a JSON array from fresh exact host readback");
   }
@@ -1412,6 +1413,16 @@ pool.command("list")
     else say(`备用 Chat：可用 ${payload.available}，已领取 ${payload.claimed}`);
   });
 
+pool.command("reclaim-candidates")
+  .description("List local rotation candidates; exact host idle observations are still required")
+  .option("--pro", "explicitly requested Pro inventory", false)
+  .option("--json", "machine-readable output", false)
+  .action((opts: { pro: boolean; json: boolean }) => {
+    const payload = readReclaimCandidates(opts.pro);
+    if (opts.json) say(JSON.stringify(payload));
+    else say(`本地候选 ${payload.candidates.length}，排除 ${payload.excluded.length}；使用 --json 查看详情并核实原 task 与 Chat 空闲`);
+  });
+
 pool.command("import")
   .description("Import one Chat verified by list_threads and read_thread as a standby Chat")
   .requiredOption("--conversation-id <id>")
@@ -1439,8 +1450,14 @@ pool.command("claim")
   .option("--task-id <id>")
   .option("--pro", "this task explicitly requests Pro", false)
   .option("--reclaim-observations <json>", "fresh exact idle observations from host readback")
+  .option("--reclaim-observations-file <path>", "UTF-8 JSON observations from exact host readback")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; taskId?: string; pro: boolean; reclaimObservations?: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; pro: boolean; reclaimObservations?: string; reclaimObservationsFile?: string; json: boolean }) => {
+    if (opts.reclaimObservations !== undefined && opts.reclaimObservationsFile !== undefined) {
+      throw new InvalidArgumentError("choose only one of --reclaim-observations and --reclaim-observations-file");
+    }
+    const observations = parseReclaimObservations(opts.reclaimObservationsFile === undefined ? opts.reclaimObservations :
+      fs.readFileSync(path.resolve(opts.reclaimObservationsFile), "utf8"));
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
     const resolved = resolvedSessionTaskId(opts.taskId);
@@ -1460,7 +1477,7 @@ pool.command("claim")
       workspaceName: workspace.name,
       branch: gitInfo(workspace.root).branch,
       userExplicitPro: opts.pro,
-      reclaimObservations: parseReclaimObservations(opts.reclaimObservations),
+      reclaimObservations: observations,
     });
     let routeToken: string | null = null;
     let task = claimed.task;

@@ -934,6 +934,59 @@ function observationAllowsReclaim(
   return Number.isFinite(observedAt) && observedAt <= nowMs && nowMs - observedAt <= 60_000;
 }
 
+export function validateReclaimObservations(value: unknown): ReclaimObservation[] {
+  if (!Array.isArray(value)) throw new Error("RECLAIM_OBSERVATIONS_INVALID: expected an array");
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== "object" ||
+      ![item.conversationId, item.workspaceId, item.taskId].every(v => typeof v === "string" && v.trim() === v && v.length > 0) ||
+      !Number.isSafeInteger(item.generation) || item.generation < 1 ||
+      !Number.isSafeInteger(item.assignmentEpoch) || item.assignmentEpoch < 0 ||
+      typeof item.observedAt !== "string" || !Number.isFinite(Date.parse(item.observedAt)) ||
+      item.taskStatus !== "idle" || item.chatStatus !== "idle" || item.readbackClean !== true || seen.has(item.conversationId)) {
+      throw new Error("RECLAIM_OBSERVATIONS_INVALID: use complete unique observations from exact host readback");
+    }
+    seen.add(item.conversationId);
+  }
+  return value;
+}
+
+function reclaimExclusion(ledger: SessionLedger, entry: StandbyConversation, marker: StandbyMarker): string | null {
+  if (entry.marker !== marker) return "marker_mismatch";
+  if (entry.status !== "claimed") return entry.status;
+  const owner = currentConversationOwner(ledger, entry.conversationId);
+  if (!owner || entry.claimedBy?.workspaceId !== owner.workspaceId ||
+    entry.claimedBy?.taskId !== owner.task.taskId || entry.claimedBy?.generation !== owner.task.generation) return "owner_mismatch";
+  if (owner.task.verificationState !== "ready") return "verification_pending";
+  if (owner.task.activeUse) return "active_lease";
+  if (taskIsBusy(owner.task)) return "pending_or_degraded";
+  if (!owner.task.lastDeliveredMessageId || !owner.task.lastState) return "receipt_missing";
+  return null;
+}
+
+function reclaimOrder(left: StandbyConversation, right: StandbyConversation): number {
+  return (left.lastUsedAt ?? left.claimedAt ?? left.importedAt).localeCompare(right.lastUsedAt ?? right.claimedAt ?? right.importedAt) ||
+    left.conversationId.localeCompare(right.conversationId);
+}
+
+/** Local eligibility only: callers must still read both exact host surfaces. */
+export function readReclaimCandidates(pro = false) {
+  const ledger = readSessionLedger();
+  const marker = pro ? STANDBY_PRO_MARKER : STANDBY_MARKER;
+  const rows = [...ledger.pool.entries].sort(reclaimOrder).map(entry => {
+    const owner = currentConversationOwner(ledger, entry.conversationId);
+    return { conversationId: entry.conversationId, workspaceId: owner?.workspaceId,
+      taskId: owner?.task.taskId, generation: owner?.task.generation, assignmentEpoch: entry.assignmentEpoch ?? 0,
+      lastUsedAt: entry.lastUsedAt ?? entry.claimedAt ?? entry.importedAt,
+      iteration: owner?.task.iteration, lastDeliveredMessageId: owner?.task.lastDeliveredMessageId,
+      lastState: owner?.task.lastState, lastReviewHead: owner?.task.lastReviewHead,
+      exclusionReason: reclaimExclusion(ledger, entry, marker) };
+  });
+  return { ok: true, hostObservationRequired: true,
+    candidates: rows.filter(row => row.exclusionReason === null),
+    excluded: rows.filter(row => row.exclusionReason !== null) };
+}
+
 function reclaimableCandidate(
   ledger: SessionLedger,
   marker: StandbyMarker,
@@ -942,15 +995,11 @@ function reclaimableCandidate(
 ): { entry: StandbyConversation; owner: { workspaceId: string; task: SavedTaskSession } } | null {
   if (!observations) return null;
   const candidates = ledger.pool.entries.flatMap(entry => {
-    if (entry.status !== "claimed" || entry.marker !== marker) return [];
-    const owner = currentConversationOwner(ledger, entry.conversationId);
-    if (!owner || owner.task.bindingState !== "bound" || owner.task.verificationState !== "ready" || taskIsBusy(owner.task)) return [];
+    if (reclaimExclusion(ledger, entry, marker)) return [];
+    const owner = currentConversationOwner(ledger, entry.conversationId)!;
     return observationAllowsReclaim(entry, owner, observations, nowMs) ? [{ entry, owner }] : [];
   });
-  return candidates.sort((left, right) =>
-    (left.entry.lastUsedAt ?? left.entry.claimedAt ?? left.entry.importedAt).localeCompare(right.entry.lastUsedAt ?? right.entry.claimedAt ?? right.entry.importedAt) ||
-    left.entry.conversationId.localeCompare(right.entry.conversationId)
-  )[0] ?? null;
+  return candidates.sort((left, right) => reclaimOrder(left.entry, right.entry))[0] ?? null;
 }
 
 /**
@@ -962,6 +1011,7 @@ export async function claimStandbyConversation(
   return withWorkspaceLifecycleLock(SESSION_REGISTRY_LOCK_ID, async () => {
     const workspaceId = validateWorkspaceId(input.workspaceId);
     const taskId = validateTaskId(input.taskId);
+    if (input.reclaimObservations !== undefined) validateReclaimObservations(input.reclaimObservations);
     const connectorName = input.connectorName.trim();
     const workspaceName = input.workspaceName.trim();
     if (!connectorName || !workspaceName) throw new Error("standby claim requires connector and workspace names");
@@ -988,8 +1038,11 @@ export async function claimStandbyConversation(
     const now = new Date().toISOString();
     const reclaim = candidate ? null : reclaimableCandidate(ledger, desiredMarker, input.reclaimObservations, Date.parse(now));
     if (!candidate && !reclaim) {
+      if (pool.entries.some(entry => reclaimExclusion(ledger, entry, desiredMarker) === null)) {
+        throw new Error("POOL_OBSERVATION_REQUIRED: run session pool reclaim-candidates --json; read the exact owner task and Chat, then claim with --reclaim-observations-file using fresh idle evidence");
+      }
       const hasCompatibleClaim = pool.entries.some(entry => entry.status === "claimed" && entry.marker === desiredMarker);
-      throw new Error(hasCompatibleClaim ? "POOL_BUSY: no Chat has fresh safe-reclaim evidence; stop for manual handling" : "POOL_EXHAUSTED: no compatible standby Chat is available");
+      throw new Error(hasCompatibleClaim ? "POOL_BUSY: local candidates are blocked; run session pool reclaim-candidates --json for exclusion reasons; do not force takeover" : "POOL_EXHAUSTED: no compatible standby Chat is available");
     }
     candidate = candidate ?? reclaim!.entry;
     const owner = currentConversationOwner(ledger, candidate.conversationId);
@@ -1025,14 +1078,15 @@ export async function claimStandbyConversation(
       ...registry,
       projectUrl: `https://chatgpt.com/g/${candidate.projectId}/project`,
       connectorName,
-      tasks: [...registry.tasks.filter((entry) => entry.taskId !== taskId), task],
+      tasks: [...registry.tasks.filter((entry) => entry.taskId !== taskId &&
+        !(reclaim?.owner.workspaceId === workspaceId && entry.taskId === reclaim.owner.task.taskId)), task],
       // Legacy fake-creation provisions must not participate in standby allocation.
       provisions: registry.provisions.filter((entry) => entry.taskId !== taskId),
       savedAt: now,
     };
     const remainingRegistries = ledger.registries
       .filter((entry) => entry.workspaceId !== workspaceId && entry.workspaceId !== reclaim?.owner.workspaceId);
-    const reclaimedRegistry = reclaim ? {
+    const reclaimedRegistry = reclaim && reclaim.owner.workspaceId !== workspaceId ? {
       ...registryFromLedger(ledger, reclaim.owner.workspaceId),
       tasks: registryFromLedger(ledger, reclaim.owner.workspaceId).tasks.filter(task => task.taskId !== reclaim.owner.task.taskId),
       savedAt: now,

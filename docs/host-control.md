@@ -60,7 +60,26 @@ The ten live pool entries are reusable only when a candidate is locally ready,
 has no pending/accepted/uncertain delivery and no active coordinator lease, and
 has a fresh 60-second host observation proving both task and Chat idle plus a
 clean readback. The CLI accepts that structured observation; it does not pretend
-to call Codex App tools itself. Otherwise `POOL_BUSY` stops for manual handling.
+to call Codex App tools itself. Use `session pool reclaim-candidates --json`
+when unclaimed stock is empty. It returns local candidates in least-recently-used
+order, receipt identities, and exclusion reasons without exposing route tokens.
+`POOL_OBSERVATION_REQUIRED` means a local candidate still needs host proof;
+`POOL_BUSY` means local candidates are blocked. Neither means that all owner tasks
+were observed busy by the host.
+
+For each local candidate, read the exact owner task and exact Chat, verify both
+are idle and the latest user/reply identity matches the candidate's registered
+receipt with no newer request. Immediately pass the complete `ReclaimObservation`
+array through `session pool claim --reclaim-observations-file <UTF-8 JSON path>`.
+The legacy inline option remains supported; the two inputs are mutually exclusive.
+The locked claim rejects stale ownership, epoch, leases, pending states and
+observations older than 60 seconds. If a candidate changes, inspect remaining
+candidates instead of forcing takeover. Missing or failed host reads are not idle
+proof. Exhaustion of this pass must report its actual exclusion/readback reasons.
+
+See the installed Skill's **Mandatory rotation when unclaimed stock is empty**
+for the complete host sequence and JSON example. After rotation, the new owner
+must complete BOOT and workspace verification before task content is sent.
 `session finish` releases the active lease but keeps the same task binding.
 
 `status` and `runtime diagnose` report `workspaceRegistration` independently of

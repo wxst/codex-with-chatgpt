@@ -452,7 +452,7 @@ describe("task-scoped standby session registry", () => {
     expect(readTaskSession("owner-one", "first-task")).toBeNull();
     await expect(claimStandbyConversation({
       workspaceId: "another-owner", taskId: "another-task", connectorName: "C2C", workspaceName: "another", branch: "main",
-    })).rejects.toThrow(/POOL_BUSY/);
+    })).rejects.toThrow(/POOL_OBSERVATION_REQUIRED/);
   });
 
   it("keeps a v3 legacy provision inert and lets the task claim standby inventory", async () => {
