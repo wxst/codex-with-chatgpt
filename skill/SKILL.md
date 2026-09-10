@@ -1,7 +1,7 @@
 ---
 name: codex-with-chatgpt
 description: >
-  Use when a coding task should offload repository exploration, analysis, planning, debugging, and review to ChatGPT while Codex edits, tests, and uses Git.
+  Use for coding tasks needing repository exploration, planning, root-cause analysis, test design, or review: delegate primary reasoning to ChatGPT to save Codex quota while Codex executes.
 ---
 
 # Codex with ChatGPT — Global Router + Standby Pool
@@ -11,6 +11,65 @@ Installed checkout: `__C2C_CHECKOUT__`
 Codex executes. ChatGPT explores, plans, diagnoses, and reviews. ChatGPT reads
 source through the read-only C2C MCP tools; control messages carry only short
 state and identity fields.
+
+## Daily reasoning workflow
+
+Use ChatGPT subscription capacity to reduce Codex quota consumption. ChatGPT is
+the primary reasoning partner throughout the task, including repository exploration,
+design alternatives, root-cause analysis, test design, and review. Codex owns edits,
+commands, tests, Git, necessary judgment, and verification. Do not complete the same deep analysis locally before INIT
+and then use ChatGPT only as a second reviewer.
+
+1. Codex checks the user goal, scope, repository state, applicable instructions,
+   and connection readiness. Follow the operational sections below to resume or
+   acquire the exact task Chat, resolve pending receipts, and reach `ready`.
+   BOOT DONE confirms connectivity only; it does not complete the business task.
+2. Send INIT before substantive exploration or implementation. Give ChatGPT the
+   goal, constraints, success criteria, and evidence locations; let it retrieve
+   current code itself. Do not paste files or precompute the entire answer.
+3. Wait for a matching substantive PLAN containing
+   SOURCE_EVIDENCE, ACTIONS, TESTS, and SUCCESS_CRITERIA. Evidence identifies the
+   relevant files/symbols and observations; actions explain what to do and why.
+   Identity echoes, generic advice, and an unexamined DONE are not a usable plan.
+   For non-exempt tasks, do not edit until this PLAN is received; BLOCKED or ERROR
+   does not authorize implementation. Apply only the routing exceptions below.
+   After confirming a completed reply, request missing analysis in a fresh message.
+4. Codex checks scope, feasibility, and risk, then executes the plan using its
+   own tools. Make necessary targeted checks rather than repeating all exploration.
+   Do not blindly execute a proposal that conflicts with user constraints or evidence.
+5. Send EXECUTED with concise results, failures, and evidence locations. ChatGPT
+   reads current changes and returns the next PLAN, evidence-backed DONE, or
+   BLOCKED with the missing prerequisite. Return complex failures for diagnosis;
+   straightforward mechanical corrections remain with Codex.
+6. Continue until the requested outcome is verified or a real blocker remains.
+   No fixed business-iteration limit applies. DONE still requires Codex to check
+   the agreed success criteria. Complete exact receipts and release the task's
+   coordinator lease with `session finish --use-id <id>` when one exists.
+
+The business sequence is `ready → INIT → PLAN → execution → EXECUTED → PLAN / DONE / BLOCKED`.
+These are message instructions, not new CLI states or an expansion of tool permissions.
+Use the delivery procedure under Normal control loop for every send, including
+follow-up analysis. Review requests retain the exact REVIEW_HEAD contract below.
+
+### Routing exceptions and unavailable channels
+
+- Simple deterministic operations, such as a trivial mechanical typo edit, may
+  run directly only when no repository exploration, design, or diagnosis is needed.
+  Mechanical steps alone do not qualify: a cross-file rename with unresolved
+  impact still needs ChatGPT analysis before execution.
+- With a complete user-supplied plan, ask ChatGPT only for necessary code mapping
+  and gap analysis. Do not force replanning or expand the approved scope. Work
+  already fully specified by the user need not wait for redundant planning.
+- Review-only requests stay review-only. A user prohibition on external sharing
+  takes precedence; do not send prohibited task content.
+- An unavailable channel is not permission to silently perform all reasoning locally.
+  Report the offload blocker and preserve the binding and pending receipts. Continue
+  only independently authorized, fully specified work; if substantial reasoning
+  must move back to Codex, obtain the user's direction. Do not claim ChatGPT analysis
+  or acceptance without an observed substantive reply.
+
+These exceptions do not waive host preflight, receipt readback, binding ownership,
+or the exact REVIEW_HEAD requirement whenever a ChatGPT message is sent.
 
 ## Always use this routing model
 
@@ -454,21 +513,45 @@ advance the iteration or create a second send. A later recovery after an
 explicit terminal host result uses a fresh message id and `begin-send --probe`.
 
 Keep control messages under 1 KB. ChatGPT must retrieve code itself.
+Use separate templates; substitute concise values and check the actual message size.
+The reply may be longer when needed for an actionable plan. SOURCE_EVIDENCE must
+distinguish actual tool observations from assumptions or executor reports.
 
 ```text
 [C2C]
-STATE: INIT | EXECUTED
+STATE: INIT
 TASK_ID: <task-id>
 WORKSPACE_ID: <workspace-id>
 ITERATION: <n>
 MESSAGE_ID: <message-id>
 
 GOAL: <one short task statement>
+CONSTRAINTS: <scope, user decisions, exclusions>
+SUCCESS_CRITERIA: <observable outcome>
 REPOSITORY: <github|gitea|other> <owner/repo> <branch>
 LOCAL_STATE: <clean|local changes|unpushed commits>
 
-Use C2C MCP for current local code, status, diff, and test records. Echo the
-four identity fields. Reply with STATE: PLAN, DONE, BLOCKED, or ERROR.
+Read current code through the read-only tools. Echo the four identity fields.
+Reply STATE: PLAN with SOURCE_EVIDENCE, ACTIONS, TESTS, and SUCCESS_CRITERIA;
+if blocked, report the missing prerequisite instead of inventing evidence.
+```
+
+```text
+[C2C]
+STATE: EXECUTED
+TASK_ID: <task-id>
+WORKSPACE_ID: <workspace-id>
+ITERATION: <n>
+MESSAGE_ID: <message-id>
+
+GOAL: <same agreed outcome>
+RESULTS: <changes, checks, failures; executor-reported>
+EVIDENCE: <current diff, test-record or artifact locations>
+LOCAL_STATE: <clean|local changes|unpushed commits>
+
+Read current evidence through the read-only tools. Echo the four identity fields.
+Return the next substantive PLAN, verified DONE, or BLOCKED with prerequisites.
+Separate independent observations from executor reports.
 ```
 
 ## ChatGPT read-source order

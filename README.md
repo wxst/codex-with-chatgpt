@@ -2,11 +2,35 @@
 
 [简体中文](README.zh-CN.md)
 
-> ChatGPT plans and reviews. Codex edits, runs commands, tests, and fixes.
+> ChatGPT explores, plans, diagnoses, and reviews. Codex executes and verifies.
 
 This fork keeps ChatGPT planning inside the unified Codex App while hardening the local
 Bridge, credential lifecycle, process shutdown, dependency policy, and upstream
 update path. The ChatGPT-facing MCP surface is read-only.
+
+## Daily use: delegate reasoning first
+
+Use ChatGPT subscription capacity to reduce Codex quota spent on repository
+exploration, design alternatives, root-cause analysis, test design, and review.
+Codex checks scope and connection readiness, then delegates substantive analysis
+before implementing; it retains execution ownership and necessary judgment.
+
+Follow `ready → INIT → PLAN → execution → EXECUTED → PLAN / DONE / BLOCKED`.
+BOOT DONE proves connection readiness only. A useful PLAN gives source evidence,
+actions, tests, and success criteria. Codex executes it and sends concise results
+and evidence locations back for the next analysis or review, without repeating
+the entire investigation locally. The [Skill](skill/SKILL.md#daily-reasoning-workflow)
+contains the INIT and EXECUTED templates and exact delivery procedure.
+
+Simple deterministic work (for example, a trivial typo edit) can run directly only
+when no exploration, design, or diagnosis is needed. A mechanical cross-file rename
+with unresolved impact still needs analysis. For a complete user plan, request only
+necessary code mapping and gap analysis; review-only requests remain review-only.
+Respect restrictions on external sharing. An unavailable channel preserves the
+binding and receipts and is reported as an offload blocker, not implicit permission
+to move all reasoning to Codex. Already specified, independently authorized work
+can continue. Neither a BOOT receipt nor a keyword test proves reasoning delegation
+or a measured quota saving.
 
 ## Installation-trial scope
 

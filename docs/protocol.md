@@ -1,5 +1,37 @@
 # C2C Agent Protocol
 
+## Business reasoning loop
+
+ChatGPT performs primary repository exploration, planning, root-cause analysis,
+test design, and review using read-only source access. This uses ChatGPT subscription
+capacity to reduce repeated reasoning in Codex. Codex owns execution, necessary
+judgment, and verification; it checks scope and readiness before requesting analysis.
+
+`ready → INIT → PLAN → execution → EXECUTED → PLAN / DONE / BLOCKED`
+
+INIT supplies the goal, constraints, and success criteria. ChatGPT retrieves code
+and returns a substantive PLAN with SOURCE_EVIDENCE, ACTIONS, TESTS, and
+SUCCESS_CRITERIA. Codex checks and executes that plan, then sends EXECUTED with
+results and evidence locations. Complex failures return to ChatGPT for diagnosis;
+Codex does not repeat the entire investigation. An identity echo or generic advice
+does not satisfy PLAN. BOOT DONE confirms connectivity only, not business completion.
+Business DONE requires evidence for the agreed outcome, checked by Codex. There is
+no fixed business-iteration cap. All messages retain the delivery and identity
+requirements below; these instructions introduce no new CLI or ledger states.
+
+Simple deterministic operations, such as a trivial typo edit, can run directly only
+when no exploration, design, or diagnosis is needed. Mechanical cross-file changes
+with unresolved impact still require analysis. Complete user plans need only
+necessary code mapping and gap analysis, not forced replanning. Review-only work
+stays review-only, and user restrictions on external sharing take precedence.
+An unavailable channel is an offload blocker: preserve binding and receipts, do
+not claim analysis occurred, and do not silently move all reasoning to Codex.
+Only independently authorized, fully specified work may continue without it.
+
+See the [Skill templates](../skill/SKILL.md#normal-control-loop). Documentation
+tests prove instruction presence; real acceptance requires observed source reads,
+a substantive response, exact same-Chat receipts, and normal lease release.
+
 Control plane: Codex App background tools `list_threads → read_thread →
 send_message_to_thread`.
 
