@@ -48,7 +48,10 @@ const DEFAULT_HEARTBEAT_MS = 1_000;
 const TICKET_SUFFIX = ".ticket.json";
 const WINDOWS_RENAME_RETRY_DELAYS_MS = [2, 4, 8, 16, 32, 64] as const;
 const WINDOWS_TRANSIENT_RENAME_CODES = new Set(["EACCES", "EBUSY", "EPERM"]);
+const TICKET_READ_RETRY_LIMIT = 8;
 const activeLifecycleOwners = new Map<string, ActiveLifecycleOwner>();
+
+class LifecycleTicketChangedError extends Error {}
 
 function normalizedStateRoot(value: string): string {
   const resolved = path.resolve(value);
@@ -196,7 +199,7 @@ function sameTicketIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolea
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-function readTicketEntry(file: string): TicketEntry | null {
+function readTicketEntryOnce(file: string): TicketEntry | null {
   let before: fs.BigIntStats;
   try {
     before = fs.lstatSync(file, { bigint: true });
@@ -226,8 +229,24 @@ function readTicketEntry(file: string): TicketEntry | null {
   let content: string;
   try {
     const opened = fs.fstatSync(descriptor, { bigint: true });
-    if (!opened.isFile() || opened.nlink !== 1n || !sameTicketIdentity(before, opened)) {
-      throw new Error(`Lifecycle ticket changed while it was being opened: ${file}`);
+    if (!opened.isFile() || opened.nlink !== 1n) {
+      throw new Error(`Lifecycle ticket path is not a private regular file: ${file}`);
+    }
+    if (!sameTicketIdentity(before, opened)) {
+      let current: fs.BigIntStats;
+      try {
+        current = fs.lstatSync(file, { bigint: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      }
+      if (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1n) {
+        throw new Error(`Lifecycle ticket path is not a private regular file: ${file}`);
+      }
+      if (!sameTicketIdentity(opened, current)) {
+        throw new Error(`Lifecycle ticket changed while it was being opened: ${file}`);
+      }
+      throw new LifecycleTicketChangedError(`Lifecycle ticket changed while it was being opened: ${file}`);
     }
     content = fs.readFileSync(descriptor, "utf8");
   } finally {
@@ -241,19 +260,33 @@ function readTicketEntry(file: string): TicketEntry | null {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
-  if (
-    current.isSymbolicLink() ||
-    !current.isFile() ||
-    current.nlink !== 1n ||
-    !sameTicketIdentity(before, current)
-  ) {
-    throw new Error(`Lifecycle ticket changed while it was being inspected: ${file}`);
+  if (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1n) {
+    throw new Error(`Lifecycle ticket path is not a private regular file: ${file}`);
+  }
+  if (!sameTicketIdentity(before, current)) {
+    throw new LifecycleTicketChangedError(`Lifecycle ticket changed while it was being inspected: ${file}`);
   }
   return {
     file,
     mtimeMs: Number(current.mtimeMs),
     ticket: parseWorkspaceLifecycleTicket(content),
   };
+}
+
+function readTicketEntry(file: string): TicketEntry | null {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return readTicketEntryOnce(file);
+    } catch (error) {
+      // Ticket owners publish state changes with an atomic rename. A scanner can
+      // therefore open the previous inode just as the new inode becomes current.
+      // Re-read the same path from lstat instead of skipping the contender. A
+      // path that keeps changing still fails closed after the bounded retries.
+      if (!(error instanceof LifecycleTicketChangedError) || attempt >= TICKET_READ_RETRY_LIMIT) {
+        throw error;
+      }
+    }
+  }
 }
 
 function listTicketsInDirectory(workspaceId: string, dir: string): TicketEntry[] {

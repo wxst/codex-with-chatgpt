@@ -129,6 +129,81 @@ describe("workspace lifecycle serialization", () => {
     expect(attempts).toBe(1);
   });
 
+  it("re-reads a ticket after one concurrent atomic replacement without skipping it", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-concurrent-ticket-refresh");
+    const realOpen = fs.openSync.bind(fs) as typeof fs.openSync;
+    let reboundOnce = false;
+    const open = vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode) => {
+      if (!reboundOnce && typeof target === "string" && target.endsWith(".ticket.json")) {
+        reboundOnce = true;
+        const replacement = `${target}.replacement`;
+        fs.writeFileSync(replacement, fs.readFileSync(target), { mode: 0o600 });
+        fs.renameSync(replacement, target);
+      }
+      return realOpen(target, flags, mode);
+    }) as typeof fs.openSync);
+
+    try {
+      const held = await acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 });
+      expect(reboundOnce).toBe(true);
+      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, held.nonce)).toBe(true);
+      held.release();
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  it("fails closed when a ticket identity keeps changing during bounded re-reads", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-persistent-ticket-rebind");
+    const realFstat = fs.fstatSync.bind(fs);
+    const realLstat = fs.lstatSync.bind(fs);
+    let attempts = 0;
+    let lstats = 0;
+    const fstat = vi.spyOn(fs, "fstatSync").mockImplementation(((descriptor, options) => {
+      const stat = realFstat(descriptor, options as { bigint: true }) as fs.BigIntStats;
+      attempts += 1;
+      return { ...stat, ino: stat.ino + 1n, isFile: () => true } as fs.BigIntStats;
+    }) as typeof fs.fstatSync);
+    const lstat = vi.spyOn(fs, "lstatSync").mockImplementation(((target, options) => {
+      const stat = realLstat(target, options as { bigint: true }) as fs.BigIntStats;
+      lstats += 1;
+      return lstats % 2 === 0
+        ? { ...stat, ino: stat.ino + 1n, isFile: () => true, isSymbolicLink: () => false } as fs.BigIntStats
+        : stat;
+    }) as typeof fs.lstatSync);
+
+    try {
+      await expect(acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 }))
+        .rejects.toThrow(/changed while it was being (?:opened|inspected)/);
+      expect(attempts).toBe(9);
+    } finally {
+      lstat.mockRestore();
+      fstat.mockRestore();
+    }
+  });
+
+  it("does not retry an unsafe opened ticket descriptor", async () => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-ticket-hardlink-descriptor");
+    const realFstat = fs.fstatSync.bind(fs);
+    let attempts = 0;
+    const fstat = vi.spyOn(fs, "fstatSync").mockImplementation(((descriptor, options) => {
+      const stat = realFstat(descriptor, options as { bigint: true }) as fs.BigIntStats;
+      attempts += 1;
+      return attempts === 1 ? { ...stat, nlink: 2n, isFile: () => true } as fs.BigIntStats : stat;
+    }) as typeof fs.fstatSync);
+
+    try {
+      await expect(acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 }))
+        .rejects.toThrow(/private regular file/);
+      expect(attempts).toBe(1);
+    } finally {
+      fstat.mockRestore();
+    }
+  });
+
   it("blocks revocation while the same workspace lifecycle lock is held", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("lifecycle-revoke");
