@@ -5,6 +5,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { startWorkspaceRouter, type WorkspaceRouterBridge } from "../src/router/server.js";
 import { createWorkspaceRouter, issueRouteCapability } from "../src/router/state.js";
 import {
+  recordTaskHostControl,
   attachTaskRouteCapability,
   beginTaskSend,
   claimStandbyConversation,
@@ -180,7 +181,14 @@ describe("router MCP capability boundary", () => {
     const info = result.structuredContent as { workspaceId: string; routeTaskId: string; workspaceName: string; git: { branch: string | null } };
     expect(info).toMatchObject({ workspaceId: beta.workspaceId, routeTaskId: "alpha-task", workspaceName: path.basename(betaRoot) });
     const bootId = newMessageId();
-    await beginTaskSend(beta.workspaceId, "alpha-task", bootId, moved.iteration, { bootstrap: true });
+    await recordTaskHostControl(beta.workspaceId, "alpha-task", { result: "probe", tools: ["read_thread", "send_message_to_thread"] });
+    await recordTaskHostControl(beta.workspaceId, "alpha-task", { result: "migration-read-ok", migrationObservation: {
+      taskId: "alpha-task", conversationId: old.conversationId, fromWorkspaceId: alpha.workspaceId, toWorkspaceId: beta.workspaceId,
+      generation: moved.generation, assignmentEpoch: moved.migrationHandshake!.assignmentEpoch, iteration: old.iteration,
+      messageId: old.lastDeliveredMessageId!, state: old.lastState!, reviewHead: old.lastReviewHead,
+      chatReadAt: new Date().toISOString(), chatStatus: "idle", readbackClean: true,
+    } });
+    await beginTaskSend(beta.workspaceId, "alpha-task", bootId, moved.iteration + 1, { bootstrap: true, expectedGeneration: moved.generation });
     await confirmTaskDelivery(beta.workspaceId, "alpha-task", bootId);
     await confirmTaskReply(beta.workspaceId, "alpha-task", bootId, "DONE");
     const ready = await confirmTaskWorkspace(beta.workspaceId, "alpha-task", {

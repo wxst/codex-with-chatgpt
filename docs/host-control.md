@@ -58,29 +58,52 @@ change the task id, or claim another Chat to work around the path change.
 
 The ten live pool entries are reusable only when a candidate is locally ready,
 has no pending/accepted/uncertain delivery and no active coordinator lease, and
-has a fresh 60-second host observation proving both task and Chat idle plus a
-clean readback. The CLI accepts that structured observation; it does not pretend
-to call Codex App tools itself. Use `session pool reclaim-candidates --json`
-when unclaimed stock is empty. It returns local candidates in least-recently-used
-order, receipt identities, and exclusion reasons without exposing route tokens.
-`POOL_OBSERVATION_REQUIRED` means a local candidate still needs host proof;
-`POOL_BUSY` means local candidates are blocked. Neither means that all owner tasks
-were observed busy by the host.
+has a fresh 60-second host observation proving an idle owner task or a fully
+corroborated `notLoaded` owner task, plus an idle exact Chat and clean readback.
+A bare `notLoaded` result is insufficient. The CLI accepts that structured
+observation; it does not pretend to call Codex App tools itself. Use `session pool
+reclaim-candidates --json` when unclaimed stock is empty. It returns local
+candidates in least-recently-used order, receipt identities, and exclusion reasons
+without exposing route tokens. `POOL_OBSERVATION_REQUIRED` means a local candidate
+still needs host proof; `POOL_BUSY` means local candidates are blocked. Neither
+means that all owner tasks were observed busy by the host.
 
-For each local candidate, read the exact owner task and exact Chat, verify both
-are idle and the latest user/reply identity matches the candidate's registered
-receipt with no newer request. Immediately pass the complete `ReclaimObservation`
-array through `session pool claim --reclaim-observations-file <UTF-8 JSON path>`.
-The legacy inline option remains supported; the two inputs are mutually exclusive.
-The locked claim rejects stale ownership, epoch, leases, pending states and
-observations older than 60 seconds. If a candidate changes, inspect remaining
-candidates instead of forcing takeover. Missing or failed host reads are not idle
-proof. Exhaustion of this pass must report its actual exclusion/readback reasons.
+For each local candidate, read the exact owner task and exact Chat. When the task
+reads `notLoaded`, take a same-host immediate `wait_threads(timeoutMs: 0)`
+snapshot and require `inactiveStatus` with a completed latest turn; then, after the
+Chat receipt check, take one more same-host snapshot with the same completed turn.
+Record each read timestamp, host id, turn id/status, and the receipt fields shown
+by the Chat. Immediately pass the complete `ReclaimObservation` array through
+`session pool claim --reclaim-observations-file <UTF-8 JSON path>`. The legacy
+inline option remains supported; the two inputs are mutually exclusive. The locked
+claim rejects stale ownership, epoch, leases, pending states, changed receipt, or
+any individual read older than 60 seconds. If a candidate changes, inspect
+remaining candidates instead of forcing takeover; refresh only expired evidence
+once. Missing or failed host reads are not idle proof. Exhaustion of this pass must
+report every actual exclusion/readback reason.
 
 See the installed Skill's **Mandatory rotation when unclaimed stock is empty**
 for the complete host sequence and JSON example. After rotation, the new owner
 must complete BOOT and workspace verification before task content is sent.
 `session finish` releases the active lease but keeps the same task binding.
+
+BOOT carries no `REVIEW_HEAD`; the CLI rejects that combination. If an older
+client already left a delivered BOOT with an erroneous pending review head, read
+the exact existing request and reply and run the normal receipt commands. Matching
+BOOT identity automatically reconciles the reply and discards the erroneous head,
+after which actual `workspace_info` is still required. Do not resend it or ask
+the user to authorize C2C-internal recovery.
+
+The coordinator automatically checks every LRU candidate before reporting pool
+exhaustion; it never asks the user for additional standby Chats. A prior owner's
+binding alone is not a busy condition. ChatGPT sends/readbacks use the exact
+conversation id without `hostId`; only Codex owner reads use host routing.
+After `no rollout found`, check this distinction before classifying the Chat.
+If a correctly routed send is explicitly rejected and the current Chat is idle
+with no unresolved receipt, use `pool claim --recover-bound-file` together with
+the first safe candidate's observations. See the Skill for the exact JSON and
+commands. This retains the fixed inventory and archives old receipts; it does not
+authorize taking busy Chats or replacing a binding after an uncertain send.
 
 `status` and `runtime diagnose` report `workspaceRegistration` independently of
 the global anchor's health. Unregistered/revoked workspaces return
@@ -94,3 +117,13 @@ Malformed, unreadable or duplicate Router registrations stop diagnostics and
 repair with `router_state_invalid` or `router_state_unavailable`; they cannot
 select legacy mode. `runtime diagnose` top-level `ok` also requires the selected
 runtime to be available, running, healthy, ready, non-stale and free of errors.
+
+### Migrated workspace
+
+An old-workspace receipt is valid historical evidence, not proof of the new
+workspace. Use `migration-read-ok --observation-file` after tool probe and exact
+Chat read. `migration_boot_ready` is limited to new BOOT, is consumed by reservation,
+and requires current expected generation. Finish normal delivery/reply readback
+and actual workspace_info confirmation before business messages. Never report an
+expected new workspace ID as observed in an old message. Preserve unresolved
+sends; migration does not waive receipt or lease protection.

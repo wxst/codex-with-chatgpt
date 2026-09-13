@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { beginTaskSend, claimStandbyConversation, confirmTaskDelivery, confirmTaskReply,
-  confirmTaskSendAccepted, importStandbyConversation, newMessageId, readTaskSession,
+  confirmTaskSendAccepted, confirmTaskWorkspace, importStandbyConversation, newMessageId, readTaskSession,
   recordTaskHostControl, readStandbyPool, recordTaskReadResult, failTaskDelivery, sessionLedgerFile } from "../src/session/state.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
 
@@ -83,9 +83,41 @@ it.each(["conversation_gone", "identity_mismatch"])("handles terminal %s while d
     .toBe(kind === "conversation_gone" ? "unavailable" : "quarantined");
 });
 
-it("rejects a reply for an old HEAD even with current receipt identity", async () => {
+it("forbids REVIEW_HEAD on new BOOT reservations", async () => {
+  await expect(beginTaskSend(w, t, newMessageId(), 0, {
+    bootstrap: true, reviewHead: "a".repeat(40),
+  })).rejects.toThrow(/BOOT_REVIEW_HEAD_FORBIDDEN/);
+  expect(readTaskSession(w, t)?.pendingMessageId).toBeUndefined();
+});
+
+it("reconciles a delivered legacy malformed BOOT without inventing a review receipt", async () => {
+  const id = newMessageId();
+  await beginTaskSend(w, t, id, 0, { bootstrap: true });
+  const file = sessionLedgerFile();
+  const ledger = JSON.parse(fs.readFileSync(file, "utf8"));
+  ledger.registries[0].tasks[0].lastReviewHead = "c".repeat(40);
+  ledger.registries[0].tasks[0].pendingReviewHead = "a".repeat(40);
+  fs.writeFileSync(file, JSON.stringify(ledger));
+
+  await confirmTaskDelivery(w, t, id);
+  await expect(confirmTaskReply(w, t, id, "DONE", "b".repeat(40))).rejects.toThrow(/HEAD/);
+  expect(readTaskSession(w, t)?.pendingMessageId).toBe(id);
+  const task = await confirmTaskReply(w, t, id, "DONE");
+  expect(task.pendingMessageId).toBeUndefined();
+  expect(task.pendingReviewHead).toBeUndefined();
+  expect(task.lastReviewHead).toBe("c".repeat(40));
+  expect(task.verificationState).toBe("pending");
+});
+
+it("rejects a reply for an old HEAD on a normal review message", async () => {
+  const bootId = newMessageId();
+  await beginTaskSend(w, t, bootId, 0, { bootstrap: true });
+  await confirmTaskDelivery(w, t, bootId);
+  await confirmTaskReply(w, t, bootId, "DONE");
+  await confirmTaskWorkspace(w, t, { workspaceId: w, routeTaskId: t, workspaceName: "repo", branch: "main" });
+
   const id = newMessageId(), head = "a".repeat(40);
-  await beginTaskSend(w, t, id, 0, { bootstrap: true, reviewHead: head });
+  await beginTaskSend(w, t, id, 1, { reviewHead: head });
   await confirmTaskDelivery(w, t, id);
   await expect(confirmTaskReply(w, t, id, "DONE")).rejects.toThrow(/HEAD/);
   await expect(confirmTaskReply(w, t, id, "DONE", "b".repeat(40))).rejects.toThrow(/HEAD/);

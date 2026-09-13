@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  recordTaskHostControl,
   beginTaskSend,
   clearTaskSession,
   deliveryReadbackPhase,
@@ -385,6 +386,10 @@ describe("task-scoped standby session registry", () => {
   it("switches an idle task binding atomically and refuses a pending one", async () => {
     reset();
     const claimed = await claimedTask("old-workspace", "same-task");
+    const sourceBoot = newMessageId();
+    await beginTaskSend("old-workspace", "same-task", sourceBoot, 0, { bootstrap: true });
+    await confirmTaskDelivery("old-workspace", "same-task", sourceBoot);
+    await confirmTaskReply("old-workspace", "same-task", sourceBoot, "DONE");
     const switched = await switchTaskWorkspace({
       taskId: "same-task", fromWorkspaceId: "old-workspace", toWorkspaceId: "new-workspace",
       expectedGeneration: claimed.task.generation, connectorName: "C2C Router", workspaceName: "new-repo", branch: "main",
@@ -394,7 +399,13 @@ describe("task-scoped standby session registry", () => {
     expect(resolveTaskBinding("new-workspace", "same-task").resolution).toBe("exact");
 
     const boot = newMessageId();
-    await beginTaskSend("new-workspace", "same-task", boot, 0, { bootstrap: true });
+    await recordTaskHostControl("new-workspace", "same-task", { result: "probe", tools: ["read_thread", "send_message_to_thread"] });
+    await recordTaskHostControl("new-workspace", "same-task", { result: "migration-read-ok", migrationObservation: {
+      taskId: "same-task", conversationId: switched.conversationId, fromWorkspaceId: "old-workspace", toWorkspaceId: "new-workspace",
+      generation: switched.generation, assignmentEpoch: switched.migrationHandshake!.assignmentEpoch,
+      iteration: 0, messageId: sourceBoot, state: "DONE", chatReadAt: new Date().toISOString(), chatStatus: "idle", readbackClean: true,
+    } });
+    await beginTaskSend("new-workspace", "same-task", boot, 1, { bootstrap: true, expectedGeneration: switched.generation });
     await expect(switchTaskWorkspace({
       taskId: "same-task", fromWorkspaceId: "new-workspace", toWorkspaceId: "third-workspace",
       expectedGeneration: switched.generation, connectorName: "C2C Router", workspaceName: "third", branch: "main",

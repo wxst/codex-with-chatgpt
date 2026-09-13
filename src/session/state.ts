@@ -13,18 +13,50 @@ export type ChannelState = "ready" | "sending" | "delivered" | "awaiting_reply" 
 export type DeliveryFailureKind = "host_rejected" | "conversation_gone" | "identity_mismatch";
 
 export interface HostControlState {
-  status: "tools_missing" | "readback_required" | "ready" | "call_timeout" | "call_failed" | "not_invoked";
+  status: "tools_missing" | "readback_required" | "migration_boot_ready" | "ready" | "call_timeout" | "call_failed" | "not_invoked";
   missingTools: string[];
   checkedAt: string;
 }
 
 export interface HostControlObservation {
-  result: "probe" | "read-ok" | "timeout" | "call-failed" | "not-invoked";
+  result: "migration-read-ok" | "probe" | "read-ok" | "timeout" | "call-failed" | "not-invoked";
+  migrationObservation?: MigrationReadObservation;
   tools?: string[];
   conversationId?: string;
   observedTaskId?: string;
   observedWorkspaceId?: string;
   messageId?: string;
+}
+
+export interface MigrationHandshake {
+  id: string;
+  fromWorkspaceId: string;
+  toWorkspaceId: string;
+  taskId: string;
+  conversationId: string;
+  fromGeneration: number;
+  toGeneration: number;
+  assignmentEpoch: number;
+  receipt: { iteration: number; messageId: string | null; state: string | null; reviewHead?: string };
+  bootMessageId?: string;
+  completedAt?: string;
+}
+
+export interface MigrationReadObservation {
+  taskId: string;
+  conversationId: string;
+  fromWorkspaceId: string;
+  toWorkspaceId: string;
+  generation: number;
+  assignmentEpoch: number;
+  iteration: number;
+  messageId: string | null;
+  state: string | null;
+  reviewHead?: string;
+  chatReadAt: string;
+  chatStatus: "idle";
+  readbackClean: true;
+  useId?: string;
 }
 
 export interface LegacySavedSession {
@@ -70,6 +102,7 @@ export interface SavedTaskSession {
   verificationState: VerificationState;
   channelState: ChannelState;
   hostControl?: HostControlState;
+  migrationHandshake?: MigrationHandshake;
   pendingMessageId?: string;
   pendingIteration?: number;
   /** Sticky until this message is resolved; a timed-out call may have sent it. */
@@ -247,7 +280,13 @@ export interface AssignmentHistoryEntry {
   taskId: string;
   generation: number;
   recordedAt: string;
-  reason: "workspace_switch" | "pool_reclaimed";
+  reason: "workspace_switch" | "pool_reclaimed" | "binding_recovered";
+  toWorkspaceId?: string;
+  toTaskId?: string;
+  toConversationId?: string;
+  assignmentEpoch?: number;
+  /** Audit snapshot retains receipts after the previous current owner is removed. */
+  snapshot?: SavedTaskSession;
 }
 
 export type TaskBindingResolution = "exact" | "workspace_switch_required" | "unbound" | "ambiguous";
@@ -289,19 +328,79 @@ export interface ClaimStandbyConversationOptions {
   branch: string | null;
   userExplicitPro?: boolean;
   reclaimObservations?: ReclaimObservation[];
+  recoveryObservation?: BoundRecoveryObservation;
 }
 
-export interface ReclaimObservation {
+export interface BoundRecoveryObservation {
+  taskId: string;
+  workspaceId: string;
+  conversationId: string;
+  generation: number;
+  useId?: string;
+  failureCheckedAt: string;
+  routingCheckedAt: string;
+  chatReadAt: string;
+  observedAt: string;
+  hostRoutingChecked: true;
+  routingMode: "conversation_id_only";
+  chatStatus: "idle";
+  readbackClean: true;
+  receiptIteration: number;
+  receiptMessageId: string | null;
+  receiptState: string | null;
+  receiptReviewHead?: string;
+  reason: "host_rejected";
+}
+
+interface ReclaimObservationIdentity {
   conversationId: string;
   workspaceId: string;
   taskId: string;
   generation: number;
   assignmentEpoch: number;
   observedAt: string;
-  taskStatus: "idle";
   chatStatus: "idle";
   readbackClean: true;
 }
+
+/** The original explicit-idle observation remains supported for existing callers. */
+export interface IdleReclaimObservation extends ReclaimObservationIdentity {
+  taskStatus: "idle";
+}
+
+/**
+ * A `read_thread` notLoaded result is reclaimable only with a same-host
+ * inactive snapshot, a completed unchanged turn, and a clean exact Chat
+ * receipt. These fields are host evidence; the ledger still rechecks local
+ * ownership, leases, pending state, and the registered receipt while locked.
+ */
+export interface NotLoadedReclaimObservation extends ReclaimObservationIdentity {
+  taskStatus: "notLoaded";
+  taskReadTaskId: string;
+  snapshotTaskId: string;
+  recheckTaskId: string;
+  taskReadLatestTurnId: string;
+  taskReadLatestTurnStatus: "completed";
+  taskReadHostId: string;
+  snapshotHostId: string;
+  snapshotStatus: "inactiveStatus";
+  latestTurnId: string;
+  latestTurnStatus: "completed";
+  taskReadAt: string;
+  snapshotReadAt: string;
+  chatReadAt: string;
+  recheckHostId: string;
+  recheckSnapshotStatus: "inactiveStatus";
+  recheckLatestTurnId: string;
+  recheckLatestTurnStatus: "completed";
+  recheckReadAt: string;
+  receiptIteration: number;
+  receiptMessageId: string;
+  receiptState: string;
+  receiptReviewHead?: string;
+}
+
+export type ReclaimObservation = IdleReclaimObservation | NotLoadedReclaimObservation;
 
 export interface StandbyClaimResult {
   task: SavedTaskSession;
@@ -508,13 +607,26 @@ function isRegistry(value: unknown): value is SessionRegistry {
 
 function normalizeRegistry(registry: SessionRegistry): SessionRegistry {
   for (const task of registry.tasks) {
+    const m = task.migrationHandshake;
+    if (m !== undefined && (!m || typeof m !== "object" || typeof m.id !== "string" || !m.id.startsWith("c2c_migration_") ||
+      m.taskId !== task.taskId || m.conversationId !== task.conversationId || m.toWorkspaceId !== registry.workspaceId ||
+      !Number.isSafeInteger(m.fromGeneration) || m.fromGeneration < 1 || m.toGeneration !== task.generation ||
+      m.fromGeneration >= m.toGeneration || !Number.isSafeInteger(m.assignmentEpoch) || m.assignmentEpoch < 1 ||
+      typeof m.fromWorkspaceId !== "string" || !m.fromWorkspaceId || !m.receipt ||
+      !Number.isSafeInteger(m.receipt.iteration) || m.receipt.iteration < 0 ||
+      (m.receipt.messageId !== null && (typeof m.receipt.messageId !== "string" || !m.receipt.messageId)) ||
+      (m.receipt.state !== null && !["DONE", "PLAN", "BLOCKED", "ERROR"].includes(m.receipt.state)) ||
+      ((m.receipt.messageId === null) !== (m.receipt.state === null)) ||
+      (m.receipt.reviewHead !== undefined && (typeof m.receipt.reviewHead !== "string" || !/^[0-9a-f]{40}$/u.test(m.receipt.reviewHead))) ||
+      (m.bootMessageId !== undefined && typeof m.bootMessageId !== "string") ||
+      (m.completedAt !== undefined && !isValidReclaimTimestamp(m.completedAt)))) throw new Error("MIGRATION_STATE_INVALID");
     const host = task.hostControl;
     if (host !== undefined && (!host || typeof host !== "object" ||
-      !["tools_missing", "readback_required", "ready", "call_timeout", "call_failed", "not_invoked"].includes(host.status) ||
+      !["tools_missing", "readback_required", "migration_boot_ready", "ready", "call_timeout", "call_failed", "not_invoked"].includes(host.status) ||
       !Array.isArray(host.missingTools) || host.missingTools.some(x => !["read_thread", "send_message_to_thread"].includes(x)) ||
       new Set(host.missingTools).size !== host.missingTools.length ||
       (host.status === "tools_missing" && host.missingTools.length === 0) ||
-      (["ready", "readback_required"].includes(host.status) && host.missingTools.length !== 0) ||
+      (["ready", "migration_boot_ready", "readback_required"].includes(host.status) && host.missingTools.length !== 0) ||
       typeof host.checkedAt !== "string" || !Number.isFinite(Date.parse(host.checkedAt)))) {
       throw new Error("HOST_CONTROL_STATE_INVALID");
     }
@@ -929,26 +1041,119 @@ function observationAllowsReclaim(
   const observation = observations.find(item => item.conversationId === entry.conversationId);
   if (!observation || observation.workspaceId !== owner.workspaceId || observation.taskId !== owner.task.taskId ||
     observation.generation !== owner.task.generation || observation.assignmentEpoch !== (entry.assignmentEpoch ?? 0) ||
-    observation.taskStatus !== "idle" || observation.chatStatus !== "idle" || observation.readbackClean !== true) return false;
-  const observedAt = Date.parse(observation.observedAt);
-  return Number.isFinite(observedAt) && observedAt <= nowMs && nowMs - observedAt <= 60_000;
+    observation.chatStatus !== "idle" || observation.readbackClean !== true || !isFreshReclaimTimestamp(observation.observedAt, nowMs)) return false;
+  if (observation.taskStatus === "idle") return true;
+  return observation.taskReadHostId === observation.snapshotHostId &&
+    observation.snapshotHostId === observation.recheckHostId &&
+    observation.snapshotStatus === "inactiveStatus" && observation.recheckSnapshotStatus === "inactiveStatus" &&
+    observation.latestTurnStatus === "completed" && observation.recheckLatestTurnStatus === "completed" &&
+    observation.latestTurnId === observation.recheckLatestTurnId &&
+    observation.receiptIteration === owner.task.iteration &&
+    observation.receiptMessageId === owner.task.lastDeliveredMessageId &&
+    observation.receiptState === owner.task.lastState &&
+    observation.receiptReviewHead === owner.task.lastReviewHead &&
+    [observation.taskReadAt, observation.snapshotReadAt, observation.chatReadAt, observation.recheckReadAt]
+      .every(timestamp => isFreshReclaimTimestamp(timestamp, nowMs)) &&
+    Date.parse(observation.taskReadAt) <= Date.parse(observation.snapshotReadAt) &&
+    Date.parse(observation.snapshotReadAt) <= Date.parse(observation.chatReadAt) &&
+    Date.parse(observation.chatReadAt) <= Date.parse(observation.recheckReadAt) &&
+    Date.parse(observation.recheckReadAt) <= Date.parse(observation.observedAt);
+}
+
+function isExactNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim() === value && value.length > 0;
+}
+
+function isValidReclaimTimestamp(value: unknown): value is string {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value) &&
+    Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+}
+
+function isFreshReclaimTimestamp(value: string, nowMs: number): boolean {
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && timestamp <= nowMs && nowMs - timestamp <= 60_000;
+}
+
+function hasValidReclaimIdentity(item: Record<string, unknown>): boolean {
+  return [item.conversationId, item.workspaceId, item.taskId].every(isExactNonEmptyString) &&
+    Number.isSafeInteger(item.generation) && (item.generation as number) >= 1 &&
+    Number.isSafeInteger(item.assignmentEpoch) && (item.assignmentEpoch as number) >= 0 &&
+    isValidReclaimTimestamp(item.observedAt) && item.chatStatus === "idle" && item.readbackClean === true;
+}
+
+function isValidNotLoadedObservation(item: Record<string, unknown>): boolean {
+  return item.taskStatus === "notLoaded" &&
+    item.taskReadTaskId === item.taskId && item.snapshotTaskId === item.taskId && item.recheckTaskId === item.taskId &&
+    item.taskReadLatestTurnId === item.latestTurnId && item.taskReadLatestTurnStatus === "completed" &&
+    [item.taskReadHostId, item.snapshotHostId, item.recheckHostId, item.latestTurnId,
+      item.recheckLatestTurnId, item.receiptMessageId, item.receiptState].every(isExactNonEmptyString) &&
+    item.taskReadHostId === item.snapshotHostId && item.snapshotHostId === item.recheckHostId &&
+    item.snapshotStatus === "inactiveStatus" && item.recheckSnapshotStatus === "inactiveStatus" &&
+    item.latestTurnStatus === "completed" && item.recheckLatestTurnStatus === "completed" &&
+    item.latestTurnId === item.recheckLatestTurnId &&
+    [item.taskReadAt, item.snapshotReadAt, item.chatReadAt, item.recheckReadAt].every(isValidReclaimTimestamp) &&
+    Number.isSafeInteger(item.receiptIteration) && (item.receiptIteration as number) >= 0 &&
+    (item.receiptReviewHead === undefined || isExactNonEmptyString(item.receiptReviewHead));
 }
 
 export function validateReclaimObservations(value: unknown): ReclaimObservation[] {
   if (!Array.isArray(value)) throw new Error("RECLAIM_OBSERVATIONS_INVALID: expected an array");
   const seen = new Set<string>();
   for (const item of value) {
-    if (!item || typeof item !== "object" ||
-      ![item.conversationId, item.workspaceId, item.taskId].every(v => typeof v === "string" && v.trim() === v && v.length > 0) ||
-      !Number.isSafeInteger(item.generation) || item.generation < 1 ||
-      !Number.isSafeInteger(item.assignmentEpoch) || item.assignmentEpoch < 0 ||
-      typeof item.observedAt !== "string" || !Number.isFinite(Date.parse(item.observedAt)) ||
-      item.taskStatus !== "idle" || item.chatStatus !== "idle" || item.readbackClean !== true || seen.has(item.conversationId)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
       throw new Error("RECLAIM_OBSERVATIONS_INVALID: use complete unique observations from exact host readback");
     }
-    seen.add(item.conversationId);
+    const observation = item as Record<string, unknown>;
+    const validStatus = observation.taskStatus === "idle" || isValidNotLoadedObservation(observation);
+    if (!hasValidReclaimIdentity(observation) || !validStatus || seen.has(observation.conversationId as string)) {
+      throw new Error("RECLAIM_OBSERVATIONS_INVALID: use complete unique idle or notLoaded observations from exact host readback");
+    }
+    seen.add(observation.conversationId as string);
   }
-  return value;
+  return value as ReclaimObservation[];
+}
+
+export function validateBoundRecoveryObservation(value: unknown): BoundRecoveryObservation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("RECOVERY_OBSERVATION_INVALID: expected exact bound Chat evidence");
+  const item = value as Record<string, unknown>;
+  if (![item.taskId, item.workspaceId, item.conversationId].every(isExactNonEmptyString) ||
+    !Number.isSafeInteger(item.generation) || (item.generation as number) < 1 ||
+    (item.useId !== undefined && (typeof item.useId !== "string" || !USE_ID_PATTERN.test(item.useId))) ||
+    ![item.failureCheckedAt, item.routingCheckedAt, item.chatReadAt, item.observedAt].every(isValidReclaimTimestamp) ||
+    item.hostRoutingChecked !== true || item.routingMode !== "conversation_id_only" ||
+    item.chatStatus !== "idle" || item.readbackClean !== true || item.reason !== "host_rejected" ||
+    !Number.isSafeInteger(item.receiptIteration) || (item.receiptIteration as number) < 0 ||
+    !(item.receiptMessageId === null || isExactNonEmptyString(item.receiptMessageId)) ||
+    !(item.receiptState === null || isExactNonEmptyString(item.receiptState)) ||
+    ((item.receiptMessageId === null) !== (item.receiptState === null)) ||
+    (item.receiptReviewHead !== undefined && !isExactNonEmptyString(item.receiptReviewHead))) {
+    throw new Error("RECOVERY_OBSERVATION_INVALID: verify host routing and read the exact idle Chat after explicit rejection");
+  }
+  return value as BoundRecoveryObservation;
+}
+
+function assertBoundRecovery(task: SavedTaskSession | undefined, workspaceId: string, observation: BoundRecoveryObservation): void {
+  if (!task || task.bindingState !== "bound" || task.taskId !== observation.taskId || workspaceId !== observation.workspaceId ||
+    task.conversationId !== observation.conversationId || task.generation !== observation.generation ||
+    task.lastDeliveryCheckedAt !== observation.failureCheckedAt) throw new Error("RECOVERY_BINDING_CHANGED: reread the current binding and terminal failure");
+  if (task.pendingMessageId || task.pendingIteration !== undefined || task.pendingDispatchUncertain || task.sendAcceptedAt ||
+    task.deliveryPendingSince || task.activeUse?.useId !== observation.useId) {
+    throw new Error("TASK_CHAT_BUSY: resolve the original receipt or other coordinator lease before recovery");
+  }
+  if (task.channelState !== "degraded" || !task.lastDeliveryError?.startsWith("host_rejected:")) {
+    throw new Error("RECOVERY_NOT_REQUIRED: reuse the healthy binding; uncertain sends and read failures cannot authorize rotation");
+  }
+  if (observation.receiptIteration !== task.iteration || observation.receiptMessageId !== (task.lastDeliveredMessageId ?? null) ||
+    observation.receiptState !== (task.lastState ?? null) || observation.receiptReviewHead !== task.lastReviewHead) {
+    throw new Error("RECOVERY_BINDING_CHANGED: reread the exact Chat; completed receipt no longer matches the ledger");
+  }
+  const times = [observation.routingCheckedAt, observation.failureCheckedAt, observation.chatReadAt, observation.observedAt];
+  if (!times.every(time => isFreshReclaimTimestamp(time, Date.now()))) {
+    throw new Error("RECLAIM_OBSERVATION_EXPIRED: refresh all host reads once before retrying");
+  }
+  if (times.some((time, index) => index > 0 && Date.parse(times[index - 1]) > Date.parse(time))) {
+    throw new Error("RECOVERY_OBSERVATION_INVALID: verify routing before a new rejection, then read the exact Chat");
+  }
 }
 
 function reclaimExclusion(ledger: SessionLedger, entry: StandbyConversation, marker: StandbyMarker): string | null {
@@ -1003,7 +1208,8 @@ function reclaimableCandidate(
 }
 
 /**
- * Atomically use an unclaimed Chat, or reclaim one only after a fresh exact idle observation.
+ * Atomically use an unclaimed Chat, or reclaim one only after fresh exact idle
+ * or fully corroborated notLoaded host evidence.
  */
 export async function claimStandbyConversation(
   input: ClaimStandbyConversationOptions
@@ -1012,6 +1218,7 @@ export async function claimStandbyConversation(
     const workspaceId = validateWorkspaceId(input.workspaceId);
     const taskId = validateTaskId(input.taskId);
     if (input.reclaimObservations !== undefined) validateReclaimObservations(input.reclaimObservations);
+    if (input.recoveryObservation !== undefined) validateBoundRecoveryObservation(input.recoveryObservation);
     const connectorName = input.connectorName.trim();
     const workspaceName = input.workspaceName.trim();
     if (!connectorName || !workspaceName) throw new Error("standby claim requires connector and workspace names");
@@ -1022,7 +1229,8 @@ export async function claimStandbyConversation(
     const registry = registryFromLedger(ledger, workspaceId);
     const existing = registry.tasks.find((entry) => entry.taskId === taskId);
     const pool = ledger.pool;
-    if (existing?.bindingState === "bound") {
+    if (input.recoveryObservation) assertBoundRecovery(existing, workspaceId, input.recoveryObservation);
+    if (existing?.bindingState === "bound" && !input.recoveryObservation) {
       const entry = pool.entries.find((candidate) => candidate.conversationId === existing.conversationId);
       if (!entry) throw new Error("bound task conversation is missing from the standby pool");
       return { task: existing, entry, reused: true };
@@ -1038,8 +1246,29 @@ export async function claimStandbyConversation(
     const now = new Date().toISOString();
     const reclaim = candidate ? null : reclaimableCandidate(ledger, desiredMarker, input.reclaimObservations, Date.parse(now));
     if (!candidate && !reclaim) {
+      if (input.reclaimObservations?.length) {
+        const observedCandidates = input.reclaimObservations.map(observation => {
+          const entry = pool.entries.find(item => item.conversationId === observation.conversationId);
+          const owner = entry && currentConversationOwner(ledger, entry.conversationId);
+          return { observation, entry, owner };
+        });
+        if (observedCandidates.some(({ observation, entry, owner }) => !entry || !owner ||
+          owner.workspaceId !== observation.workspaceId || owner.task.taskId !== observation.taskId ||
+          owner.task.generation !== observation.generation || (entry.assignmentEpoch ?? 0) !== observation.assignmentEpoch ||
+          (observation.taskStatus === "notLoaded" && (observation.receiptIteration !== owner.task.iteration ||
+            observation.receiptMessageId !== owner.task.lastDeliveredMessageId || observation.receiptState !== owner.task.lastState ||
+            observation.receiptReviewHead !== owner.task.lastReviewHead)))) {
+          throw new Error("RECLAIM_CANDIDATE_CHANGED: reread session pool reclaim-candidates --json and continue with remaining candidates");
+        }
+        if (observedCandidates.some(({ observation }) =>
+          [observation.observedAt, ...(observation.taskStatus === "notLoaded" ?
+            [observation.taskReadAt, observation.snapshotReadAt, observation.chatReadAt, observation.recheckReadAt] : [])]
+            .some(time => !isFreshReclaimTimestamp(time, Date.parse(now))))) {
+          throw new Error("RECLAIM_OBSERVATION_EXPIRED: refresh every host read once; changing observedAt alone is insufficient");
+        }
+      }
       if (pool.entries.some(entry => reclaimExclusion(ledger, entry, desiredMarker) === null)) {
-        throw new Error("POOL_OBSERVATION_REQUIRED: run session pool reclaim-candidates --json; read the exact owner task and Chat, then claim with --reclaim-observations-file using fresh idle evidence");
+        throw new Error("POOL_OBSERVATION_REQUIRED: run session pool reclaim-candidates --json; read the exact owner task and Chat, then claim with --reclaim-observations-file using fresh idle or corroborated notLoaded evidence");
       }
       const hasCompatibleClaim = pool.entries.some(entry => entry.status === "claimed" && entry.marker === desiredMarker);
       throw new Error(hasCompatibleClaim ? "POOL_BUSY: local candidates are blocked; run session pool reclaim-candidates --json for exclusion reasons; do not force takeover" : "POOL_EXHAUSTED: no compatible standby Chat is available");
@@ -1057,6 +1286,7 @@ export async function claimStandbyConversation(
       prior: existing,
       now,
     });
+    if (input.recoveryObservation) task.activeUse = existing!.activeUse;
     const retiredPriorId = existing?.poolEntryId;
     const entries = pool.entries.map((entry) => {
       if (entry.id === candidate.id) {
@@ -1069,6 +1299,11 @@ export async function claimStandbyConversation(
         };
       }
       if (retiredPriorId && entry.id === retiredPriorId && entry.status === "claimed") {
+        if (input.recoveryObservation) {
+          // Keep the fixed inventory; unavailable routing is not proof of deletion.
+          return { ...entry, status: "quarantined" as const, claimedBy: undefined,
+            reason: "binding_recovered: host rejected the correctly routed send", assignmentEpoch: (entry.assignmentEpoch ?? 0) + 1 };
+        }
         return { ...entry, status: "retired" as const, retiredAt: now, reason: existing?.replacementReason ?? "replaced" };
       }
       return entry;
@@ -1095,7 +1330,13 @@ export async function claimStandbyConversation(
       ...ledger,
       pool: { ...pool, entries, savedAt: now },
       registries: [...remainingRegistries, ...(reclaimedRegistry ? [reclaimedRegistry] : []), nextRegistry],
-      assignmentHistory: reclaim ? [...(ledger.assignmentHistory ?? []), historyEntry(reclaim.owner.task, reclaim.owner.workspaceId, "pool_reclaimed", now)] : ledger.assignmentHistory,
+      assignmentHistory: [...(ledger.assignmentHistory ?? []),
+        ...(reclaim ? [{ ...historyEntry(reclaim.owner.task, reclaim.owner.workspaceId, "pool_reclaimed", now),
+          snapshot: reclaim.owner.task, toWorkspaceId: workspaceId, toTaskId: taskId,
+          toConversationId: task.conversationId, assignmentEpoch: claimed.assignmentEpoch }] : []),
+        ...(input.recoveryObservation && existing ? [{ ...historyEntry(existing, workspaceId, "binding_recovered", now),
+          snapshot: existing, toWorkspaceId: workspaceId, toTaskId: taskId, toConversationId: task.conversationId,
+          assignmentEpoch: claimed.assignmentEpoch }] : [])],
       savedAt: now,
     });
     return { task, entry: claimed, reused: false };
@@ -1237,7 +1478,9 @@ export async function switchTaskWorkspace(input: SwitchTaskWorkspaceOptions): Pr
     const from = registryFromLedger(ledger, fromWorkspaceId);
     const current = from.tasks.find(task => task.taskId === taskId);
     if (!current || current.bindingState !== "bound" || current.generation !== input.expectedGeneration) throw new Error("TASK_BINDING_STALE");
-    if (taskIsBusy(current)) throw new Error("TASK_CHAT_BUSY: resolve the in-flight message or active use before switching workspace");
+    if (taskIsBusy(current) || (current.migrationHandshake?.bootMessageId && !current.migrationHandshake.completedAt)) {
+      throw new Error("TASK_CHAT_BUSY: resolve the in-flight message, active use, or migration BOOT before switching workspace");
+    }
     const target = registryFromLedger(ledger, toWorkspaceId);
     if (target.tasks.some(task => task.taskId === taskId && task.bindingState === "bound")) throw new Error("TASK_BINDING_AMBIGUOUS");
     const poolEntry = current.poolEntryId ? ledger.pool.entries.find(entry => entry.id === current.poolEntryId) : undefined;
@@ -1259,7 +1502,13 @@ export async function switchTaskWorkspace(input: SwitchTaskWorkspaceOptions): Pr
       verificationState: "pending",
       channelState: "ready",
       hostControl: undefined,
-      lastReviewHead: undefined,
+      migrationHandshake: {
+        id: `c2c_migration_${randomUUID()}`, fromWorkspaceId: current.migrationHandshake && !current.migrationHandshake.completedAt ? current.migrationHandshake.fromWorkspaceId : fromWorkspaceId, toWorkspaceId, taskId,
+        conversationId: current.conversationId, fromGeneration: current.migrationHandshake && !current.migrationHandshake.completedAt ? current.migrationHandshake.fromGeneration : current.generation,
+        toGeneration: current.generation + 1, assignmentEpoch: (poolEntry.assignmentEpoch ?? 0) + 1,
+        receipt: { iteration: current.iteration, messageId: current.lastDeliveredMessageId ?? null,
+          state: current.lastState ?? null, reviewHead: current.lastReviewHead },
+      },
       activeUse: undefined,
       savedAt: now,
     };
@@ -1269,7 +1518,7 @@ export async function switchTaskWorkspace(input: SwitchTaskWorkspaceOptions): Pr
     writeSessionLedger({ ...ledger,
       pool: { ...ledger.pool, entries: ledger.pool.entries.map(entry => entry.id === poolEntry.id ? { ...entry, claimedBy: { workspaceId: toWorkspaceId, taskId, generation: moved.generation }, lastUsedAt: now, assignmentEpoch: (entry.assignmentEpoch ?? 0) + 1 } : entry), savedAt: now },
       registries: [...ledger.registries.filter(registry => registry.workspaceId !== fromWorkspaceId && registry.workspaceId !== toWorkspaceId), nextFrom, nextTarget],
-      assignmentHistory: [...(ledger.assignmentHistory ?? []), historyEntry(current, fromWorkspaceId, "workspace_switch", now)], savedAt: now });
+      assignmentHistory: [...(ledger.assignmentHistory ?? []), { ...historyEntry(current, fromWorkspaceId, "workspace_switch", now), toWorkspaceId, toTaskId: taskId, toConversationId: current.conversationId, assignmentEpoch: moved.migrationHandshake!.assignmentEpoch, snapshot: current }], savedAt: now });
     return moved;
   });
 }
@@ -1416,8 +1665,18 @@ export async function confirmTaskWorkspace(
     if (task.lastState !== "DONE") {
       throw new Error("workspace verification requires a successful boot reply");
     }
+    if (!task.migrationHandshake && task.verificationState === "pending" && readSessionLedger().assignmentHistory?.some(h =>
+      h.reason === "workspace_switch" && h.taskId === taskId && h.conversationId === task.conversationId && h.generation === task.generation - 1)) {
+      throw new Error("MIGRATION_BOOT_RECEIPT_REQUIRED");
+    }
+    if (task.migrationHandshake && !task.migrationHandshake.completedAt &&
+      task.migrationHandshake.bootMessageId !== task.lastDeliveredMessageId) {
+      throw new Error("MIGRATION_BOOT_RECEIPT_REQUIRED");
+    }
     return {
       ...task,
+      migrationHandshake: task.migrationHandshake ? { ...task.migrationHandshake, completedAt: new Date().toISOString() } : undefined,
+      hostControl: task.migrationHandshake ? { status: "ready", missingTools: [], checkedAt: new Date().toISOString() } : task.hostControl,
       verificationState: "ready",
       channelState: "ready",
       savedAt: new Date().toISOString(),
@@ -1553,6 +1812,56 @@ export async function restoreTaskConversation(
   });
 }
 
+function verifyMigrationRead(workspaceId: string, taskId: string, task: SavedTaskSession, o: MigrationReadObservation | undefined): SavedTaskSession {
+  if (!o || typeof o !== "object" || Array.isArray(o) || o.chatStatus !== "idle" || o.readbackClean !== true ||
+    !Number.isSafeInteger(o.iteration) || o.iteration < 0 || !Number.isSafeInteger(o.generation) ||
+    !Number.isSafeInteger(o.assignmentEpoch) || !isValidReclaimTimestamp(o.chatReadAt)) throw new Error("MIGRATION_OBSERVATION_INVALID");
+  if (Date.now() - Date.parse(o.chatReadAt) > 60_000 || Date.parse(o.chatReadAt) > Date.now()) throw new Error("MIGRATION_OBSERVATION_EXPIRED");
+  if (task.hostControl?.status !== "readback_required" || task.hostControl.missingTools.length) throw new Error("HOST_CONTROL_PROBE_REQUIRED");
+  if (task.verificationState !== "pending" || task.pendingMessageId || task.pendingIteration !== undefined ||
+    task.pendingDispatchUncertain || task.sendAcceptedAt || task.deliveryPendingSince) throw new Error("MIGRATION_SEND_UNRESOLVED");
+  if (task.activeUse?.useId !== o.useId) throw new Error("TASK_USE_STALE");
+  const ledger = readSessionLedger(); // Caller holds the global ledger lock.
+  const owners = ledger.registries.flatMap(r => r.tasks.filter(t => t.bindingState === "bound" &&
+    (t.taskId === taskId || t.conversationId === task.conversationId)).map(t => ({ workspaceId: r.workspaceId, task: t })));
+  const entry = ledger.pool.entries.find(e => e.id === task.poolEntryId);
+  if (owners.length !== 1 || owners[0].workspaceId !== workspaceId || !entry || entry.status !== "claimed" ||
+    entry.claimedBy?.workspaceId !== workspaceId || entry.claimedBy.taskId !== taskId || entry.claimedBy.generation !== task.generation ||
+    entry.assignmentEpoch !== o.assignmentEpoch || o.taskId !== taskId || o.conversationId !== task.conversationId ||
+    o.toWorkspaceId !== workspaceId || o.generation !== task.generation) throw new Error("MIGRATION_CANDIDATE_CHANGED");
+  let migration = task.migrationHandshake;
+  if (!migration) {
+    let destination = workspaceId;
+    let generation = task.generation - 1;
+    let source: string | undefined;
+    while (generation >= 1) {
+      const history = (ledger.assignmentHistory ?? []).filter(h => h.reason === "workspace_switch" &&
+        h.taskId === taskId && h.conversationId === task.conversationId && h.generation === generation);
+      if (history.length !== 1 || (history[0].toWorkspaceId !== undefined && history[0].toWorkspaceId !== destination) ||
+        (generation !== task.generation - 1 && history[0].toWorkspaceId === undefined)) throw new Error("MIGRATION_HISTORY_UNPROVEN");
+      source = history[0].fromWorkspaceId;
+      if (source === o.fromWorkspaceId) break;
+      destination = source;
+      generation--;
+    }
+    if (source !== o.fromWorkspaceId || generation < 1) throw new Error("MIGRATION_HISTORY_UNPROVEN");
+    migration = { id: `c2c_migration_${randomUUID()}`, fromWorkspaceId: o.fromWorkspaceId, toWorkspaceId: workspaceId,
+      taskId, conversationId: task.conversationId, fromGeneration: generation, toGeneration: task.generation,
+      assignmentEpoch: o.assignmentEpoch, receipt: { iteration: task.iteration, messageId: task.lastDeliveredMessageId ?? null,
+        state: task.lastState ?? null, reviewHead: task.lastReviewHead } };
+  }
+  if (migration.completedAt || migration.fromWorkspaceId !== o.fromWorkspaceId || migration.toWorkspaceId !== workspaceId ||
+    migration.toGeneration !== task.generation || migration.assignmentEpoch !== entry.assignmentEpoch ||
+    migration.taskId !== taskId || migration.conversationId !== task.conversationId) throw new Error("MIGRATION_HISTORY_UNPROVEN");
+  const r = migration.receipt;
+  if (o.iteration !== r.iteration || o.messageId !== r.messageId || o.state !== r.state || o.reviewHead !== r.reviewHead ||
+    task.iteration !== r.iteration || (task.lastDeliveredMessageId ?? null) !== r.messageId ||
+    (task.lastState ?? null) !== r.state || task.lastReviewHead !== r.reviewHead) throw new Error("MIGRATION_RECEIPT_MISMATCH");
+  if (r.messageId === null || r.state === null) throw new Error("MIGRATION_HISTORY_UNPROVEN: completed source receipt required");
+  return { ...task, migrationHandshake: migration, channelState: "ready",
+    hostControl: { status: "migration_boot_ready", missingTools: [], checkedAt: o.chatReadAt }, savedAt: new Date().toISOString() };
+}
+
 /** Observations come from the coordinator's callable tool inventory, not the Tunnel. */
 export async function recordTaskHostControl(
   workspaceId: string, taskId: string, observation: HostControlObservation
@@ -1568,6 +1877,8 @@ export async function recordTaskHostControl(
       }
       missingTools = ["read_thread", "send_message_to_thread"].filter(name => !observation.tools!.includes(name));
       status = missingTools.length ? "tools_missing" : "readback_required";
+    } else if (observation.result === "migration-read-ok") {
+      return verifyMigrationRead(workspaceId, taskId, task, observation.migrationObservation);
     } else if (observation.result === "read-ok") {
       if (task.hostControl?.status !== "readback_required" || missingTools.length) {
         throw new Error("HOST_CONTROL_PROBE_REQUIRED");
@@ -1665,12 +1976,23 @@ export async function beginTaskSend(
   if (!Number.isSafeInteger(iteration) || iteration < 0) throw new Error("iteration must be a non-negative integer");
   const flags = typeof options === "boolean" ? { probe: options } : options;
   if (flags.reviewHead !== undefined && !/^[0-9a-f]{40}$/u.test(flags.reviewHead)) throw new Error("REVIEW_HEAD_INVALID");
+  if (flags.bootstrap && flags.reviewHead !== undefined) throw new Error("BOOT_REVIEW_HEAD_FORBIDDEN");
   return updateTaskChannel(workspaceId, taskId, (task) => {
     if (flags.expectedGeneration !== undefined && task.generation !== flags.expectedGeneration) throw new Error("TASK_GENERATION_STALE");
     if (task.activeUse && flags.useId !== task.activeUse.useId) throw new Error("TASK_USE_STALE");
     if (flags.useId !== undefined && !USE_ID_PATTERN.test(flags.useId)) throw new Error("TASK_USE_ID_INVALID");
     if (task.bindingState !== "bound") throw new Error("task conversation binding is unavailable");
-    if (task.hostControl && task.hostControl.status !== "ready") throw new Error("HOST_CONTROL_NOT_READY: probe tools and read the exact bound Chat");
+    if (task.hostControl && task.hostControl.status !== "ready" && !(flags.bootstrap && task.hostControl.status === "migration_boot_ready")) throw new Error("HOST_CONTROL_NOT_READY: probe tools and read the exact bound Chat");
+    const migrating = task.migrationHandshake && !task.migrationHandshake.completedAt;
+    const legacyMigration = !task.migrationHandshake && task.verificationState === "pending" &&
+      readSessionLedger().assignmentHistory?.some(h => h.reason === "workspace_switch" && h.taskId === taskId &&
+        h.conversationId === task.conversationId && h.generation === task.generation - 1);
+    if (migrating || legacyMigration) {
+      if (!flags.bootstrap || task.hostControl?.status !== "migration_boot_ready" || flags.expectedGeneration !== task.generation ||
+        Date.now() - Date.parse(task.hostControl.checkedAt) > 60_000 || Date.parse(task.hostControl.checkedAt) > Date.now()) {
+        throw new Error("MIGRATION_PREFLIGHT_REQUIRED: probe then migration-read-ok before BOOT");
+      }
+    }
     if (task.settingsSource !== "user_confirmed") throw new Error("task conversation settings lack user confirmation");
     if (!flags.bootstrap && task.verificationState !== "ready") {
       throw new Error("task conversation requires workspace verification before task content");
@@ -1688,6 +2010,8 @@ export async function beginTaskSend(
     return {
       ...task,
       channelState: "sending",
+      hostControl: migrating ? { ...task.hostControl!, status: "readback_required" } : task.hostControl,
+      migrationHandshake: migrating ? { ...task.migrationHandshake!, bootMessageId: id } : task.migrationHandshake,
       pendingMessageId: id,
       pendingIteration: iteration,
       pendingDispatchUncertain: undefined,
@@ -1779,13 +2103,20 @@ export async function confirmTaskReply(
     if (task.channelState !== "awaiting_reply" || task.pendingMessageId !== id || task.pendingIteration === undefined) {
       throw new Error("reply receipt does not match the delivered in-flight message");
     }
-    if (task.pendingReviewHead && observedReviewHead !== task.pendingReviewHead) throw new Error("REVIEW_HEAD_MISMATCH");
+    // Older clients could reserve BOOT with REVIEW_HEAD. BOOT replies intentionally
+    // prove workspace identity and do not echo a review commit, so reconcile that
+    // already-delivered legacy state instead of trapping the binding forever.
+    const legacyMalformedBootstrap = task.verificationState === "pending" &&
+      task.pendingReviewHead !== undefined && observedReviewHead === undefined;
+    if (task.pendingReviewHead && !legacyMalformedBootstrap && observedReviewHead !== task.pendingReviewHead) {
+      throw new Error("REVIEW_HEAD_MISMATCH");
+    }
     return {
       ...task,
       channelState: "ready",
       iteration: task.pendingIteration,
       lastState: normalizedState,
-      lastReviewHead: task.pendingReviewHead,
+      lastReviewHead: legacyMalformedBootstrap ? task.lastReviewHead : task.pendingReviewHead,
       pendingMessageId: undefined,
       pendingIteration: undefined,
       pendingReviewHead: undefined,

@@ -95,6 +95,34 @@ and the same task may claim a next generation. A temporary direct-tool failure
 only sets `degraded`; it does not replace the Chat. Empty compatible stock yields
 `POOL_EXHAUSTED` and blocks task content.
 
+When all compatible entries are claimed, the pool may rotate the least-recently-
+used locally eligible Chat only after fresh host evidence. The normal branch
+requires an explicitly idle owner task and idle exact Chat. A `read_thread`
+result of `notLoaded` is not idle by itself: it additionally requires two
+same-host immediate `wait_threads(timeoutMs: 0)` snapshots reporting
+`inactiveStatus`, the same completed latest turn, an idle exact Chat, and a clean
+receipt matching the ledger's task/workspace/iteration/message/state/review HEAD.
+Each task, snapshot, Chat, and recheck read must be within 60 seconds at claim
+time. The locked ledger rechecks owner, generation, epoch, verification, lease,
+pending state, and the observed receipt before it archives the old owner and
+invalidates its route capability. Host and ledger reads are separate operations,
+so this narrows rather than removes a later host-activity race.
+
+The fixed inventory is reused automatically, with no request for extra standby
+Chats. Healthy exact bindings continue normally. For an unusable bound Chat,
+`session pool claim --recover-bound-file <UTF-8 JSON object>` combines current
+binding recovery evidence with `--reclaim-observations-file <candidate array>`.
+Only a correctly routed explicit host rejection, an idle Chat read, a matching
+generation/failure receipt, and no unresolved send or other coordinator lease
+permit replacement. The lock archives both displaced assignments with receipts
+and destinations, quarantines the unusable Chat without retiring inventory, and
+assigns the first eligible LRU candidate. Generation and assignment epochs fence
+concurrent recovery. The replacement requires BOOT and workspace confirmation.
+
+ChatGPT `send_message_to_thread`/`read_thread` calls omit Codex `hostId` routing.
+`no rollout found` is a routing error to investigate, not deletion proof. Unknown
+delivery outcomes retain the original pending message and prevent rotation.
+
 ## Runtime configuration health
 
 `c2c runtime diagnose` probes the anchor through exactly one source: the
@@ -157,8 +185,18 @@ retires the exact Chat.
 `fail-delivery` requires terminal evidence: `host_rejected`,
 `conversation_gone`, or `identity_mismatch`. Explicit deletion retires the
 exact binding. An identity mismatch quarantines the binding and requires
-`session clear --confirm` before a replacement claim; a host rejection keeps
-the existing binding degraded.
+`session clear --confirm` before a replacement claim; the coordinator performs
+that terminal C2C recovery automatically without asking for separate user
+authorization. A host rejection keeps the existing binding degraded.
+
+BOOT must not carry `REVIEW_HEAD`. New `begin-send --bootstrap --review-head`
+reservations fail with `BOOT_REVIEW_HEAD_FORBIDDEN`. For legacy ledgers that
+already contain that malformed combination, an exact delivered BOOT reply with
+matching task/workspace/iteration/message identity may be confirmed without the
+head. The pending head is discarded and does not become `lastReviewHead`; normal
+review messages still require the exact head, and a non-matching non-empty BOOT
+head remains `REVIEW_HEAD_MISMATCH`. Readback and actual
+`workspace_info` confirmation remain mandatory.
 
 Channel states:
 
@@ -184,3 +222,20 @@ separate route capabilities.
 - C2C MCP: current local files, status, diff, tests, unpushed changes.
 
 Current local C2C data wins on conflicts.
+
+## Workspace migration preflight
+
+`switch-workspace` records a migration handshake under the assignment ledger lock,
+including source receipt identity, destination, generations and assignmentEpoch.
+The receipt retains its original workspace. `host-control --result
+migration-read-ok --observation-file <UTF8 JSON>` validates a fresh idle exact Chat
+read against that lineage and current owner. Its `migration_boot_ready` status
+permits only BOOT with expected generation, once per reservation. The exact new
+BOOT reply and actual workspace_info confirmation complete the handshake. It
+cannot authorize INIT or make the historical DONE a destination BOOT receipt.
+
+Legacy migrations are recovered only from unique workspace_switch history and
+matching current receipt; no Chat replacement or generation increment occurs.
+Ambiguous or incomplete lineage fails closed. Pending sends and leases retain
+normal protection; terminal rejection or proven non-invocation requires fresh
+preflight before retry. See the source Skill for the complete JSON and commands.

@@ -96,6 +96,7 @@ import {
   type ReclaimObservation,
   readReclaimCandidates,
   validateReclaimObservations,
+  validateBoundRecoveryObservation,
   restoreTaskConversation,
   quarantineStandbyConversation,
   readStandbyPool,
@@ -1225,8 +1226,8 @@ function parseReclaimObservations(input: string | undefined): ReclaimObservation
   try {
     const parsed: unknown = JSON.parse(input);
     return validateReclaimObservations(parsed);
-  } catch {
-    throw new InvalidArgumentError("reclaim observations must be a JSON array from fresh exact host readback");
+  } catch (error) {
+    throw new InvalidArgumentError(error instanceof SyntaxError ? "RECLAIM_OBSERVATIONS_INVALID: expected a UTF-8 JSON array" : String(error));
   }
 }
 
@@ -1414,7 +1415,7 @@ pool.command("list")
   });
 
 pool.command("reclaim-candidates")
-  .description("List local rotation candidates; exact host idle observations are still required")
+  .description("List local rotation candidates; fresh exact host reclaim observations are still required")
   .option("--pro", "explicitly requested Pro inventory", false)
   .option("--json", "machine-readable output", false)
   .action((opts: { pro: boolean; json: boolean }) => {
@@ -1449,15 +1450,18 @@ pool.command("claim")
   .option("-w, --workspace <path>")
   .option("--task-id <id>")
   .option("--pro", "this task explicitly requests Pro", false)
-  .option("--reclaim-observations <json>", "fresh exact idle observations from host readback")
-  .option("--reclaim-observations-file <path>", "UTF-8 JSON observations from exact host readback")
+  .option("--reclaim-observations <json>", "fresh exact host reclaim observations")
+  .option("--reclaim-observations-file <path>", "UTF-8 JSON host reclaim observations")
+  .option("--recover-bound-file <path>", "UTF-8 JSON proof of a correctly routed terminal rejection and idle current Chat")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; taskId?: string; pro: boolean; reclaimObservations?: string; reclaimObservationsFile?: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; pro: boolean; reclaimObservations?: string; reclaimObservationsFile?: string; recoverBoundFile?: string; json: boolean }) => {
     if (opts.reclaimObservations !== undefined && opts.reclaimObservationsFile !== undefined) {
       throw new InvalidArgumentError("choose only one of --reclaim-observations and --reclaim-observations-file");
     }
     const observations = parseReclaimObservations(opts.reclaimObservationsFile === undefined ? opts.reclaimObservations :
       fs.readFileSync(path.resolve(opts.reclaimObservationsFile), "utf8"));
+    const recoveryObservation = opts.recoverBoundFile === undefined ? undefined :
+      validateBoundRecoveryObservation(JSON.parse(fs.readFileSync(path.resolve(opts.recoverBoundFile), "utf8")));
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
     const resolved = resolvedSessionTaskId(opts.taskId);
@@ -1478,6 +1482,7 @@ pool.command("claim")
       branch: gitInfo(workspace.root).branch,
       userExplicitPro: opts.pro,
       reclaimObservations: observations,
+      recoveryObservation,
     });
     let routeToken: string | null = null;
     let task = claimed.task;
@@ -1576,27 +1581,28 @@ session.command("mark-unavailable")
 session.command("host-control")
   .description("Record current executor tool availability or exact Chat recovery; never sends a message")
   .option("-w, --workspace <path>").option("--task-id <id>")
-  .requiredOption("--result <result>", "probe, read-ok, timeout, call-failed, or not-invoked")
+  .requiredOption("--result <result>", "probe, read-ok, migration-read-ok, timeout, call-failed, or not-invoked")
+  .option("--observation-file <path>", "UTF-8 migration readback evidence JSON")
   .option("--tools <names>", "comma-separated callable host tool names; use none if both are absent")
   .option("--conversation-id <id>")
   .option("--observed-task-id <id>").option("--observed-workspace-id <id>")
   .option("--message-id <id>")
   .option("--confirm-not-invoked", "attest that the send tool was never called for this reservation", false)
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; taskId?: string; result: HostControlObservation["result"]; tools?: string;
+  .action(async (opts: { workspace?: string; taskId?: string; result: HostControlObservation["result"]; observationFile?: string; tools?: string;
     conversationId?: string; observedTaskId?: string; observedWorkspaceId?: string; messageId?: string; confirmNotInvoked: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     if (opts.result === "not-invoked" && !opts.confirmNotInvoked) throw new Error("HOST_CONTROL_NOT_INVOKED_ATTESTATION_REQUIRED");
     const task = await recordTaskHostControl(workspace.id, resolved.taskId, {
-      result: opts.result, tools: opts.tools === "none" ? [] : opts.tools?.split(",").map(x => x.trim()),
+      result: opts.result, migrationObservation: opts.observationFile ? JSON.parse(fs.readFileSync(opts.observationFile, "utf8").replace(/^\uFEFF/u, "")) : undefined, tools: opts.tools === "none" ? [] : opts.tools?.split(",").map(x => x.trim()),
       conversationId: opts.conversationId, observedTaskId: opts.observedTaskId,
       observedWorkspaceId: opts.observedWorkspaceId, messageId: opts.messageId,
     });
     const status = task.hostControl!.status;
-    const nextAction = status === "tools_missing" ? "restore_host_tools_then_read_bound_chat" :
+    const nextAction = status === "migration_boot_ready" ? "begin_boot_with_expected_generation" : status === "tools_missing" ? "restore_host_tools_then_read_bound_chat" :
       status === "ready" ? (task.pendingMessageId ? "read_pending_message_do_not_resend" : "begin_send") : "probe_then_read_bound_chat";
-    const result = { ok: status === "ready", owner: "codex_host", status, nextAction,
+    const result = { ok: status === "ready" || status === "migration_boot_ready", owner: "codex_host", status, nextAction,
       workspaceId: workspace.id, task, reserved: Boolean(task.pendingMessageId),
       accepted: Boolean(task.pendingMessageId && task.sendAcceptedAt),
       delivered: Boolean(task.pendingMessageId && task.lastDeliveredMessageId === task.pendingMessageId),
@@ -1666,7 +1672,7 @@ addChannelCommandOptions(session.command("begin-send").description("Atomically r
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const current = readTaskSession(workspace.id, resolved.taskId);
-    if (current?.hostControl?.status !== "ready" ||
+    if ((current?.hostControl?.status !== "ready" && !(opts.bootstrap && current?.hostControl?.status === "migration_boot_ready")) ||
       !Number.isFinite(Date.parse(current.hostControl.checkedAt)) ||
       Date.now() - Date.parse(current.hostControl.checkedAt) > 60_000 || Date.parse(current.hostControl.checkedAt) > Date.now()) {
       throw new Error("HOST_CONTROL_PREFLIGHT_REQUIRED: record current callable tools and exact bound Chat readback before begin-send");

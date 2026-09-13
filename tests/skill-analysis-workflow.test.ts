@@ -2,6 +2,8 @@ import fs from "node:fs";
 import { describe, expect, it } from "vitest";
 
 const skill = fs.readFileSync("skill/SKILL.md", "utf8").replace(/\r\n/g, "\n");
+const protocol = fs.readFileSync("docs/protocol.md", "utf8").replace(/\r\n/g, "\n");
+const hostControl = fs.readFileSync("docs/host-control.md", "utf8").replace(/\r\n/g, "\n");
 
 // These are instruction contracts, not evidence of model behavior or quota savings.
 describe("ChatGPT-first Skill instruction contract", () => {
@@ -60,5 +62,40 @@ describe("ChatGPT-first Skill instruction contract", () => {
     expect(skill).toContain("These exceptions do not waive host preflight");
     expect(skill).toContain("only when no repository exploration, design, or diagnosis is needed");
     expect(skill).toContain("impact still needs ChatGPT analysis before execution");
+  });
+
+  it("documents the corroborated notLoaded reclaim path without treating it as idle", () => {
+    for (const document of [skill, protocol, hostControl]) {
+      expect(document).toContain("notLoaded");
+      expect(document).toContain("inactiveStatus");
+    }
+    expect(skill).toContain("A bare `notLoaded` result is not idle proof");
+    expect(skill).toContain("same completed latest turn id");
+    expect(skill).toContain("Every individual read must be no more than 60");
+    expect(hostControl).toContain("changed receipt");
+  });
+
+  it("makes fixed-pool automatic recovery a project and installed workflow rule", () => {
+    const agents = fs.readFileSync("AGENTS.md", "utf8");
+    expect(agents).toContain("固定复用现有 10 个 Chat");
+    expect(agents).toContain("lastUsedAt");
+    expect(agents).toContain("不能以“已有绑定”为由停止");
+    expect(skill).toContain("--recover-bound-file");
+    expect(skill).toContain("omitting `hostId`");
+    expect(skill).toContain("never asks for more Chats");
+    expect(protocol).toContain("no unresolved send");
+  });
+
+  it("automatically reconciles malformed BOOT without requesting user authorization", () => {
+    const agents = fs.readFileSync("AGENTS.md", "utf8");
+    expect(skill).toContain("C2C recovery is already authorized");
+    expect(skill).toContain("do not ask for authorization or send another BOOT");
+    expect(skill).toContain("Never put\nit on BOOT or pass `--review-head` with `begin-send --bootstrap`");
+    expect(skill).toContain("does not require another user decision");
+    expect(protocol).toContain("BOOT_REVIEW_HEAD_FORBIDDEN");
+    expect(protocol).toContain("does not become `lastReviewHead`");
+    expect(hostControl).toContain("Do not resend it or ask");
+    expect(agents).toContain("错误 BOOT 修复");
+    expect(agents).toContain("不再向用户索取单独授权");
   });
 });
