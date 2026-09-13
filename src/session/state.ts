@@ -11,6 +11,8 @@ export type BootstrapCreationState = "idle" | "dispatching" | "pending" | "creat
 export type SettingsDialogState = "pending" | "confirmed" | "later";
 export type ChannelState = "ready" | "sending" | "delivered" | "awaiting_reply" | "degraded";
 export type DeliveryFailureKind = "host_rejected" | "conversation_gone" | "identity_mismatch";
+export type BusinessMessageKind = "init" | "executed";
+export type MemoryInitializationStatus = "ready" | "degraded";
 
 export interface HostControlState {
   status: "tools_missing" | "readback_required" | "migration_boot_ready" | "ready" | "call_timeout" | "call_failed" | "not_invoked";
@@ -108,6 +110,11 @@ export interface SavedTaskSession {
   /** Sticky until this message is resolved; a timed-out call may have sent it. */
   pendingDispatchUncertain?: boolean;
   pendingReviewHead?: string;
+  /** Metadata for a generated business INIT/EXECUTED; BOOT and legacy messages omit it. */
+  pendingMessageKind?: BusinessMessageKind;
+  /** SHA-256 of a generated INIT body. The body itself is never stored in the ledger. */
+  pendingMessageDigest?: string;
+  pendingMemoryProject?: string;
   lastReviewHead?: string;
   /** The direct host accepted the outbound request, but ChatGPT has not yet exposed its user turn. */
   sendAcceptedAt?: string;
@@ -125,6 +132,15 @@ export interface SavedTaskSession {
   routeCapabilityId?: string;
   /** An active coordinator lease prevents this Chat from being reclaimed. */
   activeUse?: { useId: string; startedAt: string };
+  /** A mem initialization belongs to exactly one binding generation. */
+  memoryInitialization?: {
+    generation: number;
+    project: string;
+    status: MemoryInitializationStatus;
+    sources: string[];
+    reason?: string;
+    checkedAt: string;
+  };
   lastReadError?: string;
   lastReadCheckedAt?: string;
   savedAt: string;
@@ -172,6 +188,33 @@ export interface BeginSendOptions {
   reviewHead?: string;
   expectedGeneration?: number;
   useId?: string;
+  messageKind?: BusinessMessageKind;
+  messageDigest?: string;
+  memoryProject?: string;
+}
+
+export interface InitMessageInput {
+  goal: string;
+  constraints: string;
+  successCriteria: string;
+  repository: { provider: "github" | "gitea" | "other"; name: string; branch: string };
+  localState: string;
+  memoryProject: string;
+}
+
+export interface PreparedInitMessage {
+  task: SavedTaskSession;
+  messageId: string;
+  iteration: number;
+  message: string;
+  messageDigest: string;
+}
+
+export interface MemoryReplyObservation {
+  project: string;
+  status: MemoryInitializationStatus;
+  sources: string[];
+  reason?: string;
 }
 
 export interface ReceiptIdentity {
@@ -493,6 +536,73 @@ export function bindingCodeDigest(bindingCode: string): string {
   return createHash("sha256").update(bindingCode, "utf8").digest("hex");
 }
 
+/** Digest the exact UTF-8 body read from or sent to the bound Chat. */
+export function digestBusinessMessage(message: string): string {
+  if (typeof message !== "string") throw new Error("C2C_MESSAGE_INVALID");
+  return createHash("sha256").update(message, "utf8").digest("hex");
+}
+
+function compactInitField(value: unknown, field: string, maxLength: number): string {
+  if (typeof value !== "string") throw new Error(`C2C_INIT_${field.toUpperCase()}_REQUIRED`);
+  const normalized = value.replace(/[\r\n\t]+/gu, " ").replace(/\s{2,}/gu, " ").trim();
+  if (!normalized) throw new Error(`C2C_INIT_${field.toUpperCase()}_REQUIRED`);
+  if (normalized.length > maxLength) throw new Error(`C2C_INIT_${field.toUpperCase()}_TOO_LONG`);
+  return normalized;
+}
+
+export function validateInitMessageInput(input: unknown): InitMessageInput {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("C2C_INIT_INPUT_INVALID");
+  const value = input as Partial<InitMessageInput>;
+  if (!value.repository || typeof value.repository !== "object" || Array.isArray(value.repository)) {
+    throw new Error("C2C_INIT_REPOSITORY_REQUIRED");
+  }
+  const repository = value.repository as Partial<InitMessageInput["repository"]>;
+  if (repository.provider !== "github" && repository.provider !== "gitea" && repository.provider !== "other") {
+    throw new Error("C2C_INIT_REPOSITORY_PROVIDER_INVALID");
+  }
+  return {
+    goal: compactInitField(value.goal, "goal", 260),
+    constraints: compactInitField(value.constraints, "constraints", 260),
+    successCriteria: compactInitField(value.successCriteria, "success_criteria", 220),
+    repository: {
+      provider: repository.provider,
+      name: compactInitField(repository.name, "repository_name", 160),
+      branch: compactInitField(repository.branch, "repository_branch", 120),
+    },
+    localState: compactInitField(value.localState, "local_state", 120),
+    memoryProject: compactInitField(value.memoryProject, "memory_project", 120),
+  };
+}
+
+function renderInitMessage(workspaceId: string, taskId: string, messageId: string, iteration: number, input: InitMessageInput, reviewHead?: string): string {
+  const review = reviewHead ? `\nREVIEW_HEAD: ${reviewHead}` : "";
+  const message = `[C2C]\nSTATE: INIT\nTASK_ID: ${taskId}\nWORKSPACE_ID: ${workspaceId}\nITERATION: ${iteration}\nMESSAGE_ID: ${messageId}\n\nGOAL: ${input.goal}\nCONSTRAINTS: ${input.constraints}\nSUCCESS_CRITERIA: ${input.successCriteria}\nREPOSITORY: ${input.repository.provider} ${input.repository.name} ${input.repository.branch}\nLOCAL_STATE: ${input.localState}\nMEMORY_PROJECT: ${input.memoryProject}${review}\nMEM: First call memory_start_task(task=GOAL+CONSTRAINTS+SUCCESS_CRITERIA, project=MEMORY_PROJECT, detail=standard, intent=start, mode=hybrid, includeProjectContext=true). Then memory_search for needed history/docs; for Gitea read-only codewiki_*/gitea_*. No memory_write_summary, Gitea, or other writes. C2C local source wins.\n\nREPLY: Echo 4 IDs; STATE: PLAN; MEMORY_PROJECT; MEMORY_STATUS READY|DEGRADED; MEMORY_SOURCES; MEMORY_REASON if DEGRADED; SOURCE_EVIDENCE, ACTIONS, TESTS, SUCCESS_CRITERIA.`;
+  if (Buffer.byteLength(message, "utf8") > 1024) throw new Error("C2C_INIT_MESSAGE_TOO_LARGE");
+  return message;
+}
+
+function validateMemorySources(sources: string[]): string[] {
+  if (!Array.isArray(sources)) throw new Error("MEMORY_SOURCES_REQUIRED");
+  const normalized = [...new Set(sources.map(source => compactInitField(source, "source", 80)))];
+  if (normalized.length === 0 || normalized.length > 12) throw new Error("MEMORY_SOURCES_INVALID");
+  return normalized;
+}
+
+function validateMemoryReplyObservation(observation: MemoryReplyObservation | undefined, task: SavedTaskSession): MemoryReplyObservation {
+  if (!observation) throw new Error("MEMORY_REPLY_OBSERVATION_REQUIRED");
+  const project = compactInitField(observation.project, "project", 120);
+  if (project !== task.pendingMemoryProject) throw new Error("MEMORY_PROJECT_MISMATCH");
+  if (observation.status !== "ready" && observation.status !== "degraded") throw new Error("MEMORY_STATUS_INVALID");
+  const sources = validateMemorySources(observation.sources);
+  const reason = observation.reason === undefined ? undefined : compactInitField(observation.reason, "reason", 500);
+  if (observation.status === "ready" && !sources.includes("memory_start_task")) {
+    throw new Error("MEMORY_START_TASK_EVIDENCE_REQUIRED");
+  }
+  if (observation.status === "degraded" && !reason) throw new Error("MEMORY_DEGRADED_REASON_REQUIRED");
+  if (observation.status === "ready" && reason !== undefined) throw new Error("MEMORY_READY_REASON_FORBIDDEN");
+  return { project, status: observation.status, sources, reason };
+}
+
 function migratedReceiptMessageId(provisionId: string): string {
   const hex = createHash("sha256").update(`${provisionId}:receipt`, "utf8").digest("hex");
   return `c2c_msg_${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
@@ -634,6 +744,33 @@ function normalizeRegistry(registry: SessionRegistry): SessionRegistry {
       [task.pendingReviewHead, task.lastReviewHead].some(head => head !== undefined &&
         (typeof head !== "string" || !/^[0-9a-f]{40}$/u.test(head)))) {
       throw new Error("HOST_CONTROL_STATE_INVALID");
+    }
+    if (task.pendingMessageKind !== undefined && task.pendingMessageKind !== "init" && task.pendingMessageKind !== "executed") {
+      throw new Error("BUSINESS_MESSAGE_STATE_INVALID");
+    }
+    if (task.pendingMessageKind === "init") {
+      if (!task.pendingMessageId || task.pendingIteration === undefined ||
+        !/^[0-9a-f]{64}$/u.test(task.pendingMessageDigest ?? "")) {
+        throw new Error("C2C_INIT_PENDING_STATE_INVALID");
+      }
+      compactInitField(task.pendingMemoryProject, "memory_project", 120);
+    } else if (task.pendingMessageDigest !== undefined || task.pendingMemoryProject !== undefined) {
+      throw new Error("C2C_INIT_PENDING_STATE_INVALID");
+    }
+    const memory = task.memoryInitialization;
+    if (memory !== undefined) {
+      if (!memory || !Number.isSafeInteger(memory.generation) || memory.generation !== task.generation ||
+        (memory.status !== "ready" && memory.status !== "degraded") ||
+        typeof memory.checkedAt !== "string" || !Number.isFinite(Date.parse(memory.checkedAt))) {
+        throw new Error("MEMORY_INITIALIZATION_STATE_INVALID");
+      }
+      compactInitField(memory.project, "memory_project", 120);
+      validateMemorySources(memory.sources);
+      const reason = memory.reason === undefined ? undefined : compactInitField(memory.reason, "reason", 500);
+      if ((memory.status === "ready" && (!memory.sources.includes("memory_start_task") || reason !== undefined)) ||
+        (memory.status === "degraded" && !reason)) {
+        throw new Error("MEMORY_INITIALIZATION_STATE_INVALID");
+      }
     }
     if (task.activeUse !== undefined &&
       (!task.activeUse || !USE_ID_PATTERN.test(task.activeUse.useId) ||
@@ -1499,6 +1636,7 @@ export async function switchTaskWorkspace(input: SwitchTaskWorkspaceOptions): Pr
       workspaceName,
       branch: input.branch,
       routeCapabilityId: undefined,
+      memoryInitialization: undefined,
       verificationState: "pending",
       channelState: "ready",
       hostControl: undefined,
@@ -1708,6 +1846,9 @@ function unavailableTask(task: SavedTaskSession, reason: string): SavedTaskSessi
     pendingMessageId: undefined,
     pendingIteration: undefined,
     pendingReviewHead: undefined,
+    pendingMessageKind: undefined,
+    pendingMessageDigest: undefined,
+    pendingMemoryProject: undefined,
     pendingDispatchUncertain: undefined,
     sendAcceptedAt: undefined,
     deliveryPendingSince: undefined,
@@ -1729,6 +1870,9 @@ function quarantineTask(task: SavedTaskSession, reason: string): SavedTaskSessio
     pendingMessageId: undefined,
     pendingIteration: undefined,
     pendingReviewHead: undefined,
+    pendingMessageKind: undefined,
+    pendingMessageDigest: undefined,
+    pendingMemoryProject: undefined,
     pendingDispatchUncertain: undefined,
     sendAcceptedAt: undefined,
     deliveryPendingSince: undefined,
@@ -1786,6 +1930,7 @@ export async function restoreTaskConversation(
       channelState: "degraded",
       replacedConversations: current.replacedConversations.filter((item) => item.conversationId !== conversationId),
       replacementReason: undefined,
+      memoryInitialization: undefined,
       consecutiveReadFailures: 0,
       lastReadError: undefined,
       lastReadCheckedAt: now,
@@ -1893,7 +2038,9 @@ export async function recordTaskHostControl(
         throw new Error("HOST_CONTROL_NOT_INVOKED_UNPROVEN");
       }
       return { ...task, pendingMessageId: undefined, pendingIteration: undefined,
-        pendingReviewHead: undefined, pendingDispatchUncertain: undefined,
+        pendingReviewHead: undefined, pendingMessageKind: undefined,
+        pendingMessageDigest: undefined, pendingMemoryProject: undefined,
+        pendingDispatchUncertain: undefined,
         deliveryPendingSince: undefined, channelState: "degraded",
         hostControl: { status: "not_invoked", missingTools, checkedAt }, savedAt: checkedAt };
     } else if (observation.result === "timeout") status = "call_timeout";
@@ -1965,6 +2112,76 @@ export async function recordTaskReadResult(
   return task;
 }
 
+function reserveTaskSend(
+  task: SavedTaskSession,
+  id: string,
+  iteration: number,
+  flags: BeginSendOptions,
+): SavedTaskSession {
+  if (flags.messageKind !== undefined && flags.messageKind !== "init" && flags.messageKind !== "executed") {
+    throw new Error("BUSINESS_MESSAGE_KIND_INVALID");
+  }
+  if ((flags.bootstrap || flags.probe) && flags.messageKind !== undefined) {
+    throw new Error("BUSINESS_MESSAGE_KIND_FORBIDDEN");
+  }
+  if (flags.messageKind === "init") {
+    if (!/^[0-9a-f]{64}$/u.test(flags.messageDigest ?? "")) throw new Error("C2C_INIT_MESSAGE_DIGEST_INVALID");
+    compactInitField(flags.memoryProject, "memory_project", 120);
+  } else if (flags.messageDigest !== undefined || flags.memoryProject !== undefined) {
+    throw new Error("C2C_INIT_METADATA_FORBIDDEN");
+  }
+  if (flags.messageKind === "executed" && task.memoryInitialization?.generation !== task.generation) {
+    throw new Error("MEMORY_INIT_REQUIRED: send a generated INIT for this binding generation first");
+  }
+  if (flags.expectedGeneration !== undefined && task.generation !== flags.expectedGeneration) throw new Error("TASK_GENERATION_STALE");
+  if (task.activeUse && flags.useId !== task.activeUse.useId) throw new Error("TASK_USE_STALE");
+  if (flags.useId !== undefined && !USE_ID_PATTERN.test(flags.useId)) throw new Error("TASK_USE_ID_INVALID");
+  if (task.bindingState !== "bound") throw new Error("task conversation binding is unavailable");
+  if (task.hostControl && task.hostControl.status !== "ready" && !(flags.bootstrap && task.hostControl.status === "migration_boot_ready")) throw new Error("HOST_CONTROL_NOT_READY: probe tools and read the exact bound Chat");
+  const migrating = task.migrationHandshake && !task.migrationHandshake.completedAt;
+  const legacyMigration = !task.migrationHandshake && task.verificationState === "pending" &&
+    readSessionLedger().assignmentHistory?.some(h => h.reason === "workspace_switch" && h.taskId === task.taskId &&
+      h.conversationId === task.conversationId && h.generation === task.generation - 1);
+  if (migrating || legacyMigration) {
+    if (!flags.bootstrap || task.hostControl?.status !== "migration_boot_ready" || flags.expectedGeneration !== task.generation ||
+      Date.now() - Date.parse(task.hostControl.checkedAt) > 60_000 || Date.parse(task.hostControl.checkedAt) > Date.now()) {
+      throw new Error("MIGRATION_PREFLIGHT_REQUIRED: probe then migration-read-ok before BOOT");
+    }
+  }
+  if (task.settingsSource !== "user_confirmed") throw new Error("task conversation settings lack user confirmation");
+  if (!flags.bootstrap && task.verificationState !== "ready") {
+    throw new Error("task conversation requires workspace verification before task content");
+  }
+  if (flags.bootstrap && task.verificationState !== "pending") {
+    throw new Error("bootstrap sends are accepted only before workspace verification");
+  }
+  if (task.pendingMessageId) throw new Error("task conversation already has an in-flight message");
+  if (task.channelState === "degraded" && !flags.probe) {
+    throw new Error("task conversation is degraded; a recovery probe is required");
+  }
+  if (task.channelState !== "ready" && task.channelState !== "degraded") {
+    throw new Error(`task conversation is busy (${task.channelState})`);
+  }
+  return {
+    ...task,
+    channelState: "sending",
+    hostControl: migrating ? { ...task.hostControl!, status: "readback_required" } : task.hostControl,
+    migrationHandshake: migrating ? { ...task.migrationHandshake!, bootMessageId: id } : task.migrationHandshake,
+    pendingMessageId: id,
+    pendingIteration: iteration,
+    pendingDispatchUncertain: undefined,
+    pendingReviewHead: flags.reviewHead,
+    pendingMessageKind: flags.messageKind,
+    pendingMessageDigest: flags.messageDigest,
+    pendingMemoryProject: flags.memoryProject,
+    sendAcceptedAt: undefined,
+    deliveryPendingSince: undefined,
+    lastDeliveryError: undefined,
+    lastDeliveryCheckedAt: new Date().toISOString(),
+    savedAt: new Date().toISOString(),
+  };
+}
+
 export async function beginTaskSend(
   workspaceId: string,
   taskId: string,
@@ -1977,52 +2194,35 @@ export async function beginTaskSend(
   const flags = typeof options === "boolean" ? { probe: options } : options;
   if (flags.reviewHead !== undefined && !/^[0-9a-f]{40}$/u.test(flags.reviewHead)) throw new Error("REVIEW_HEAD_INVALID");
   if (flags.bootstrap && flags.reviewHead !== undefined) throw new Error("BOOT_REVIEW_HEAD_FORBIDDEN");
-  return updateTaskChannel(workspaceId, taskId, (task) => {
-    if (flags.expectedGeneration !== undefined && task.generation !== flags.expectedGeneration) throw new Error("TASK_GENERATION_STALE");
-    if (task.activeUse && flags.useId !== task.activeUse.useId) throw new Error("TASK_USE_STALE");
-    if (flags.useId !== undefined && !USE_ID_PATTERN.test(flags.useId)) throw new Error("TASK_USE_ID_INVALID");
-    if (task.bindingState !== "bound") throw new Error("task conversation binding is unavailable");
-    if (task.hostControl && task.hostControl.status !== "ready" && !(flags.bootstrap && task.hostControl.status === "migration_boot_ready")) throw new Error("HOST_CONTROL_NOT_READY: probe tools and read the exact bound Chat");
-    const migrating = task.migrationHandshake && !task.migrationHandshake.completedAt;
-    const legacyMigration = !task.migrationHandshake && task.verificationState === "pending" &&
-      readSessionLedger().assignmentHistory?.some(h => h.reason === "workspace_switch" && h.taskId === taskId &&
-        h.conversationId === task.conversationId && h.generation === task.generation - 1);
-    if (migrating || legacyMigration) {
-      if (!flags.bootstrap || task.hostControl?.status !== "migration_boot_ready" || flags.expectedGeneration !== task.generation ||
-        Date.now() - Date.parse(task.hostControl.checkedAt) > 60_000 || Date.parse(task.hostControl.checkedAt) > Date.now()) {
-        throw new Error("MIGRATION_PREFLIGHT_REQUIRED: probe then migration-read-ok before BOOT");
-      }
-    }
-    if (task.settingsSource !== "user_confirmed") throw new Error("task conversation settings lack user confirmation");
-    if (!flags.bootstrap && task.verificationState !== "ready") {
-      throw new Error("task conversation requires workspace verification before task content");
-    }
-    if (flags.bootstrap && task.verificationState !== "pending") {
-      throw new Error("bootstrap sends are accepted only before workspace verification");
-    }
-    if (task.pendingMessageId) throw new Error("task conversation already has an in-flight message");
-    if (task.channelState === "degraded" && !flags.probe) {
-      throw new Error("task conversation is degraded; a recovery probe is required");
-    }
-    if (task.channelState !== "ready" && task.channelState !== "degraded") {
-      throw new Error(`task conversation is busy (${task.channelState})`);
-    }
-    return {
-      ...task,
-      channelState: "sending",
-      hostControl: migrating ? { ...task.hostControl!, status: "readback_required" } : task.hostControl,
-      migrationHandshake: migrating ? { ...task.migrationHandshake!, bootMessageId: id } : task.migrationHandshake,
-      pendingMessageId: id,
-      pendingIteration: iteration,
-      pendingDispatchUncertain: undefined,
-      pendingReviewHead: flags.reviewHead,
-      sendAcceptedAt: undefined,
-      deliveryPendingSince: undefined,
-      lastDeliveryError: undefined,
-      lastDeliveryCheckedAt: new Date().toISOString(),
-      savedAt: new Date().toISOString(),
-    };
+  return updateTaskChannel(workspaceId, taskId, task => reserveTaskSend(task, id, iteration, flags));
+}
+
+/** Atomically reserve and render the only supported business INIT format. */
+export async function prepareTaskInit(
+  workspaceId: string,
+  taskId: string,
+  input: unknown,
+  options: Pick<BeginSendOptions, "reviewHead" | "useId"> = {},
+): Promise<PreparedInitMessage> {
+  const init = validateInitMessageInput(input);
+  if (options.reviewHead !== undefined && !/^[0-9a-f]{40}$/u.test(options.reviewHead)) throw new Error("REVIEW_HEAD_INVALID");
+  let prepared: Omit<PreparedInitMessage, "task"> | undefined;
+  const task = await updateTaskChannel(workspaceId, taskId, current => {
+    const messageId = newMessageId();
+    const iteration = current.iteration + 1;
+    const message = renderInitMessage(workspaceId, current.taskId, messageId, iteration, init, options.reviewHead);
+    const messageDigestValue = digestBusinessMessage(message);
+    prepared = { messageId, iteration, message, messageDigest: messageDigestValue };
+    return reserveTaskSend(current, messageId, iteration, {
+      reviewHead: options.reviewHead,
+      useId: options.useId,
+      messageKind: "init",
+      messageDigest: messageDigestValue,
+      memoryProject: init.memoryProject,
+    });
   });
+  if (!prepared) throw new Error("C2C_INIT_PREPARATION_FAILED");
+  return { task, ...prepared };
 }
 
 export async function confirmTaskSendAccepted(
@@ -2069,12 +2269,19 @@ export async function recordTaskDeliveryPending(
 export async function confirmTaskDelivery(
   workspaceId: string,
   taskId: string,
-  messageId: string
+  messageId: string,
+  observedMessageDigest?: string
 ): Promise<SavedTaskSession> {
   const id = validateMessageId(messageId);
   return updateTaskChannel(workspaceId, taskId, (task) => {
     if (task.channelState !== "sending" || task.pendingMessageId !== id) {
       throw new Error("delivery receipt does not match the in-flight message");
+    }
+    if (task.pendingMessageKind === "init") {
+      if (!observedMessageDigest) throw new Error("C2C_INIT_READBACK_REQUIRED");
+      if (observedMessageDigest !== task.pendingMessageDigest) throw new Error("C2C_INIT_READBACK_MISMATCH");
+    } else if (observedMessageDigest !== undefined) {
+      throw new Error("C2C_MESSAGE_READBACK_UNEXPECTED");
     }
     return {
       ...task,
@@ -2092,7 +2299,8 @@ export async function confirmTaskReply(
   taskId: string,
   messageId: string,
   state: string,
-  observedReviewHead?: string
+  observedReviewHead?: string,
+  observedMemory?: MemoryReplyObservation
 ): Promise<SavedTaskSession> {
   const id = validateMessageId(messageId);
   const normalizedState = state.trim().toUpperCase();
@@ -2111,6 +2319,13 @@ export async function confirmTaskReply(
     if (task.pendingReviewHead && !legacyMalformedBootstrap && observedReviewHead !== task.pendingReviewHead) {
       throw new Error("REVIEW_HEAD_MISMATCH");
     }
+    if (task.pendingMessageKind !== "init" && observedMemory !== undefined) {
+      throw new Error("MEMORY_REPLY_OBSERVATION_UNEXPECTED");
+    }
+    const memory = task.pendingMessageKind === "init"
+      ? validateMemoryReplyObservation(observedMemory, task)
+      : undefined;
+    const checkedAt = new Date().toISOString();
     return {
       ...task,
       channelState: "ready",
@@ -2120,12 +2335,23 @@ export async function confirmTaskReply(
       pendingMessageId: undefined,
       pendingIteration: undefined,
       pendingReviewHead: undefined,
+      pendingMessageKind: undefined,
+      pendingMessageDigest: undefined,
+      pendingMemoryProject: undefined,
       pendingDispatchUncertain: undefined,
       sendAcceptedAt: undefined,
       deliveryPendingSince: undefined,
       lastDeliveryError: undefined,
-      lastDeliveryCheckedAt: new Date().toISOString(),
-      savedAt: new Date().toISOString(),
+      lastDeliveryCheckedAt: checkedAt,
+      memoryInitialization: memory ? {
+        generation: task.generation,
+        project: memory.project,
+        status: memory.status,
+        sources: memory.sources,
+        reason: memory.reason,
+        checkedAt,
+      } : task.memoryInitialization,
+      savedAt: checkedAt,
     };
   });
 }
@@ -2161,6 +2387,9 @@ export async function failTaskDelivery(
       pendingMessageId: undefined,
       pendingIteration: undefined,
       pendingReviewHead: undefined,
+      pendingMessageKind: undefined,
+      pendingMessageDigest: undefined,
+      pendingMemoryProject: undefined,
       pendingDispatchUncertain: undefined,
       sendAcceptedAt: undefined,
       deliveryPendingSince: undefined,

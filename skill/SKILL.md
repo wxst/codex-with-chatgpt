@@ -24,9 +24,10 @@ and then use ChatGPT only as a second reviewer.
    and connection readiness. Follow the operational sections below to resume or
    acquire the exact task Chat, resolve pending receipts, and reach `ready`.
    BOOT DONE confirms connectivity only; it does not complete the business task.
-2. Send INIT before substantive exploration or implementation. Give ChatGPT the
-   goal, constraints, success criteria, and evidence locations; let it retrieve
-   current code itself. Do not paste files or precompute the entire answer.
+2. Send the generated mem-initialized INIT before substantive exploration or
+   implementation. Use `session prepare-init`; it is the only business INIT
+   entrypoint and its output is sent verbatim. Do not handwrite an INIT, paste
+   files, or precompute the entire answer.
 3. Wait for a matching substantive PLAN containing
    SOURCE_EVIDENCE, ACTIONS, TESTS, and SUCCESS_CRITERIA. Evidence identifies the
    relevant files/symbols and observations; actions explain what to do and why.
@@ -47,9 +48,10 @@ and then use ChatGPT only as a second reviewer.
    coordinator lease with `session finish --use-id <id>` when one exists.
 
 The business sequence is `ready → INIT → PLAN → execution → EXECUTED → PLAN / DONE / BLOCKED`.
-These are message instructions, not new CLI states or an expansion of tool permissions.
-Use the delivery procedure under Normal control loop for every send, including
-follow-up analysis. Review requests retain the exact REVIEW_HEAD contract below.
+The generated INIT records a per-generation mem receipt in the ledger; it does
+not add C2C MCP tools or permissions. Use the delivery procedure under Normal
+control loop for every send, including follow-up analysis. Review requests retain
+the exact REVIEW_HEAD contract below.
 
 ### Routing exceptions and unavailable channels
 
@@ -709,11 +711,12 @@ Only a `ready` task may receive task content.
 
 ## Normal control loop
 
-Every message includes `TASK_ID`, `WORKSPACE_ID`, `ITERATION`, and a fresh
-`MESSAGE_ID`. Always generate it with `session new-message-id`; never write a
-handmade `c2c_msg_*` value. Complete host preflight above, call `session begin-send`, then
-`send_message_to_thread`, then `confirm-send-accepted`, then poll `read_thread`
-and use `confirm-delivery` / `confirm-reply`.
+Every control message includes `TASK_ID`, `WORKSPACE_ID`, `ITERATION`, and a
+fresh `MESSAGE_ID`. Complete host preflight above, send to the exact bound Chat,
+record host acceptance, poll `read_thread`, and then confirm delivery and reply.
+`session prepare-init` creates the INIT id, iteration, body, digest, and atomic
+reservation together. `session new-message-id` is for BOOT, recovery probes, and
+EXECUTED only; never write a handmade `c2c_msg_*` value.
 
 `REVIEW_HEAD` belongs only to review-bearing INIT or EXECUTED messages. Never put
 it on BOOT or pass `--review-head` with `begin-send --bootstrap`; the CLI rejects
@@ -725,29 +728,86 @@ read back. A late readback keeps the same message in `sending`; it does not
 advance the iteration or create a second send. A later recovery after an
 explicit terminal host result uses a fresh message id and `begin-send --probe`.
 
-Keep control messages under 1 KB. ChatGPT must retrieve code itself.
-Use separate templates; substitute concise values and check the actual message size.
-The reply may be longer when needed for an actionable plan. SOURCE_EVIDENCE must
-distinguish actual tool observations from assumptions or executor reports.
+Keep control messages under 1 KB. ChatGPT must retrieve code itself. The reply
+may be longer when needed for an actionable plan. SOURCE_EVIDENCE must distinguish
+actual tool observations from assumptions or executor reports.
+
+## Mandatory mem business INIT
+
+Every new C2C business task, the first business request after a pool rotation,
+and the first business request after a workspace migration must use this exact
+flow. BOOT remains C2C identity verification only. A previous task's Chat mem
+context never satisfies this requirement, because the initialization belongs to
+the current binding generation.
+
+1. Create a UTF-8 JSON input file. Keep each field concise so the generated
+   message stays under 1 KB. `repository.provider` is `github`, `gitea`, or
+   `other`; `memoryProject` is the ChatGPT mem project identifier.
+
+```json
+{
+  "goal": "<one short task statement>",
+  "constraints": "<scope, user decisions, exclusions>",
+  "successCriteria": "<observable outcome>",
+  "repository": { "provider": "gitea", "name": "owner/repo", "branch": "main" },
+  "localState": "clean main",
+  "memoryProject": "<registered mem project>"
+}
+```
+
+2. Reserve and render the exact INIT. Do not replace its `MESSAGE_ID`, edit its
+   text, or use `begin-send` for INIT. Include `--use-id` if this task holds a
+   lease, and `--review-head` only for a review-bearing INIT.
 
 ```text
-[C2C]
-STATE: INIT
-TASK_ID: <task-id>
-WORKSPACE_ID: <workspace-id>
-ITERATION: <n>
-MESSAGE_ID: <message-id>
-
-GOAL: <one short task statement>
-CONSTRAINTS: <scope, user decisions, exclusions>
-SUCCESS_CRITERIA: <observable outcome>
-REPOSITORY: <github|gitea|other> <owner/repo> <branch>
-LOCAL_STATE: <clean|local changes|unpushed commits>
-
-Read current code through the read-only tools. Echo the four identity fields.
-Reply STATE: PLAN with SOURCE_EVIDENCE, ACTIONS, TESTS, and SUCCESS_CRITERIA;
-if blocked, report the missing prerequisite instead of inventing evidence.
+node "__C2C_CHECKOUT__/bin/c2c.js" session prepare-init \
+  -w <workspace> --task-id <task-id> --input-file <init.json> \
+  --use-id <use-id> --json
 ```
+
+Send the returned `message` string unchanged with `send_message_to_thread` to
+the bound `conversationId`, then record `confirm-send-accepted`. Read the exact
+user message back, write only its exact body to a UTF-8 file, and bind its SHA-256
+through delivery confirmation. A missing file or differing body leaves the INIT
+pending and must not be replaced.
+
+```text
+node "__C2C_CHECKOUT__/bin/c2c.js" session confirm-delivery \
+  -w <workspace> --task-id <task-id> --message-id <message-id> \
+  --observed-task-id <task-id> --observed-workspace-id <workspace-id> \
+  --observed-iteration <iteration> --observed-message-file <exact-user-body.txt> --json
+```
+
+3. The generated request requires ChatGPT to call `memory_start_task` first with
+   `detail="standard"`, `intent="start"`, `mode="hybrid"`, and
+   `includeProjectContext=true`. It passes the goal, constraints, and success
+   criteria as `task`, and the exact `MEMORY_PROJECT` as `project`. If historical
+   facts or documents are needed, it calls `memory_search`. For Gitea work it
+   then uses read-only `codewiki_*` and `gitea_*` tools as needed. It also calls
+   C2C `workspace_info` and current-source tools; local C2C evidence wins on a
+   conflict. It never calls `memory_write_summary`, any Gitea write tool, or any
+   other write interface without separate user authorization.
+
+4. Read the matching reply and confirm its exact identity plus all mem fields.
+   `READY` means `memory_start_task` actually succeeded. `DEGRADED` is allowed
+   only with a concrete reason (missing connector, unregistered project, or a
+   read failure); retain it and continue from C2C local evidence. It never means
+   that Codex may claim the unavailable mem analysis occurred.
+
+```text
+node "__C2C_CHECKOUT__/bin/c2c.js" session confirm-reply \
+  -w <workspace> --task-id <task-id> --message-id <message-id> \
+  --observed-task-id <task-id> --observed-workspace-id <workspace-id> \
+  --observed-iteration <iteration> --state PLAN \
+  --memory-project <MEMORY_PROJECT> --memory-status READY \
+  --memory-sources memory_start_task,memory_search,codewiki_repo_tree,gitea_get_issue --json
+```
+
+For a degraded reply replace the last two lines with its exact source list,
+`--memory-status DEGRADED`, and `--memory-reason <exact reason>`. After this
+confirmation only, send ordinary business follow-ups as
+`session begin-send --kind executed`; the CLI rejects EXECUTED if the current
+generation has no READY or DEGRADED mem initialization.
 
 ```text
 [C2C]
@@ -762,21 +822,24 @@ RESULTS: <changes, checks, failures; executor-reported>
 EVIDENCE: <current diff, test-record or artifact locations>
 LOCAL_STATE: <clean|local changes|unpushed commits>
 
-Read current evidence through the read-only tools. Echo the four identity fields.
+This follows an already confirmed current-generation mem INIT. Read current
+evidence through the read-only tools. Echo the four identity fields.
 Return the next substantive PLAN, verified DONE, or BLOCKED with prerequisites.
 Separate independent observations from executor reports.
 ```
 
 ## ChatGPT read-source order
 
-- **GitHub:** GitHub connector for committed code, history, PRs, and issues;
-  C2C MCP for local files, diff, tests, and unpushed work.
-- **Gitea:** mem / OpenDeepWiki for Wiki, architecture, repository structure,
-  and durable project context; C2C MCP for current local source and changes.
-- **Other repositories:** C2C MCP.
+1. `memory_start_task` loads project memory, rules, and document context.
+2. `memory_search` answers a specific historical or documentation question.
+3. For Gitea, read-only `codewiki_*` and `gitea_*` tools read Wiki, repository
+   structure, Issues, commits, and current remote state.
+4. C2C MCP reads the actual current workspace, uncommitted diff, and execution
+   records. It is final authority when sources conflict.
 
-The current C2C workspace is final authority. Connector content and Wiki data
-can be stale.
+Memory, Wiki, and remote repository data can be stale. The C2C Router still has
+exactly eight read-only workspace tools; mem, OpenDeepWiki, and Gitea are not
+implemented or exposed by this repository's Router.
 
 ## Safety invariants
 

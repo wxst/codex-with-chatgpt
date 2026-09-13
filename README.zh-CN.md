@@ -19,6 +19,14 @@ BOOT 的 DONE 仅表示连接就绪。有效 PLAN 应包含源码依据、行动
 Codex 据此执行，再回传简短结果及证据位置，由 ChatGPT 继续分析或复核。
 具体模板与送达步骤见 [Skill](skill/SKILL.md#daily-reasoning-workflow)。
 
+每个业务 INIT 都必须由 `c2c session prepare-init --input-file <UTF-8 JSON>
+--json` 生成并原子预留，agent 只能原样发送其返回的 message。它要求 ChatGPT 首先
+调用 `memory_start_task` 获取项目记忆和规则，再按需用 `memory_search` 补充历史。Gitea
+任务可使用只读 `codewiki_*`、`gitea_*` 工具读取 Wiki 和远端事实。八个只读 C2C MCP
+工具仍是当前本地工作区、未提交 diff 和执行记录的最终依据。只有实际启动 mem 才记录
+`READY`；有具体原因的 `DEGRADED` 继续以 C2C 证据工作。Chat、binding generation 或
+workspace 迁移后，必须重新 INIT 才能发送 EXECUTED。
+
 简单确定性操作（如微小错字修改）仅在无需探索、设计或诊断时直接执行；跨文件
 重命名若影响尚未确认，仍须先分析。已有完整用户计划时，只补必要代码定位和缺口分析；
 纯复核任务保持纯复核。用户禁止外发时不发送任务内容。通道不可用时保留绑定和

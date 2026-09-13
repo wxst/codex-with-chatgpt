@@ -101,6 +101,8 @@ import {
   quarantineStandbyConversation,
   readStandbyPool,
   resolveCodexTaskId,
+  prepareTaskInit,
+  digestBusinessMessage,
 } from "../session/state.js";
 
 const program = new Command();
@@ -1231,6 +1233,21 @@ function parseReclaimObservations(input: string | undefined): ReclaimObservation
   }
 }
 
+/** Read a JSON transport file without accepting malformed UTF-8 by replacement. */
+function readUtf8JsonInputFile(file: string, errorCode: string): unknown {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(path.resolve(file)));
+  } catch {
+    throw new InvalidArgumentError(`${errorCode}: expected a readable UTF-8 JSON file`);
+  }
+  try {
+    return JSON.parse(text.replace(/^\uFEFF/u, "")) as unknown;
+  } catch {
+    throw new InvalidArgumentError(`${errorCode}: expected UTF-8 JSON`);
+  }
+}
+
 session.command("get", { isDefault: true })
   .description("Show the task-scoped ChatGPT conversation")
   .option("-w, --workspace <path>").option("--task-id <id>", "stable Codex task id")
@@ -1661,14 +1678,47 @@ function parseReceiptIteration(value: string): number {
   return Number(value);
 }
 
+session.command("prepare-init")
+  .description("Render and atomically reserve the required mem-initialized business INIT")
+  .option("-w, --workspace <path>").option("--task-id <id>")
+  .requiredOption("--input-file <path>", "UTF-8 JSON with goal, constraints, repository, localState, and memoryProject")
+  .option("--review-head <sha>", "bind this review to an exact full Git HEAD")
+  .option("--use-id <id>", "fence this INIT to the active session resume lease")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; taskId?: string; inputFile: string; reviewHead?: string; useId?: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const current = readTaskSession(workspace.id, resolved.taskId);
+    if (current?.hostControl?.status !== "ready" || !Number.isFinite(Date.parse(current.hostControl.checkedAt)) ||
+      Date.now() - Date.parse(current.hostControl.checkedAt) > 60_000 || Date.parse(current.hostControl.checkedAt) > Date.now()) {
+      throw new Error("HOST_CONTROL_PREFLIGHT_REQUIRED: record current callable tools and exact bound Chat readback before prepare-init");
+    }
+    const prepared = await prepareTaskInit(
+      workspace.id,
+      resolved.taskId,
+      readUtf8JsonInputFile(opts.inputFile, "C2C_INIT_INPUT_INVALID"),
+      { reviewHead: opts.reviewHead, useId: opts.useId },
+    );
+    const payload = { ok: true, reserved: true, accepted: false, delivered: false, replied: false,
+      identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source,
+      messageId: prepared.messageId, iteration: prepared.iteration, message: prepared.message,
+      messageDigest: prepared.messageDigest, byteLength: Buffer.byteLength(prepared.message, "utf8"), task: prepared.task };
+    if (opts.json) say(JSON.stringify(payload));
+    else {
+      say(prepared.message);
+      check(`已保留 mem 初始化 INIT ${prepared.messageId}；将上述原文发送到同一 Chat 后再精确读回。`);
+    }
+  });
+
 addChannelCommandOptions(session.command("begin-send").description("Atomically reserve one outbound ChatGPT message"))
   .requiredOption("--iteration <n>")
   .option("--probe", "allow one recovery probe for a degraded channel", false)
   .option("--bootstrap", "reserve the workspace_info boot message before ready", false)
+  .option("--kind <kind>", "executed for a post-INIT business message")
   .option("--review-head <sha>", "bind this review to an exact full Git HEAD")
   .option("--expected-generation <n>", "fence this send to the resumed binding generation")
   .option("--use-id <id>", "fence this send to the active session resume lease")
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; iteration: string; probe: boolean; bootstrap: boolean; reviewHead?: string; expectedGeneration?: string; useId?: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; iteration: string; probe: boolean; bootstrap: boolean; kind?: string; reviewHead?: string; expectedGeneration?: string; useId?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const current = readTaskSession(workspace.id, resolved.taskId);
@@ -1677,13 +1727,19 @@ addChannelCommandOptions(session.command("begin-send").description("Atomically r
       Date.now() - Date.parse(current.hostControl.checkedAt) > 60_000 || Date.parse(current.hostControl.checkedAt) > Date.now()) {
       throw new Error("HOST_CONTROL_PREFLIGHT_REQUIRED: record current callable tools and exact bound Chat readback before begin-send");
     }
+    if (opts.bootstrap || opts.probe) {
+      if (opts.kind !== undefined) throw new Error("BUSINESS_MESSAGE_KIND_FORBIDDEN: BOOT and recovery probes have no business kind");
+    } else if (opts.kind !== "executed") {
+      throw new Error("BUSINESS_MESSAGE_KIND_REQUIRED: use session prepare-init for INIT or --kind executed after it is confirmed");
+    }
     const task = await beginTaskSend(
       workspace.id,
       resolved.taskId,
       opts.messageId,
       parseReceiptIteration(opts.iteration),
       { probe: opts.probe, bootstrap: opts.bootstrap, reviewHead: opts.reviewHead,
-        expectedGeneration: opts.expectedGeneration === undefined ? undefined : parseReceiptIteration(opts.expectedGeneration), useId: opts.useId }
+        expectedGeneration: opts.expectedGeneration === undefined ? undefined : parseReceiptIteration(opts.expectedGeneration),
+        useId: opts.useId, messageKind: opts.kind === "executed" ? "executed" : undefined }
     );
     if (opts.json) say(JSON.stringify({ ok: true, reserved: true, accepted: false, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`已保留发送 ${task.pendingMessageId}；尚未确认送达`);
@@ -1708,7 +1764,8 @@ addChannelCommandOptions(session.command("record-delivery-pending").description(
   });
 
 addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-delivery").description("Confirm an outbound message was observed in ChatGPT")))
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; json: boolean }) => {
+  .option("--observed-message-file <path>", "exact UTF-8 body read back from the bound Chat; required for generated INIT")
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; observedMessageFile?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const current = readTaskSession(workspace.id, resolved.taskId);
@@ -1717,7 +1774,10 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-del
       { messageId: current.pendingMessageId, taskId: current.taskId, workspaceId: workspace.id, iteration: current.pendingIteration },
       { messageId: opts.messageId, taskId: opts.observedTaskId, workspaceId: opts.observedWorkspaceId, iteration: parseReceiptIteration(opts.observedIteration) }
     );
-    const task = await confirmTaskDelivery(workspace.id, resolved.taskId, opts.messageId);
+    const observedDigest = opts.observedMessageFile === undefined ? undefined : digestBusinessMessage(
+      new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(path.resolve(opts.observedMessageFile)))
+    );
+    const task = await confirmTaskDelivery(workspace.id, resolved.taskId, opts.messageId, observedDigest);
     if (opts.json) say(JSON.stringify({ ok: true, accepted: Boolean(current.sendAcceptedAt), delivered: true, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`已确认送达 ${task.lastDeliveredMessageId}；正在等待回复`);
   });
@@ -1725,7 +1785,11 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-del
 addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-reply").description("Confirm a matching ChatGPT reply and complete the iteration")))
   .requiredOption("--state <state>")
   .option("--observed-review-head <sha>", "exact REVIEW_HEAD echoed by the reply")
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; state: string; observedReviewHead?: string; json: boolean }) => {
+  .option("--memory-project <id>", "MEMORY_PROJECT echoed by a generated INIT reply")
+  .option("--memory-status <status>", "MEMORY_STATUS: READY or DEGRADED")
+  .option("--memory-sources <csv>", "MEMORY_SOURCES from the INIT reply")
+  .option("--memory-reason <reason>", "MEMORY_REASON required for DEGRADED")
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; state: string; observedReviewHead?: string; memoryProject?: string; memoryStatus?: string; memorySources?: string; memoryReason?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const current = readTaskSession(workspace.id, resolved.taskId);
@@ -1734,7 +1798,14 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-rep
       { messageId: current.pendingMessageId, taskId: current.taskId, workspaceId: workspace.id, iteration: current.pendingIteration },
       { messageId: opts.messageId, taskId: opts.observedTaskId, workspaceId: opts.observedWorkspaceId, iteration: parseReceiptIteration(opts.observedIteration) }
     );
-    const task = await confirmTaskReply(workspace.id, resolved.taskId, opts.messageId, opts.state, opts.observedReviewHead);
+    const memoryFlagProvided = [opts.memoryProject, opts.memoryStatus, opts.memorySources, opts.memoryReason].some(value => value !== undefined);
+    const memory = !memoryFlagProvided ? undefined : {
+      project: opts.memoryProject ?? "",
+      status: (opts.memoryStatus ?? "").trim().toLowerCase() as "ready" | "degraded",
+      sources: opts.memorySources === undefined ? [] : opts.memorySources.split(",").map(value => value.trim()).filter(Boolean),
+      reason: opts.memoryReason,
+    };
+    const task = await confirmTaskReply(workspace.id, resolved.taskId, opts.messageId, opts.state, opts.observedReviewHead, memory);
     if (opts.json) say(JSON.stringify({ ok: true, accepted: Boolean(current.sendAcceptedAt), delivered: true, replied: true, identityVerified: true, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`已确认回复；任务迭代推进到 ${task.iteration}`);
   });

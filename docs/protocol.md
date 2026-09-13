@@ -7,17 +7,42 @@ test design, and review using read-only source access. This uses ChatGPT subscri
 capacity to reduce repeated reasoning in Codex. Codex owns execution, necessary
 judgment, and verification; it checks scope and readiness before requesting analysis.
 
-`ready → INIT → PLAN → execution → EXECUTED → PLAN / DONE / BLOCKED`
+`ready → generated mem INIT → PLAN → execution → EXECUTED → PLAN / DONE / BLOCKED`
 
-INIT supplies the goal, constraints, and success criteria. ChatGPT retrieves code
-and returns a substantive PLAN with SOURCE_EVIDENCE, ACTIONS, TESTS, and
+Every business INIT is created only by `session prepare-init -w <workspace>
+--input-file <UTF-8 JSON> [--use-id] [--review-head] --json`. It atomically
+generates the receipt id, iteration, under-1-KB body, its SHA-256, and the send
+reservation; agents send its returned `message` unchanged. The JSON contains
+`goal`, `constraints`, `successCriteria`, `repository.provider/name/branch`,
+`localState`, and `memoryProject`.
+
+The generated INIT supplies the goal, constraints, and success criteria and first
+requires ChatGPT to call `memory_start_task` with the exact `memoryProject`,
+`detail="standard"`, `intent="start"`, `mode="hybrid"`, and
+`includeProjectContext=true`. It uses `memory_search` for needed history and
+documents, read-only `codewiki_*` and `gitea_*` tools for Gitea facts when
+relevant, and C2C source tools for the current workspace. It must not call
+`memory_write_summary`, Gitea write tools, or any other write tool without
+separate user authorization. C2C local evidence is final if sources conflict.
+
+The matching INIT reply must echo `MEMORY_PROJECT`, `MEMORY_STATUS`, and
+`MEMORY_SOURCES`; `MEMORY_REASON` is mandatory for `DEGRADED`. `READY` records a
+successful `memory_start_task`; `DEGRADED` records a concrete unavailable,
+unregistered, or read-failure reason and permits C2C-only continuation. Delivery
+confirmation for INIT requires `--observed-message-file` and compares its exact
+readback digest. Reply confirmation stores the mem result only for the current
+generation. A pool rotation, generation change, or workspace migration clears it;
+old Chat context never authorizes a new task. `begin-send --kind executed`
+requires a current-generation READY or DEGRADED INIT.
+
+ChatGPT returns a substantive PLAN with SOURCE_EVIDENCE, ACTIONS, TESTS, and
 SUCCESS_CRITERIA. Codex checks and executes that plan, then sends EXECUTED with
 results and evidence locations. Complex failures return to ChatGPT for diagnosis;
 Codex does not repeat the entire investigation. An identity echo or generic advice
 does not satisfy PLAN. BOOT DONE confirms connectivity only, not business completion.
 Business DONE requires evidence for the agreed outcome, checked by Codex. There is
 no fixed business-iteration cap. All messages retain the delivery and identity
-requirements below; these instructions introduce no new CLI or ledger states.
+requirements below.
 
 Simple deterministic operations, such as a trivial typo edit, can run directly only
 when no exploration, design, or diagnosis is needed. Mechanical cross-file changes

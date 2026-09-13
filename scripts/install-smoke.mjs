@@ -75,6 +75,12 @@ try {
   assert.match(sessionHelp, /confirm-send-accepted/u, "session help did not expose host acceptance tracking");
   assert.match(sessionHelp, /record-delivery-pending/u, "session help did not expose late-delivery tracking");
   assert.match(sessionHelp, /migrate/u, "session help did not expose assignment-ledger migration");
+  assert.match(sessionHelp, /prepare-init/u, "session help did not expose generated mem INIT preparation");
+
+  const initHelp = runCli(["session", "prepare-init", "--help"], env);
+  assert.match(initHelp, /--input-file <path>/u, "prepare-init did not require a UTF-8 input file");
+  const deliveryHelp = runCli(["session", "confirm-delivery", "--help"], env);
+  assert.match(deliveryHelp, /--observed-message-file <path>/u, "confirm-delivery did not expose INIT readback proof");
 
   const failDeliveryHelp = runCli(["session", "fail-delivery", "--help"], env);
   assert.match(failDeliveryHelp, /--kind <kind>/u, "fail-delivery did not require a terminal failure kind");

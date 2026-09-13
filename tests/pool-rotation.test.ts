@@ -5,7 +5,8 @@ import { afterEach, beforeEach, expect, it } from "vitest";
 import { attachTaskRouteCapability, beginTaskSend, claimStandbyConversation, confirmTaskDelivery,
   confirmTaskReply, confirmTaskWorkspace, importStandbyConversation, newMessageId, readReclaimCandidates,
   readTaskSession, resumeTaskSession, sessionLedgerFile, validateReclaimObservations, failTaskDelivery,
-  type BoundRecoveryObservation, type NotLoadedReclaimObservation, type ReclaimObservation } from "../src/session/state.js";
+  digestBusinessMessage, prepareTaskInit, type BoundRecoveryObservation, type NotLoadedReclaimObservation,
+  type ReclaimObservation } from "../src/session/state.js";
 import { createWorkspaceRouter, issueRouteCapability, resolveRouteCapability } from "../src/router/state.js";
 import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir } from "./helpers.js";
 
@@ -90,6 +91,25 @@ it("accepts corroborated notLoaded evidence, archives the old owner, and boots t
   await expect(resolveRouteCapability(oldRoute.token)).rejects.toThrow("ROUTE_ACCESS_DENIED");
   await boot("new-owner");
   expect(readTaskSession(workspaceId, "new-owner")).toMatchObject({ verificationState: "ready", channelState: "ready" });
+});
+
+it("does not carry a completed mem INIT into a Chat-pool replacement generation", async () => {
+  const init = await prepareTaskInit(workspaceId, "old-owner", {
+    goal: "Review pool replacement", constraints: "read only", successCriteria: "record mem receipt",
+    repository: { provider: "gitea", name: "wxst/repo", branch: "main" }, localState: "clean", memoryProject: "pool-test",
+  });
+  await confirmTaskDelivery(workspaceId, "old-owner", init.messageId, digestBusinessMessage(init.message));
+  await confirmTaskReply(workspaceId, "old-owner", init.messageId, "PLAN", undefined, {
+    project: "pool-test", status: "ready", sources: ["memory_start_task"],
+  });
+  expect(readTaskSession(workspaceId, "old-owner")?.memoryInitialization?.generation).toBe(1);
+
+  const replacement = await claim("new-owner", workspaceId, observationsFor());
+  expect(replacement.task.generation).toBe(1);
+  expect(replacement.task.memoryInitialization).toBeUndefined();
+  await expect(beginTaskSend(workspaceId, "new-owner", newMessageId(), replacement.task.iteration + 1, {
+    messageKind: "executed",
+  })).rejects.toThrow("MEMORY_INIT_REQUIRED");
 });
 
 it.each(["lease", "pending"])("rejects a candidate that acquired %s after observation without writes", async kind => {

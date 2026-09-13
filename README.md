@@ -22,6 +22,16 @@ and evidence locations back for the next analysis or review, without repeating
 the entire investigation locally. The [Skill](skill/SKILL.md#daily-reasoning-workflow)
 contains the INIT and EXECUTED templates and exact delivery procedure.
 
+Every business INIT is generated and reserved through `c2c session prepare-init
+--input-file <UTF-8 JSON> --json`; agents send its returned message unchanged.
+It makes ChatGPT call `memory_start_task` first with project memory and rules,
+then `memory_search` for needed history. Gitea tasks may use read-only
+`codewiki_*` and `gitea_*` tools for Wiki and remote facts. The eight read-only
+C2C MCP tools remain final authority for the local workspace, uncommitted diff,
+and execution records. The INIT receipt records `READY` only after mem starts;
+an explained `DEGRADED` result continues from C2C evidence. A new Chat, binding
+generation, or workspace migration always requires a fresh INIT before EXECUTED.
+
 Simple deterministic work (for example, a trivial typo edit) can run directly only
 when no exploration, design, or diagnosis is needed. A mechanical cross-file rename
 with unresolved impact still needs analysis. For a complete user plan, request only

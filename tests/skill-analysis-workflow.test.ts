@@ -14,31 +14,47 @@ describe("ChatGPT-first Skill instruction contract", () => {
     expect(workflow).toBeLessThan(skill.indexOf("## Setup and Router gate"));
     expect(skill).toContain("Do not complete the same deep analysis locally before INIT");
     const daily = skill.slice(workflow, skill.indexOf("### Routing exceptions"));
-    const steps = ["1. Codex checks", "2. Send INIT", "3. Wait for", "4. Codex checks", "5. Send EXECUTED", "6. Continue"];
+    const steps = ["1. Codex checks", "2. Send the generated", "3. Wait for", "4. Codex checks", "5. Send EXECUTED", "6. Continue"];
     const positions = steps.map(step => daily.indexOf(step));
     expect(positions.every(position => position >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((a, b) => a - b));
     expect(daily).toContain("do not edit until this PLAN is received");
   });
 
-  it("provides distinct planning and execution messages with useful evidence", () => {
+  it("requires a generated mem INIT and provides an evidence-bearing EXECUTED message", () => {
     const templates = [...skill.matchAll(/```text\n(\[C2C\][\s\S]*?)\n```/g)].map(m => m[1]);
-    const init = templates.find(t => /^STATE: INIT$/m.test(t));
     const executed = templates.find(t => /^STATE: EXECUTED$/m.test(t));
-    expect(init).toBeDefined();
     expect(executed).toBeDefined();
-    for (const template of [init!, executed!]) {
-      for (const field of ["TASK_ID:", "WORKSPACE_ID:", "ITERATION:", "MESSAGE_ID:"]) {
-        expect(template).toContain(field);
-      }
-      expect(Buffer.byteLength(template, "utf8")).toBeLessThan(1024);
+    for (const field of ["TASK_ID:", "WORKSPACE_ID:", "ITERATION:", "MESSAGE_ID:"]) {
+      expect(executed!).toContain(field);
     }
-    expect(init).toContain("CONSTRAINTS:");
-    expect(init).toContain("SUCCESS_CRITERIA:");
-    expect(executed).toContain("RESULTS:");
-    expect(executed).toContain("EVIDENCE:");
+    expect(Buffer.byteLength(executed!, "utf8")).toBeLessThan(1024);
+    expect(executed!).toContain("RESULTS:");
+    expect(executed!).toContain("EVIDENCE:");
+    expect(skill).toContain("session prepare-init");
+    expect(skill).toContain("Do not handwrite an INIT");
+    expect(skill).toContain("memory_start_task");
+    expect(skill).toContain("--observed-message-file");
+    expect(skill).toContain("--memory-status READY");
+    expect(skill).toContain("--kind executed");
     expect(skill).toContain("SOURCE_EVIDENCE, ACTIONS, TESTS, and SUCCESS_CRITERIA");
     expect(skill).toContain("BOOT DONE confirms connectivity only");
+  });
+
+  it("keeps the mem initialization and read-only source-order contract aligned", () => {
+    const agents = fs.readFileSync("AGENTS.md", "utf8");
+    const readme = fs.readFileSync("README.md", "utf8");
+    const readmeZh = fs.readFileSync("README.zh-CN.md", "utf8");
+    for (const document of [skill, protocol, agents, readme, readmeZh]) {
+      expect(document).toContain("memory_start_task");
+      expect(document).toContain("memory_search");
+    }
+    expect(protocol).toContain("DEGRADED");
+    expect(protocol).toContain("begin-send --kind executed");
+    expect(agents).toContain("旧 Chat 残留的 mem 上下文不代表当前 generation 已初始化");
+    expect(skill).toContain("memory_write_summary");
+    expect(skill).toContain("codewiki_*");
+    expect(skill).toContain("gitea_*");
   });
 
   it.each([

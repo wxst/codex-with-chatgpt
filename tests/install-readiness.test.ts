@@ -242,9 +242,11 @@ describe("installation documentation contract", () => {
 
   it("keeps maximum ChatGPT reasoning offload with repository-aware sources and one writer", () => {
     const skill = read("skill/SKILL.md");
-    expect(skill).toContain("GitHub connector");
-    expect(skill).toContain("mem / OpenDeepWiki");
-    expect(skill).toContain("current C2C workspace is final authority");
+    expect(skill).toContain("memory_start_task");
+    expect(skill).toContain("memory_search");
+    expect(skill).toContain("codewiki_*");
+    expect(skill).toContain("gitea_*");
+    expect(skill).toContain("C2C MCP reads the actual current workspace");
     expect(skill).toContain("Only the main coordinating agent");
     expect(skill).toContain("Subagents return findings");
     expect(skill).toContain("one in-flight request");
