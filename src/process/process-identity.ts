@@ -2,7 +2,11 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-const WINDOWS_GENERATION_TIMEOUT_MS = 15_000;
+// A fresh GitHub Windows worker can take longer than the ordinary 15-second
+// CLI lifecycle budget to start its first legacy PowerShell process. This is
+// still an identity proof: a failed lookup returns null and callers fail
+// closed. The longer limit only avoids rejecting a healthy cold worker.
+const WINDOWS_GENERATION_TIMEOUT_MS = 60_000;
 const WINDOWS_NATIVE_CAPABILITY_TIMEOUT_MS = 20_000;
 const WINDOWS_NATIVE_SIGNAL_TIMEOUT_MS = 15_000;
 let cachedCurrentProcessGeneration: string | undefined;
