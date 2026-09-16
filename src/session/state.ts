@@ -255,6 +255,24 @@ export const ACTIVE_DELIVERY_READBACK_WINDOW_MS = 5 * 60_000;
 
 export type DeliveryReadbackPhase = "none" | "fast" | "active" | "deferred";
 
+export type MigrationRecoveryAction =
+  | "restore_host_tools_then_read_bound_chat"
+  | "migration_preflight_required"
+  | "begin_boot_with_expected_generation"
+  | "migration_boot_readback_required"
+  | "migration_workspace_confirmation_required";
+
+/**
+ * A read-only recovery instruction for an incomplete workspace migration.
+ * This describes the one safe next coordinator action; it never authorizes a
+ * resend, a replacement Chat, or a generation change.
+ */
+export interface MigrationRecoveryGuidance {
+  nextAction: MigrationRecoveryAction;
+  recoveryReason: string;
+  leaseActive: boolean;
+}
+
 /**
  * Classify receipt polling without mutating a task. The coordinator owns the
  * actual reads; this keeps its 60-second and five-minute boundaries stable and
@@ -271,6 +289,63 @@ export function deliveryReadbackPhase(
   if (elapsedMs < FAST_DELIVERY_READBACK_WINDOW_MS) return "fast";
   if (elapsedMs < ACTIVE_DELIVERY_READBACK_WINDOW_MS) return "active";
   return "deferred";
+}
+
+/**
+ * Distinguish source-receipt preflight from an already completed destination
+ * BOOT. In particular, an old migration receipt without REVIEW_HEAD is valid:
+ * once the destination BOOT has a matching DONE receipt, only workspace_info
+ * and confirm-workspace can complete the handshake.
+ */
+export function migrationRecoveryGuidance(
+  task: Pick<SavedTaskSession,
+    "bindingState" | "verificationState" | "migrationHandshake" | "hostControl" |
+    "pendingMessageId" | "pendingDispatchUncertain" | "sendAcceptedAt" |
+    "deliveryPendingSince" | "lastDeliveredMessageId" | "lastState" | "activeUse">
+): MigrationRecoveryGuidance | null {
+  const migration = task.migrationHandshake;
+  if (!migration || migration.completedAt || task.bindingState !== "bound" || task.verificationState !== "pending") {
+    return null;
+  }
+
+  const leaseActive = task.activeUse !== undefined;
+  if (task.hostControl?.status === "tools_missing") {
+    return {
+      nextAction: "restore_host_tools_then_read_bound_chat",
+      recoveryReason: "host read/send tools are unavailable; restore them before migration readback",
+      leaseActive,
+    };
+  }
+  if (!migration.bootMessageId) {
+    if (task.hostControl?.status === "migration_boot_ready") {
+      return {
+        nextAction: "begin_boot_with_expected_generation",
+        recoveryReason: "migration preflight is current and no destination BOOT is reserved",
+        leaseActive,
+      };
+    }
+    return {
+      nextAction: "migration_preflight_required",
+      recoveryReason: "incomplete migration needs fresh source receipt and host preflight",
+      leaseActive,
+    };
+  }
+
+  const bootReceiptComplete = !task.pendingMessageId && !task.pendingDispatchUncertain &&
+    !task.sendAcceptedAt && !task.deliveryPendingSince &&
+    task.lastDeliveredMessageId === migration.bootMessageId && task.lastState === "DONE";
+  if (!bootReceiptComplete) {
+    return {
+      nextAction: "migration_boot_readback_required",
+      recoveryReason: "destination BOOT lacks a completed matching receipt; read the exact in-flight message",
+      leaseActive,
+    };
+  }
+  return {
+    nextAction: "migration_workspace_confirmation_required",
+    recoveryReason: "destination BOOT is complete; read target workspace_info then confirm-workspace",
+    leaseActive,
+  };
 }
 
 export type StandbyMarker = typeof STANDBY_MARKER | typeof STANDBY_PRO_MARKER;

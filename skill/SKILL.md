@@ -170,6 +170,22 @@ identity mismatch, and `confirm-workspace` still requires the actual MCP identit
 A proven not-invoked or terminal rejected send requires fresh
 probe and migration evidence before retry.
 
+`session get` and `session resume` report
+`migration_workspace_confirmation_required` when the destination BOOT is already
+delivered with a matching `DONE` and no request remains in flight. Immediately call
+the target C2C MCP `workspace_info`, then run `confirm-workspace` with its actual
+workspace ID, route task ID, name, and branch. Do not reread the source receipt,
+reopen preflight, send another BOOT, or continue business work as though ChatGPT
+delegation had completed. The absence of `REVIEW_HEAD` on the registered source
+receipt remains valid and does not alter this step.
+
+Binding resolution has priority over migration substate: from an old or any other
+workspace, `session get` and `session resume` must say `switch_workspace` before
+giving a migration action. Host-tool recovery also comes first: when either exact
+Chat read or send is unavailable, `restore_host_tools_then_read_bound_chat` comes
+before source readback or target `workspace_info`; do not label that condition as
+ordinary migration preflight.
+
 `MIGRATION_OBSERVATION_EXPIRED` requires a fresh exact Chat read.
 `MIGRATION_RECEIPT_MISMATCH` or `MIGRATION_CANDIDATE_CHANGED` requires inspecting
 current binding and messages; never substitute expected observations.

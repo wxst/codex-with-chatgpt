@@ -264,3 +264,17 @@ matching current receipt; no Chat replacement or generation increment occurs.
 Ambiguous or incomplete lineage fails closed. Pending sends and leases retain
 normal protection; terminal rejection or proven non-invocation requires fresh
 preflight before retry. See the source Skill for the complete JSON and commands.
+
+When `session get` or `session resume` returns
+`migration_workspace_confirmation_required`, the destination BOOT has an exact
+delivered `DONE` receipt and no unresolved send. The coordinator reads target
+`workspace_info` and immediately runs `confirm-workspace` from those actual fields.
+This stage does not reopen source-receipt preflight, resend BOOT, replace the Chat,
+or increment generation. A source receipt without `REVIEW_HEAD` is valid when the
+registered receipt omitted it; plain HEAD is never substituted.
+
+Workspace binding resolution wins over migration substate. A command run from the
+old or another workspace returns `switch_workspace` before any migration action.
+Likewise, `tools_missing` returns `restore_host_tools_then_read_bound_chat`; the
+coordinator restores the exact read/send tools before attempting source readback or
+target `workspace_info`.

@@ -76,6 +76,7 @@ import {
   confirmTaskReply,
   confirmTaskWorkspace,
   deliveryReadbackPhase,
+  migrationRecoveryGuidance,
   attachTaskRouteCapability,
   claimStandbyConversation,
   failTaskDelivery,
@@ -1260,11 +1261,20 @@ session.command("get", { isDefault: true })
     const binding = resolveTaskBinding(workspace.id, resolved.taskId);
     const task = binding.task;
     const provision = read.registry.provisions.find((entry) => entry.taskId === resolved.taskId) ?? null;
-    const nextAction = binding.resolution === "exact"
+    // A binding discovered in another workspace must keep its workspace-switch
+    // instruction. Migration substate is only actionable from the exact target.
+    const migrationRecovery = task && binding.resolution === "exact" ? migrationRecoveryGuidance(task) : null;
+    const nextAction = migrationRecovery?.nextAction ?? (binding.resolution === "exact"
       ? (task?.pendingMessageId || task?.pendingDispatchUncertain || task?.sendAcceptedAt || task?.deliveryPendingSince || task?.channelState !== "ready"
         ? "read_bound_chat" : "resume_bound_chat")
       : binding.resolution === "workspace_switch_required" ? "switch_workspace"
-        : binding.resolution === "ambiguous" ? "stop_manual_resolution" : "claim_pool_chat";
+        : binding.resolution === "ambiguous" ? "stop_manual_resolution" : "claim_pool_chat");
+    const migration = task?.migrationHandshake && !task.migrationHandshake.completedAt ? {
+      fromWorkspaceId: task.migrationHandshake.fromWorkspaceId,
+      toWorkspaceId: task.migrationHandshake.toWorkspaceId,
+      assignmentEpoch: task.migrationHandshake.assignmentEpoch,
+      bootMessageId: task.migrationHandshake.bootMessageId ?? null,
+    } : null;
     const result = {
       ok: true,
       workspaceId: workspace.id,
@@ -1285,12 +1295,17 @@ session.command("get", { isDefault: true })
       requiresWorkspaceVerification: Boolean(task && task.bindingState === "bound" && task.verificationState !== "ready"),
       deliveryReadbackPhase: task ? deliveryReadbackPhase(task) : "none",
       nextAction,
+      recoveryReason: migrationRecovery?.recoveryReason ?? null,
+      migration,
+      migrationLeaseActive: migrationRecovery?.leaseActive ?? false,
     };
     if (opts.json) say(JSON.stringify(opts.brief ? {
       ok: result.ok, taskId: result.taskId, requestedWorkspaceId: result.requestedWorkspaceId,
       boundWorkspaceId: result.boundWorkspaceId, resolution: result.resolution,
       conversationId: task?.conversationId ?? null, generation: task?.generation ?? null,
       pendingMessageId: task?.pendingMessageId ?? null, nextAction: result.nextAction,
+      recoveryReason: result.recoveryReason, migration: result.migration,
+      migrationLeaseActive: result.migrationLeaseActive,
     } : result));
     else {
       say(`工作区：${workspace.id}`);
@@ -1320,12 +1335,47 @@ session.command("resume")
     if (binding.resolution !== "exact") {
       const nextAction = binding.resolution === "workspace_switch_required" ? "switch_workspace"
         : binding.resolution === "ambiguous" ? "stop_manual_resolution" : "claim_pool_chat";
-      const payload = { ok: true, taskId: resolved.taskId, requestedWorkspaceId: workspace.id, boundWorkspaceId: binding.boundWorkspaceId, resolution: binding.resolution, nextAction };
+      const payload = {
+        ok: true,
+        taskId: resolved.taskId,
+        requestedWorkspaceId: workspace.id,
+        boundWorkspaceId: binding.boundWorkspaceId,
+        resolution: binding.resolution,
+        nextAction,
+        recoveryReason: null,
+        migration: null,
+        migrationLeaseActive: false,
+      };
       if (opts.json) say(JSON.stringify(payload)); else say(`续接：${nextAction}`);
       return;
     }
     const current = binding.task!;
     if (current.activeUse) throw new Error("TASK_CHAT_BUSY: the bound Chat already has an active coordinator lease");
+    const migrationRecovery = migrationRecoveryGuidance(current);
+    if (migrationRecovery) {
+      const migration = current.migrationHandshake!;
+      const payload = {
+        ok: true,
+        taskId: resolved.taskId,
+        workspaceId: workspace.id,
+        resolution: "exact",
+        conversationId: current.conversationId,
+        generation: current.generation,
+        useId: null,
+        nextAction: migrationRecovery.nextAction,
+        recoveryReason: migrationRecovery.recoveryReason,
+        migration: {
+          fromWorkspaceId: migration.fromWorkspaceId,
+          toWorkspaceId: migration.toWorkspaceId,
+          assignmentEpoch: migration.assignmentEpoch,
+          bootMessageId: migration.bootMessageId ?? null,
+        },
+        migrationLeaseActive: migrationRecovery.leaseActive,
+      };
+      if (opts.json) say(JSON.stringify(opts.brief ? payload : { ...payload, task: current }));
+      else check(`已定位迁移恢复步骤：${migrationRecovery.nextAction}`);
+      return;
+    }
     if (current.pendingMessageId || current.pendingDispatchUncertain || current.sendAcceptedAt || current.deliveryPendingSince || current.channelState !== "ready") {
       const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, resolution: "exact", conversationId: current.conversationId, generation: current.generation, useId: null, nextAction: "read_bound_chat" };
       if (opts.json) say(JSON.stringify(opts.brief ? payload : { ...payload, task: current })); else check("已定位同一 Chat；先读取未完成或降级状态。");
@@ -1617,13 +1667,22 @@ session.command("host-control")
       observedWorkspaceId: opts.observedWorkspaceId, messageId: opts.messageId,
     });
     const status = task.hostControl!.status;
-    const nextAction = status === "migration_boot_ready" ? "begin_boot_with_expected_generation" : status === "tools_missing" ? "restore_host_tools_then_read_bound_chat" :
-      status === "ready" ? (task.pendingMessageId ? "read_pending_message_do_not_resend" : "begin_send") : "probe_then_read_bound_chat";
-    const result = { ok: status === "ready" || status === "migration_boot_ready", owner: "codex_host", status, nextAction,
+    const migrationRecovery = migrationRecoveryGuidance(task);
+    const migration = task.migrationHandshake && !task.migrationHandshake.completedAt ? {
+      fromWorkspaceId: task.migrationHandshake.fromWorkspaceId,
+      toWorkspaceId: task.migrationHandshake.toWorkspaceId,
+      assignmentEpoch: task.migrationHandshake.assignmentEpoch,
+      bootMessageId: task.migrationHandshake.bootMessageId ?? null,
+    } : null;
+    const nextAction = migrationRecovery?.nextAction ?? (status === "migration_boot_ready" ? "begin_boot_with_expected_generation" : status === "tools_missing" ? "restore_host_tools_then_read_bound_chat" :
+      status === "ready" ? (task.pendingMessageId ? "read_pending_message_do_not_resend" : "begin_send") : "probe_then_read_bound_chat");
+    const recoveryReady = migrationRecovery?.nextAction === "migration_workspace_confirmation_required";
+    const result = { ok: status === "ready" || status === "migration_boot_ready" || recoveryReady, owner: "codex_host", status, nextAction,
       workspaceId: workspace.id, task, reserved: Boolean(task.pendingMessageId),
       accepted: Boolean(task.pendingMessageId && task.sendAcceptedAt),
       delivered: Boolean(task.pendingMessageId && task.lastDeliveredMessageId === task.pendingMessageId),
-      replied: false };
+      replied: false, recoveryReason: migrationRecovery?.recoveryReason ?? null,
+      migration, migrationLeaseActive: migrationRecovery?.leaseActive ?? false };
     say(opts.json ? JSON.stringify(result) : `${status}: ${nextAction}`);
   });
 

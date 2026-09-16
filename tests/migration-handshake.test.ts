@@ -7,16 +7,20 @@ import { beginTaskSend, claimStandbyConversation, confirmTaskDelivery, confirmTa
   switchTaskWorkspace, type MigrationReadObservation } from "../src/session/state.js";
 import { createWorkspaceRouter } from "../src/router/state.js";
 import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir } from "./helpers.js";
-let root: string, workspace: string, target: string, evidence: MigrationReadObservation;
-const taskId = "migration-task", source = "migration-source";
+let root: string, workspace: string, sourceWorkspace: string, target: string, source: string, evidence: MigrationReadObservation;
+const taskId = "migration-task";
 const tools = ["read_thread", "send_message_to_thread"];
 const probe = () => recordTaskHostControl(target, taskId, { result: "probe", tools });
 const authorize = (o = evidence) => recordTaskHostControl(target, taskId, { result: "migration-read-ok", migrationObservation: o });
-const cli = (...args: string[]) => spawnSync(process.execPath, ["--import", "tsx/esm", "src/cli/index.ts", "session", ...args, "-w", workspace, "--task-id", taskId, "--json"],
+const cliAt = (workingDirectory: string, ...args: string[]) => spawnSync(process.execPath, ["--import", "tsx/esm", "src/cli/index.ts", "session", ...args, "-w", workingDirectory, "--task-id", taskId, "--json"],
   { encoding: "utf8", windowsHide: true, env: { ...process.env, CODEX_THREAD_ID: "", C2C_INTERNAL_STATE_DIR: "test" } });
+const cli = (...args: string[]) => cliAt(workspace, ...args);
 beforeEach(async () => {
-  root = isolateStateDir(); workspace = makeTmpDir("migration"); makeGitRepo(workspace);
-  target = (await (await createWorkspaceRouter(workspace)).register(workspace)).workspaceId;
+  root = isolateStateDir(); workspace = makeTmpDir("migration"); sourceWorkspace = makeTmpDir("migration-source");
+  makeGitRepo(workspace); makeGitRepo(sourceWorkspace);
+  const router = await createWorkspaceRouter(workspace);
+  target = (await router.register(workspace)).workspaceId;
+  source = (await router.register(sourceWorkspace)).workspaceId;
   await importStandbyConversation({ conversationId: "migration-chat", projectId: "g-p-migration", markerText: "C2C_STANDBY_READY", markerMessageId: "marker", markerRole: "user" });
   await claimStandbyConversation({ workspaceId: source, taskId, connectorName: "C2C", workspaceName: "repo", branch: "main" });
   const id = newMessageId();
@@ -27,8 +31,9 @@ beforeEach(async () => {
     generation: 2, assignmentEpoch: moved.migrationHandshake!.assignmentEpoch, iteration: 20, messageId: id, state: "DONE",
     chatReadAt: new Date().toISOString(), chatStatus: "idle", readbackClean: true };
 });
-afterEach(() => { cleanup(root); cleanup(workspace); });
+afterEach(() => { cleanup(root); cleanup(workspace); cleanup(sourceWorkspace); });
 it("reproduces the CLI identity deadlock and completes the migration BOOT through preflight", async () => {
+  expect(evidence).not.toHaveProperty("reviewHead");
   expect(cli("host-control", "--result", "probe", "--tools", tools.join(",")).status).toBe(0);
   const rejected = cli("host-control", "--result", "read-ok", "--conversation-id", evidence.conversationId,
     "--observed-task-id", taskId, "--observed-workspace-id", source);
@@ -53,6 +58,62 @@ it("reproduces the CLI identity deadlock and completes the migration BOOT throug
   const ready = cli("confirm-workspace", "--observed-workspace-id", target, "--observed-route-task-id", taskId, "--observed-workspace-name", "repo", "--observed-branch", "main");
   expect(ready.status, ready.stderr).toBe(0);
   expect(readTaskSession(target, taskId)?.migrationHandshake?.completedAt).toBeTruthy();
+});
+
+it("directs post-BOOT migration recovery to workspace confirmation without inventing REVIEW_HEAD", async () => {
+  expect(evidence).not.toHaveProperty("reviewHead");
+  expect(JSON.parse(cli("get", "--brief").stdout)).toMatchObject({
+    nextAction: "migration_preflight_required",
+    recoveryReason: "incomplete migration needs fresh source receipt and host preflight",
+  });
+
+  await probe();
+  await authorize();
+  const id = newMessageId();
+  await beginTaskSend(target, taskId, id, 21, { bootstrap: true, expectedGeneration: 2 });
+  expect(JSON.parse(cli("get", "--brief").stdout)).toMatchObject({
+    nextAction: "migration_boot_readback_required",
+    migration: { bootMessageId: id, toWorkspaceId: target },
+  });
+
+  await confirmTaskDelivery(target, taskId, id);
+  await confirmTaskReply(target, taskId, id, "DONE");
+  const expected = {
+    nextAction: "migration_workspace_confirmation_required",
+    recoveryReason: "destination BOOT is complete; read target workspace_info then confirm-workspace",
+    migration: { bootMessageId: id, toWorkspaceId: target },
+    migrationLeaseActive: false,
+  };
+  expect(JSON.parse(cli("get", "--brief").stdout)).toMatchObject(expected);
+  expect(JSON.parse(cli("resume", "--brief").stdout)).toMatchObject(expected);
+  expect(JSON.parse(cli("host-control", "--result", "probe", "--tools", tools.join(",")).stdout)).toMatchObject({ ok: true, ...expected });
+  for (const command of ["get", "resume"]) {
+    expect(JSON.parse(cliAt(sourceWorkspace, command, "--brief").stdout)).toMatchObject({
+      resolution: "workspace_switch_required",
+      nextAction: "switch_workspace",
+      recoveryReason: null,
+    });
+  }
+
+  await confirmTaskWorkspace(target, taskId, { workspaceId: target, routeTaskId: taskId, workspaceName: "repo", branch: "main" });
+  expect(JSON.parse(cli("get", "--brief").stdout)).toMatchObject({
+    nextAction: "resume_bound_chat",
+    recoveryReason: null,
+    migration: null,
+  });
+});
+it("keeps missing host tools ahead of migration preflight", async () => {
+  const output = JSON.parse(cli("host-control", "--result", "probe", "--tools", "none").stdout);
+  expect(output).toMatchObject({
+    ok: false,
+    status: "tools_missing",
+    nextAction: "restore_host_tools_then_read_bound_chat",
+    recoveryReason: "host read/send tools are unavailable; restore them before migration readback",
+  });
+  expect(JSON.parse(cli("get", "--brief").stdout)).toMatchObject({
+    nextAction: "restore_host_tools_then_read_bound_chat",
+    recoveryReason: "host read/send tools are unavailable; restore them before migration readback",
+  });
 });
 it.each([
   { taskId: "wrong" }, { conversationId: "wrong" }, { fromWorkspaceId: "wrong" }, { toWorkspaceId: "wrong" },

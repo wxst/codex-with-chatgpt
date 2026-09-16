@@ -26,3 +26,5 @@
 - INIT 的精确 Chat 读回必须以 `--observed-message-file` 校验摘要；回复必须记录 `MEMORY_PROJECT`、`MEMORY_STATUS`、`MEMORY_SOURCES`，`DEGRADED` 还须记录具体 `MEMORY_REASON`。`READY` 仅表示实际初始化成功；`DEGRADED` 保留原因并继续使用 C2C 本地证据。
 - 只有当前 generation 已记录 `READY` 或 `DEGRADED` INIT 时才可发送 `begin-send --kind executed`。generation、Chat 或 workspace 改变会清除该记录，必须重新初始化。
 - C2C 自身的回执对账、错误 BOOT 修复、迁移握手、租约释放、终态绑定退役及固定池安全轮换属于已授权的内部恢复；主协调者自动完成，不再向用户索取单独授权。该约定不扩大到发布、部署、重启、凭据或其他任务的 pending/租约。
+- 未完成迁移的目标 BOOT 已送达且得到匹配 `DONE`、无 pending 时，`session get`/`resume` 必须返回 `migration_workspace_confirmation_required`；主协调者立即读取目标 C2C `workspace_info` 并执行 `confirm-workspace`。不得重新核对源 INIT、重发 BOOT、换 Chat 或把本地/Gitea 工作描述成已经完成 ChatGPT 委派。源回执缺少 `REVIEW_HEAD` 时保持省略，不能用普通 HEAD 填充。
+- 工作区解析优先于迁移子状态：在旧或其他 workspace 调用时，`session get`/`resume` 必须先返回 `switch_workspace`。宿主缺少精确 Chat 的读取或发送工具时，必须先返回并完成 `restore_host_tools_then_read_bound_chat`，不得误报普通迁移 preflight，也不得在工具尚不可用时尝试源读回或目标 `workspace_info`。

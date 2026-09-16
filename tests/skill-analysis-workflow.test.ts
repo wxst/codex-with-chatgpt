@@ -114,4 +114,18 @@ describe("ChatGPT-first Skill instruction contract", () => {
     expect(agents).toContain("错误 BOOT 修复");
     expect(agents).toContain("不再向用户索取单独授权");
   });
+
+  it("requires the post-BOOT migration confirmation instead of revisiting an old source receipt", () => {
+    const agents = fs.readFileSync("AGENTS.md", "utf8");
+    for (const document of [skill, protocol, agents]) {
+      expect(document).toContain("migration_workspace_confirmation_required");
+      expect(document).toContain("workspace_info");
+    }
+    expect(skill).toContain("Do not reread the source receipt");
+    expect(protocol).toContain("does not reopen source-receipt preflight");
+    for (const document of [skill, protocol, agents]) {
+      expect(document).toContain("switch_workspace");
+      expect(document).toContain("restore_host_tools_then_read_bound_chat");
+    }
+  });
 });
