@@ -123,6 +123,10 @@ export interface SavedTaskSession {
   lastDeliveredMessageId?: string;
   lastDeliveryError?: string;
   lastDeliveryCheckedAt?: string;
+  /** Independent phase clocks; observations never restart these timers. */
+  pendingStartedAt?: string;
+  replyWaitingSince?: string;
+  readbackObservation?: ReadbackObservation;
   replacedConversations: ReplacedConversation[];
   replacementReason?: string;
   consecutiveReadFailures: number;
@@ -144,6 +148,73 @@ export interface SavedTaskSession {
   lastReadError?: string;
   lastReadCheckedAt?: string;
   savedAt: string;
+}
+
+/** Exact host observations, not permission to send or a business success receipt. */
+export interface ReadbackObservation {
+  taskId: string;
+  workspaceId: string;
+  conversationId: string;
+  generation: number;
+  assignmentEpoch: number;
+  messageId: string;
+  iteration: number;
+  readAt: string;
+  result: "empty" | "request_visible" | "reply_visible" | "missing" | "timeout" | "read_failed";
+  paginationComplete?: boolean;
+  hostTurnId?: string;
+  hostTurnStatus?: "inProgress" | "completed" | "failed" | "interrupted";
+  chatStatus?: "active" | "idle";
+  errorCategory?: "timeout" | "unavailable" | "missing" | "other";
+  useId?: string;
+}
+
+export interface SessionRecoveryGuidance {
+  nextAction: string;
+  recoveryReason: string | null;
+  waitingMs: number | null;
+  nextReadInMs: number | null;
+  diagnosticRequired: boolean;
+}
+
+/** Shared, read-only policy for all CLI continuation surfaces. */
+export function sessionRecoveryGuidance(
+  resolution: TaskBindingResolution, task: SavedTaskSession | null,
+  useId?: string, nowMs = Date.now(),
+): SessionRecoveryGuidance {
+  const base = { waitingMs: null, nextReadInMs: null, diagnosticRequired: false };
+  const action = (nextAction: string, recoveryReason: string | null = null): SessionRecoveryGuidance =>
+    ({ ...base, nextAction, recoveryReason });
+  if (resolution !== "exact") return action(resolution === "workspace_switch_required" ? "switch_workspace" :
+    resolution === "ambiguous" ? "stop_manual_resolution" : "claim_pool_chat");
+  if (!task) return action("stop_manual_resolution", "exact binding is missing");
+  if (task.activeUse && task.activeUse.useId !== useId) return action("wait_for_coordinator_lease", "another coordinator holds this binding");
+  if (task.bindingState !== "bound") return action("read_bound_chat", "binding requires terminal recovery verification");
+  if (task.hostControl?.status === "tools_missing") return action("restore_host_tools_then_read_bound_chat",
+    migrationRecoveryGuidance(task)?.recoveryReason ?? "host read/send tools are unavailable");
+  if (task.pendingMessageId) {
+    const delivered = task.lastDeliveredMessageId === task.pendingMessageId;
+    const started = delivered ? task.replyWaitingSince : task.sendAcceptedAt ?? task.pendingStartedAt;
+    const parsed = started ? Date.parse(started) : NaN;
+    const waitingMs = Number.isFinite(parsed) ? Math.max(0, nowMs - parsed) : null;
+    const migrationBoot = task.migrationHandshake && !task.migrationHandshake.completedAt &&
+      task.migrationHandshake.bootMessageId === task.pendingMessageId;
+    return {
+      nextAction: migrationBoot ? "migration_boot_readback_required" : delivered ? "reply_readback_required" : "delivery_readback_required",
+      recoveryReason: delivered ? "request delivered; read the matching reply, including late or paginated results; never resend" :
+        "reserved request requires exact delivery readback; an empty read never authorizes resend",
+      waitingMs, nextReadInMs: waitingMs === null || waitingMs >= 300_000 ? 30_000 : waitingMs >= 60_000 ? 15_000 : 5_000,
+      diagnosticRequired: waitingMs === null || waitingMs >= 900_000,
+    };
+  }
+  const migration = migrationRecoveryGuidance(task);
+  if (migration) return action(migration.nextAction, migration.recoveryReason);
+  if (task.channelState !== "ready" || (task.hostControl && task.hostControl.status !== "ready")) return action("read_bound_chat", "restore host preflight and read the exact bound Chat");
+  const preflightAt = task.hostControl ? Date.parse(task.hostControl.checkedAt) : NaN;
+  if (!Number.isFinite(preflightAt) || preflightAt > nowMs || nowMs - preflightAt > 60_000) {
+    return action("probe_then_read_bound_chat", "host preflight is missing or expired; refresh it before reserving a message");
+  }
+  return action("resume_bound_chat");
 }
 
 export interface BootstrapProvision {
@@ -852,6 +923,10 @@ function normalizeRegistry(registry: SessionRegistry): SessionRegistry {
         !Number.isFinite(Date.parse(task.activeUse.startedAt)))) {
       throw new Error("TASK_USE_STATE_INVALID");
     }
+    if ([task.pendingStartedAt, task.replyWaitingSince].some(t => t !== undefined && !isValidReclaimTimestamp(t))) {
+      throw new Error("READBACK_CLOCK_INVALID");
+    }
+    if (task.readbackObservation !== undefined) validateReadbackObservation(task.readbackObservation);
   }
   return {
     ...registry,
@@ -1807,7 +1882,7 @@ export async function confirmTaskSettings(
 async function updateTaskChannel(
   workspaceId: string,
   taskId: string,
-  update: (task: SavedTaskSession) => SavedTaskSession
+  update: (task: SavedTaskSession, ledger: SessionLedger) => SavedTaskSession
 ): Promise<SavedTaskSession> {
   return withWorkspaceLifecycleLock(SESSION_REGISTRY_LOCK_ID, async () => {
     const workspace = validateWorkspaceId(workspaceId);
@@ -1816,7 +1891,7 @@ async function updateTaskChannel(
     const registry = registryFromLedger(ledger, workspace);
     const current = registry.tasks.find((task) => task.taskId === id);
     if (!current) throw new Error("task has no ChatGPT conversation binding");
-    const task = update({ ...current, channelState: current.channelState ?? "ready" });
+    const task = update({ ...current, channelState: current.channelState ?? "ready" }, ledger);
     const tasks = registry.tasks.map((entry) => entry.taskId === id ? task : entry);
     const usedNow = (task.activeUse !== undefined && current.activeUse?.useId !== task.activeUse.useId) ||
       current.pendingMessageId !== task.pendingMessageId ||
@@ -1919,6 +1994,7 @@ function unavailableTask(task: SavedTaskSession, reason: string): SavedTaskSessi
     verificationState: "pending",
     channelState: "degraded",
     pendingMessageId: undefined,
+    pendingStartedAt: undefined, replyWaitingSince: undefined, readbackObservation: undefined,
     pendingIteration: undefined,
     pendingReviewHead: undefined,
     pendingMessageKind: undefined,
@@ -1943,6 +2019,7 @@ function quarantineTask(task: SavedTaskSession, reason: string): SavedTaskSessio
     verificationState: "pending",
     channelState: "degraded",
     pendingMessageId: undefined,
+    pendingStartedAt: undefined, replyWaitingSince: undefined, readbackObservation: undefined,
     pendingIteration: undefined,
     pendingReviewHead: undefined,
     pendingMessageKind: undefined,
@@ -2112,7 +2189,7 @@ export async function recordTaskHostControl(
         task.pendingDispatchUncertain) {
         throw new Error("HOST_CONTROL_NOT_INVOKED_UNPROVEN");
       }
-      return { ...task, pendingMessageId: undefined, pendingIteration: undefined,
+      return { ...task, pendingMessageId: undefined, pendingStartedAt: undefined, replyWaitingSince: undefined, readbackObservation: undefined, pendingIteration: undefined,
         pendingReviewHead: undefined, pendingMessageKind: undefined,
         pendingMessageDigest: undefined, pendingMemoryProject: undefined,
         pendingDispatchUncertain: undefined,
@@ -2122,8 +2199,9 @@ export async function recordTaskHostControl(
     else if (observation.result === "call-failed") status = "call_failed";
     else throw new Error("HOST_CONTROL_RESULT_INVALID");
     // Recover the delivery phase from its receipts; tool visibility alone never resumes it.
-    const channelState: ChannelState = status !== "ready" ? "degraded" : !task.pendingMessageId ? "ready" :
-      task.lastDeliveredMessageId === task.pendingMessageId ? "awaiting_reply" : "sending";
+    const channelState: ChannelState = task.pendingMessageId
+      ? task.lastDeliveredMessageId === task.pendingMessageId ? "awaiting_reply" : "sending"
+      : status !== "ready" ? "degraded" : "ready";
     return { ...task, channelState,
       pendingDispatchUncertain: task.pendingDispatchUncertain ||
         (Boolean(task.pendingMessageId) && (status === "call_timeout" || status === "call_failed")),
@@ -2243,6 +2321,9 @@ function reserveTaskSend(
     hostControl: migrating ? { ...task.hostControl!, status: "readback_required" } : task.hostControl,
     migrationHandshake: migrating ? { ...task.migrationHandshake!, bootMessageId: id } : task.migrationHandshake,
     pendingMessageId: id,
+    pendingStartedAt: new Date().toISOString(),
+    replyWaitingSince: undefined,
+    readbackObservation: undefined,
     pendingIteration: iteration,
     pendingDispatchUncertain: undefined,
     pendingReviewHead: flags.reviewHead,
@@ -2341,6 +2422,51 @@ export async function recordTaskDeliveryPending(
   });
 }
 
+function validateReadbackObservation(value: unknown): ReadbackObservation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("READBACK_OBSERVATION_INVALID");
+  const o = value as ReadbackObservation;
+  const keys = ["taskId", "workspaceId", "conversationId", "generation", "assignmentEpoch", "messageId", "iteration", "readAt", "result", "paginationComplete", "hostTurnId", "hostTurnStatus", "chatStatus", "errorCategory", "useId"];
+  if (Object.keys(o).some(key => !keys.includes(key)) ||
+    ![o.taskId, o.workspaceId, o.conversationId, o.messageId].every(s => typeof s === "string" && s.length > 0 && s.length <= 128) ||
+    !Number.isSafeInteger(o.generation) || o.generation < 1 || !Number.isSafeInteger(o.assignmentEpoch) || o.assignmentEpoch < 0 ||
+    !Number.isSafeInteger(o.iteration) || o.iteration < 0 || !isValidReclaimTimestamp(o.readAt) ||
+    !["empty", "request_visible", "reply_visible", "missing", "timeout", "read_failed"].includes(o.result) ||
+    (o.paginationComplete !== undefined && typeof o.paginationComplete !== "boolean") ||
+    (o.hostTurnId !== undefined && (typeof o.hostTurnId !== "string" || !o.hostTurnId.trim() || o.hostTurnId.length > 128)) ||
+    (o.hostTurnStatus !== undefined && !["inProgress", "completed", "failed", "interrupted"].includes(o.hostTurnStatus)) ||
+    (o.chatStatus !== undefined && !["active", "idle"].includes(o.chatStatus)) ||
+    (o.errorCategory !== undefined && !["timeout", "unavailable", "missing", "other"].includes(o.errorCategory)) ||
+    (o.useId !== undefined && (typeof o.useId !== "string" || !USE_ID_PATTERN.test(o.useId)))) {
+    throw new Error("READBACK_OBSERVATION_INVALID");
+  }
+  return o;
+}
+
+export async function recordTaskReadback(workspaceId: string, taskId: string, value: unknown): Promise<SavedTaskSession> {
+  const o = validateReadbackObservation(value);
+  return updateTaskChannel(workspaceId, taskId, (task, ledger) => {
+    const now = Date.now();
+    const readAt = Date.parse(o.readAt);
+    if (readAt > now || now - readAt > 60_000) throw new Error("READBACK_OBSERVATION_EXPIRED: reread the exact Chat");
+    const entry = ledger.pool.entries.find(e => e.id === task.poolEntryId);
+    const owners = ledger.registries.flatMap(r => r.tasks.filter(t => t.bindingState === "bound" && t.conversationId === task.conversationId));
+    if (o.workspaceId !== workspaceId || o.taskId !== taskId || task.bindingState !== "bound" ||
+      owners.length !== 1 || (task.poolEntryId && !entry) ||
+      o.conversationId !== task.conversationId || o.generation !== task.generation ||
+      o.assignmentEpoch !== (entry?.assignmentEpoch ?? 0) ||
+      (entry && (entry.claimedBy?.taskId !== taskId || entry.claimedBy.workspaceId !== workspaceId || entry.claimedBy.generation !== task.generation)) ||
+      o.messageId !== task.pendingMessageId || o.iteration !== task.pendingIteration) {
+      throw new Error("READBACK_CANDIDATE_CHANGED: reread the current binding and pending message");
+    }
+    if (task.activeUse?.useId !== o.useId) throw new Error("TASK_USE_STALE");
+    if (task.readbackObservation && Date.parse(task.readbackObservation.readAt) > readAt) throw new Error("READBACK_OBSERVATION_STALE");
+    // Visibility hints never confirm delivery/reply or overwrite registered receipts.
+    return { ...task, readbackObservation: { ...o },
+      channelState: task.lastDeliveredMessageId === task.pendingMessageId ? "awaiting_reply" : "sending",
+      savedAt: new Date(now).toISOString() };
+  });
+}
+
 export async function confirmTaskDelivery(
   workspaceId: string,
   taskId: string,
@@ -2361,6 +2487,7 @@ export async function confirmTaskDelivery(
     return {
       ...task,
       channelState: "awaiting_reply",
+      replyWaitingSince: new Date().toISOString(),
       lastDeliveredMessageId: id,
       deliveryPendingSince: undefined,
       lastDeliveryCheckedAt: new Date().toISOString(),
@@ -2408,6 +2535,9 @@ export async function confirmTaskReply(
       lastState: normalizedState,
       lastReviewHead: legacyMalformedBootstrap ? task.lastReviewHead : task.pendingReviewHead,
       pendingMessageId: undefined,
+      pendingStartedAt: undefined,
+      replyWaitingSince: undefined,
+      readbackObservation: undefined,
       pendingIteration: undefined,
       pendingReviewHead: undefined,
       pendingMessageKind: undefined,
@@ -2460,6 +2590,7 @@ export async function failTaskDelivery(
       ...task,
       channelState: "degraded",
       pendingMessageId: undefined,
+      pendingStartedAt: undefined, replyWaitingSince: undefined, readbackObservation: undefined,
       pendingIteration: undefined,
       pendingReviewHead: undefined,
       pendingMessageKind: undefined,

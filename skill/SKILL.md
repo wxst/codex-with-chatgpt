@@ -662,6 +662,14 @@ Every one of the eight C2C read-only tools requires `route_token`; a missing,
 wrong, revoked, or cross-task token returns `ROUTE_ACCESS_DENIED`. The token
 never grants write, shell, Git mutation, or access to another workspace.
 
+Before calling `send_message_to_thread`, verify the reservation command exited
+successfully and returned ok=true with the exact message ID and iteration.
+If preflight expired, refresh probe and exact readback, then reserve; do not send
+after a failed CLI command. Check each dependent command before proceeding.
+Use `--use-id <own-lease>` with get/host-control when holding a coordinator lease.
+With no pending request, `probe_then_read_bound_chat` means refresh the missing or
+expired preflight before reserving. Pending readback takes priority over that timer.
+
 Immediately after `send_message_to_thread` accepts the request, record that
 fact. A returned conversation id does not prove that ChatGPT has displayed the
 message:
@@ -690,17 +698,58 @@ node "__C2C_CHECKOUT__/bin/c2c.js" session record-delivery-pending \
   -w <workspace> --task-id <task-id> --message-id <message-id> --json
 ```
 
-Continue reading for up to five minutes while the task is active. After that,
-leave the same message in flight and read it again before any later task
-message. Keep the same Chat after temporary `missing`, timeout, or delayed
-readback results; record each as `degraded` and continue exact readback. Do not
-resend, change Chats, or call `fail-delivery` because a short readback window
-is empty. `fail-delivery` is only for an explicit
-`host_rejected`, `conversation_gone`, or `identity_mismatch` result. An
-identity mismatch quarantines the exact Chat. After confirming the mismatch is
-terminal and no uncertain send remains, automatically retire that exact binding,
-inspect every fixed-pool candidate in LRU order, atomically claim the first safe
-one, and complete BOOT. This C2C recovery does not require another user decision.
+Delivery and reply have separate clocks. After the first 60 seconds, read every
+15 seconds; after five minutes, read every 30 seconds. Five minutes changes the
+cadence, never ends the wait. Each wait is at most 60 seconds. After fifteen
+minutes, diagnose host health and pagination; keep waiting if observations are
+possible and the outcome is unresolved. Start each read at the newest page and
+follow cursors as needed to find the exact request and matching reply.
+
+After delivery, use the same cadence for the assistant reply. `idle`, a completed
+host turn, an empty page, or a timeout cannot prove that no reply exists.
+`session get --use-id <own-lease>` and `resume` expose `delivery_readback_required`
+or `reply_readback_required`, waitingMs, nextReadInMs and diagnosticRequired.
+An unknown legacy phase start has waitingMs=null and requires diagnostics, not
+an invented timestamp. A different coordinator lease must be respected.
+
+Record actual read results with `session record-readback --observation-file
+<UTF8-JSON> --json`. This does not confirm delivery or reply. Example shape:
+
+```json
+{
+  "taskId": "<own-task>", "workspaceId": "<workspace>",
+  "conversationId": "<exact-chat>", "generation": 1, "assignmentEpoch": 1,
+  "messageId": "<pending-message>", "iteration": 1,
+  "readAt": "<actual-UTC-read-time>", "result": "empty",
+  "paginationComplete": false, "chatStatus": "idle", "useId": "<own-lease>"
+}
+```
+
+Read actual identities and epoch from the binding and pool. Result is one of
+empty, request_visible, reply_visible, missing, timeout, read_failed. Include
+hostTurnId, hostTurnStatus (inProgress/completed/failed/interrupted), chatStatus
+(active/idle), paginationComplete, errorCategory (timeout/unavailable/missing/other)
+and useId only when actually known or held. Never invent missing host evidence.
+Submit each observation within 60 seconds of its read. A stale generation,
+message, lease or epoch requires rereading; never overwrite the newer binding.
+
+Temporary missing/timeout results update observations while preserving the
+message phase and pending receipt. Keep the same Chat and never resend.
+On task continuation and before any new message, reconcile the existing pending
+request first. If the host cannot be observed, report the concrete observation
+blocker and pending identity; resume that same readback when tools return.
+This is not permission to substitute full local analysis for ChatGPT analysis.
+
+`fail-delivery` is only for an explicit host_rejected, conversation_gone, or
+identity_mismatch result. Preserve the existing terminal recovery and fixed-pool
+rules; short empty reads never authorize retirement or rotation.
+Authorized terminal recovery does not require another user decision.
+
+A matching PLAN closes its transport receipt even when its analysis is weak.
+Check SOURCE_EVIDENCE, ACTIONS, TESTS and SUCCESS_CRITERIA before implementation;
+after confirming the completed reply, request missing analysis in a fresh message.
+MEMORY_STATUS READY is a reply declaration: real acceptance additionally requires
+verifiable mem and source-tool evidence, not just that declaration.
 
 Then wait for the matching ChatGPT reply and run `session confirm-reply` with
 the same observed identity fields. After `workspace_info` reports the expected

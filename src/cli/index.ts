@@ -77,6 +77,8 @@ import {
   confirmTaskWorkspace,
   deliveryReadbackPhase,
   migrationRecoveryGuidance,
+  sessionRecoveryGuidance,
+  recordTaskReadback,
   attachTaskRouteCapability,
   claimStandbyConversation,
   failTaskDelivery,
@@ -1252,9 +1254,10 @@ function readUtf8JsonInputFile(file: string, errorCode: string): unknown {
 session.command("get", { isDefault: true })
   .description("Show the task-scoped ChatGPT conversation")
   .option("-w, --workspace <path>").option("--task-id <id>", "stable Codex task id")
+  .option("--use-id <id>", "current coordinator lease")
   .option("--brief", "emit only continuation decisions", false)
   .option("--json", "machine-readable output", false)
-  .action((opts: { workspace?: string; taskId?: string; brief: boolean; json: boolean }) => {
+  .action((opts: { workspace?: string; taskId?: string; useId?: string; brief: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const read = readSessionRegistry(workspace.id);
@@ -1264,11 +1267,7 @@ session.command("get", { isDefault: true })
     // A binding discovered in another workspace must keep its workspace-switch
     // instruction. Migration substate is only actionable from the exact target.
     const migrationRecovery = task && binding.resolution === "exact" ? migrationRecoveryGuidance(task) : null;
-    const nextAction = migrationRecovery?.nextAction ?? (binding.resolution === "exact"
-      ? (task?.pendingMessageId || task?.pendingDispatchUncertain || task?.sendAcceptedAt || task?.deliveryPendingSince || task?.channelState !== "ready"
-        ? "read_bound_chat" : "resume_bound_chat")
-      : binding.resolution === "workspace_switch_required" ? "switch_workspace"
-        : binding.resolution === "ambiguous" ? "stop_manual_resolution" : "claim_pool_chat");
+    const guidance = sessionRecoveryGuidance(binding.resolution, task, opts.useId);
     const migration = task?.migrationHandshake && !task.migrationHandshake.completedAt ? {
       fromWorkspaceId: task.migrationHandshake.fromWorkspaceId,
       toWorkspaceId: task.migrationHandshake.toWorkspaceId,
@@ -1293,9 +1292,9 @@ session.command("get", { isDefault: true })
       requiresManualRetirement: task?.bindingState === "quarantined",
       requiresSettingsConfirmation: Boolean(task && task.bindingState === "bound" && task.settingsSource !== "user_confirmed"),
       requiresWorkspaceVerification: Boolean(task && task.bindingState === "bound" && task.verificationState !== "ready"),
+      assignmentEpoch: task ? (readStandbyPool().entries.find(e => e.id === task.poolEntryId)?.assignmentEpoch ?? 0) : null,
       deliveryReadbackPhase: task ? deliveryReadbackPhase(task) : "none",
-      nextAction,
-      recoveryReason: migrationRecovery?.recoveryReason ?? null,
+      ...guidance,
       migration,
       migrationLeaseActive: migrationRecovery?.leaseActive ?? false,
     };
@@ -1303,8 +1302,8 @@ session.command("get", { isDefault: true })
       ok: result.ok, taskId: result.taskId, requestedWorkspaceId: result.requestedWorkspaceId,
       boundWorkspaceId: result.boundWorkspaceId, resolution: result.resolution,
       conversationId: task?.conversationId ?? null, generation: task?.generation ?? null,
-      pendingMessageId: task?.pendingMessageId ?? null, nextAction: result.nextAction,
-      recoveryReason: result.recoveryReason, migration: result.migration,
+      pendingMessageId: task?.pendingMessageId ?? null,
+      ...guidance, assignmentEpoch: result.assignmentEpoch, migration: result.migration,
       migrationLeaseActive: result.migrationLeaseActive,
     } : result));
     else {
@@ -1332,57 +1331,23 @@ session.command("resume")
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const binding = resolveTaskBinding(workspace.id, resolved.taskId);
-    if (binding.resolution !== "exact") {
-      const nextAction = binding.resolution === "workspace_switch_required" ? "switch_workspace"
-        : binding.resolution === "ambiguous" ? "stop_manual_resolution" : "claim_pool_chat";
-      const payload = {
-        ok: true,
-        taskId: resolved.taskId,
-        requestedWorkspaceId: workspace.id,
-        boundWorkspaceId: binding.boundWorkspaceId,
-        resolution: binding.resolution,
-        nextAction,
-        recoveryReason: null,
-        migration: null,
-        migrationLeaseActive: false,
+    const current = binding.task;
+    const guidance = sessionRecoveryGuidance(binding.resolution, current);
+    if (guidance.nextAction !== "resume_bound_chat") {
+      const m = current?.migrationHandshake;
+      const payload = { ok: true, taskId: resolved.taskId, requestedWorkspaceId: workspace.id,
+        boundWorkspaceId: binding.boundWorkspaceId, workspaceId: workspace.id, resolution: binding.resolution,
+        conversationId: current?.conversationId ?? null, generation: current?.generation ?? null,
+        useId: null, ...guidance,
+        migration: m && !m.completedAt ? { fromWorkspaceId: m.fromWorkspaceId, toWorkspaceId: m.toWorkspaceId,
+          assignmentEpoch: m.assignmentEpoch, bootMessageId: m.bootMessageId ?? null } : null,
+        migrationLeaseActive: Boolean(current?.activeUse),
       };
-      if (opts.json) say(JSON.stringify(payload)); else say(`续接：${nextAction}`);
-      return;
-    }
-    const current = binding.task!;
-    if (current.activeUse) throw new Error("TASK_CHAT_BUSY: the bound Chat already has an active coordinator lease");
-    const migrationRecovery = migrationRecoveryGuidance(current);
-    if (migrationRecovery) {
-      const migration = current.migrationHandshake!;
-      const payload = {
-        ok: true,
-        taskId: resolved.taskId,
-        workspaceId: workspace.id,
-        resolution: "exact",
-        conversationId: current.conversationId,
-        generation: current.generation,
-        useId: null,
-        nextAction: migrationRecovery.nextAction,
-        recoveryReason: migrationRecovery.recoveryReason,
-        migration: {
-          fromWorkspaceId: migration.fromWorkspaceId,
-          toWorkspaceId: migration.toWorkspaceId,
-          assignmentEpoch: migration.assignmentEpoch,
-          bootMessageId: migration.bootMessageId ?? null,
-        },
-        migrationLeaseActive: migrationRecovery.leaseActive,
-      };
-      if (opts.json) say(JSON.stringify(opts.brief ? payload : { ...payload, task: current }));
-      else check(`已定位迁移恢复步骤：${migrationRecovery.nextAction}`);
-      return;
-    }
-    if (current.pendingMessageId || current.pendingDispatchUncertain || current.sendAcceptedAt || current.deliveryPendingSince || current.channelState !== "ready") {
-      const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, resolution: "exact", conversationId: current.conversationId, generation: current.generation, useId: null, nextAction: "read_bound_chat" };
-      if (opts.json) say(JSON.stringify(opts.brief ? payload : { ...payload, task: current })); else check("已定位同一 Chat；先读取未完成或降级状态。");
+      if (opts.json) say(JSON.stringify(payload)); else say(`续接：${guidance.nextAction}`);
       return;
     }
     const task = await resumeTaskSession(workspace.id, resolved.taskId);
-    const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, resolution: "exact", conversationId: task.conversationId, generation: task.generation, useId: task.useId, nextAction: task.pendingMessageId ? "read_bound_chat" : "send_or_read_bound_chat" };
+    const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, resolution: "exact", conversationId: task.conversationId, generation: task.generation, useId: task.useId, ...sessionRecoveryGuidance("exact", task, task.useId) };
     if (opts.json) say(JSON.stringify(opts.brief ? payload : { ...payload, task })); else check(`已续接同一 Chat；use-id：${task.useId}`);
   });
 
@@ -1649,6 +1614,7 @@ session.command("host-control")
   .description("Record current executor tool availability or exact Chat recovery; never sends a message")
   .option("-w, --workspace <path>").option("--task-id <id>")
   .requiredOption("--result <result>", "probe, read-ok, migration-read-ok, timeout, call-failed, or not-invoked")
+  .option("--use-id <id>", "current coordinator lease")
   .option("--observation-file <path>", "UTF-8 migration readback evidence JSON")
   .option("--tools <names>", "comma-separated callable host tool names; use none if both are absent")
   .option("--conversation-id <id>")
@@ -1656,10 +1622,16 @@ session.command("host-control")
   .option("--message-id <id>")
   .option("--confirm-not-invoked", "attest that the send tool was never called for this reservation", false)
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; taskId?: string; result: HostControlObservation["result"]; observationFile?: string; tools?: string;
+  .action(async (opts: { workspace?: string; taskId?: string; result: HostControlObservation["result"]; useId?: string; observationFile?: string; tools?: string;
     conversationId?: string; observedTaskId?: string; observedWorkspaceId?: string; messageId?: string; confirmNotInvoked: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
+    const binding = resolveTaskBinding(workspace.id, resolved.taskId);
+    const before = sessionRecoveryGuidance(binding.resolution, binding.task, opts.useId);
+    if (binding.resolution !== "exact" || before.nextAction === "wait_for_coordinator_lease") {
+      say(JSON.stringify({ ok: false, taskId: resolved.taskId, ...before }));
+      return;
+    }
     if (opts.result === "not-invoked" && !opts.confirmNotInvoked) throw new Error("HOST_CONTROL_NOT_INVOKED_ATTESTATION_REQUIRED");
     const task = await recordTaskHostControl(workspace.id, resolved.taskId, {
       result: opts.result, migrationObservation: opts.observationFile ? JSON.parse(fs.readFileSync(opts.observationFile, "utf8").replace(/^\uFEFF/u, "")) : undefined, tools: opts.tools === "none" ? [] : opts.tools?.split(",").map(x => x.trim()),
@@ -1674,16 +1646,32 @@ session.command("host-control")
       assignmentEpoch: task.migrationHandshake.assignmentEpoch,
       bootMessageId: task.migrationHandshake.bootMessageId ?? null,
     } : null;
-    const nextAction = migrationRecovery?.nextAction ?? (status === "migration_boot_ready" ? "begin_boot_with_expected_generation" : status === "tools_missing" ? "restore_host_tools_then_read_bound_chat" :
-      status === "ready" ? (task.pendingMessageId ? "read_pending_message_do_not_resend" : "begin_send") : "probe_then_read_bound_chat");
+    const guidance = sessionRecoveryGuidance("exact", task, opts.useId);
+    const nextAction = guidance.nextAction;
     const recoveryReady = migrationRecovery?.nextAction === "migration_workspace_confirmation_required";
-    const result = { ok: status === "ready" || status === "migration_boot_ready" || recoveryReady, owner: "codex_host", status, nextAction,
+    const result = { ok: status === "ready" || status === "migration_boot_ready" || recoveryReady, owner: "codex_host", status,
       workspaceId: workspace.id, task, reserved: Boolean(task.pendingMessageId),
       accepted: Boolean(task.pendingMessageId && task.sendAcceptedAt),
       delivered: Boolean(task.pendingMessageId && task.lastDeliveredMessageId === task.pendingMessageId),
-      replied: false, recoveryReason: migrationRecovery?.recoveryReason ?? null,
+      replied: false, ...guidance,
       migration, migrationLeaseActive: migrationRecovery?.leaseActive ?? false };
     say(opts.json ? JSON.stringify(result) : `${status}: ${nextAction}`);
+  });
+
+session.command("record-readback")
+  .description("Record exact pending-message visibility without confirming or resending")
+  .option("-w, --workspace <path>").option("--task-id <id>")
+  .requiredOption("--observation-file <path>", "UTF-8 host observation JSON")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; taskId?: string; observationFile: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    const task = await recordTaskReadback(workspace.id, resolved.taskId,
+      readUtf8JsonInputFile(opts.observationFile, "READBACK_OBSERVATION_INVALID"));
+    const guidance = sessionRecoveryGuidance("exact", task, task.readbackObservation?.useId);
+    const result = { ok: true, taskId: task.taskId, workspaceId: workspace.id, conversationId: task.conversationId,
+      generation: task.generation, pendingMessageId: task.pendingMessageId, ...guidance };
+    say(opts.json ? JSON.stringify(result) : `${guidance.nextAction}: ${guidance.recoveryReason}`);
   });
 
 session.command("record-read")

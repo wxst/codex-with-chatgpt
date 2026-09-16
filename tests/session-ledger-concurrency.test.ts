@@ -79,5 +79,5 @@ describe("global session assignment ledger", () => {
         stateRoot = undefined;
       }
     }
-  }, 30_000);
+  }); // Use the suite's 60s budget for all six real-process waves.
 });

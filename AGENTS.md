@@ -28,3 +28,12 @@
 - C2C 自身的回执对账、错误 BOOT 修复、迁移握手、租约释放、终态绑定退役及固定池安全轮换属于已授权的内部恢复；主协调者自动完成，不再向用户索取单独授权。该约定不扩大到发布、部署、重启、凭据或其他任务的 pending/租约。
 - 未完成迁移的目标 BOOT 已送达且得到匹配 `DONE`、无 pending 时，`session get`/`resume` 必须返回 `migration_workspace_confirmation_required`；主协调者立即读取目标 C2C `workspace_info` 并执行 `confirm-workspace`。不得重新核对源 INIT、重发 BOOT、换 Chat 或把本地/Gitea 工作描述成已经完成 ChatGPT 委派。源回执缺少 `REVIEW_HEAD` 时保持省略，不能用普通 HEAD 填充。
 - 工作区解析优先于迁移子状态：在旧或其他 workspace 调用时，`session get`/`resume` 必须先返回 `switch_workspace`。宿主缺少精确 Chat 的读取或发送工具时，必须先返回并完成 `restore_host_tools_then_read_bound_chat`，不得误报普通迁移 preflight，也不得在工具尚不可用时尝试源读回或目标 `workspace_info`。
+
+## 消息等待与恢复
+
+- get、resume、host-control 使用统一恢复决策：工作区、其他协调者租约及工具可用性优先，随后对账 pending，再完成迁移或续接。
+- 送达与回复独立计时：前 60 秒每 5 秒、之后每 15 秒、超过 5 分钟每 30 秒读取；单次等待不超过 60 秒。十五分钟触发健康和分页诊断，不自动判失败。
+- idle、completed、空页、超时均不证明没有回复。每次从最新页读起，按需分页定位精确请求和回复；用 session record-readback 记录真实观察，不能改写已确认送达进度。
+- 续接及新消息前必须先对账 pending；晚到回复仍确认原消息，不重发、不换 Chat。工具无法读取时报告具体阻塞，恢复后继续同一请求。
+- 无 pending 且预检过期时先刷新预检。发送前必须核实预留命令退出成功、ok=true 且消息身份匹配；失败后不得继续调用发送工具。持有租约时向 get/host-control 传自身 use-id。
+- 匹配 PLAN 回执先确认，再审查代码依据、行动、测试和成功标准；内容不足另发补充请求。MEMORY_STATUS READY 声明不能代替真实 mem/MCP 工具证据。

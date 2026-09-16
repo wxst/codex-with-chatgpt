@@ -198,21 +198,40 @@ delivery after the matching user message appears, and confirms reply only after
 the matching ChatGPT reply appears. `wait_threads` is not used for ordinary
 ChatGPT conversations.
 
-The first 60 seconds are a fast check, with an exact read every 5 seconds. A missing user turn in that period is a
-late delivery, not a terminal failure: the task remains `sending`, retains its
-same message id and write lock, and records `deliveryPendingSince`. Active work
-may continue reading for five minutes. If it is still absent, the next task
-operation reads that exact in-flight message before any new send. There is no
-automatic resend or Chat replacement. Repeated `missing` and timeout results
-remain `degraded`; only explicit deletion evidence or an identity mismatch
-retires the exact Chat.
+Delivery and reply use independent clocks. The first 60 seconds poll every 5
+seconds, then every 15 seconds until five minutes, then every 30 seconds. Five
+minutes is a cadence change, not a terminal failure or permission to stop reading.
+After fifteen minutes diagnose host health and pagination and continue if readable.
+Each wait is at most 60 seconds. Start with the newest page and follow cursors to
+find the exact pending request/reply. `idle`, completed turns, partial/empty pages,
+timeout and late delivery are observation gaps, not proof of absent replies.
 
-`fail-delivery` requires terminal evidence: `host_rejected`,
-`conversation_gone`, or `identity_mismatch`. Explicit deletion retires the
-exact binding. An identity mismatch quarantines the binding and requires
-`session clear --confirm` before a replacement claim; the coordinator performs
-that terminal C2C recovery automatically without asking for separate user
-authorization. A host rejection keeps the existing binding degraded.
+`session record-readback --observation-file <UTF8 JSON>` records actual taskId,
+workspaceId, conversationId, generation, assignmentEpoch, messageId, iteration,
+readAt and result (empty/request_visible/reply_visible/missing/timeout/read_failed).
+Optional paginationComplete, hostTurnId, hostTurnStatus, chatStatus, errorCategory
+and useId remain unknown when absent. Observations must be within 60 seconds,
+match the lock-protected current binding/message/lease and never regress in time.
+No body or route token is stored. Observations never confirm a receipt or resend.
+
+`get`, `resume` and `host-control` share recovery precedence: workspace resolution,
+coordinator lease and missing tools, pending delivery/reply, migration, normal
+continuation. Normal pending actions are delivery_readback_required and
+reply_readback_required; migration action names remain compatible. Outputs include
+waitingMs (null for unknown legacy start), nextReadInMs and diagnosticRequired.
+With no pending, expired or missing preflight returns probe_then_read_bound_chat.
+Send only after reservation exits successfully and returns the matching identity;
+a failed reservation never authorizes a host send. Pass the held use-id to get
+and host-control so lease guidance distinguishes the current coordinator.
+Temporary read failures retain sending/awaiting_reply. Legacy degraded pending
+records recover their phase from the registered delivery receipt. Continuation
+must reconcile pending before any new send. Only explicit terminal evidence uses
+fail-delivery; inability to observe is a resumable blocker, never resend authority.
+
+Matching PLAN receipts and substantive analysis are separate: confirm the receipt,
+then require code evidence/actions/tests/success criteria or request supplementation.
+MEMORY_STATUS READY alone does not prove tools ran; acceptance needs tool evidence.
+
 
 BOOT must not carry `REVIEW_HEAD`. New `begin-send --bootstrap --review-head`
 reservations fail with `BOOT_REVIEW_HEAD_FORBIDDEN`. For legacy ledgers that

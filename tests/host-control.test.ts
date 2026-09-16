@@ -61,7 +61,7 @@ it.each([false, true])("keeps uncertain/accepted sends in flight across timeout 
   if (accepted) await confirmTaskSendAccepted(w, t, id);
   const task = await recordTaskHostControl(w, t, { result: "timeout" });
   expect(task.hostControl?.status).toBe("call_timeout");
-  expect(task.channelState).toBe("degraded");
+  expect(task.channelState).toBe("sending");
   expect(task.pendingMessageId).toBe(id);
   if (accepted) await expect(recordTaskHostControl(w, t, { result: "not-invoked", messageId: id })).rejects.toThrow();
   await probe(); await recover();
@@ -150,7 +150,7 @@ it("CLI refuses missing preflight and reports actual unaccepted failures", async
   const started = cli("begin-send", "--task-id", "cli-task", "--message-id", id, "--iteration", "0", "--bootstrap", "--json");
   expect(started.status).toBe(0);
   const resumedPending = cli("resume", "--task-id", "cli-task", "--brief", "--json");
-  expect(JSON.parse(resumedPending.stdout)).toMatchObject({ ok: true, useId: null, nextAction: "read_bound_chat" });
+  expect(JSON.parse(resumedPending.stdout)).toMatchObject({ ok: true, useId: null, nextAction: "delivery_readback_required" });
   const failed = cli("fail-delivery", "--task-id", "cli-task", "--message-id", id, "--kind", "host_rejected", "--reason", "explicit rejection", "--json");
   expect(JSON.parse(failed.stdout).accepted).toBe(false);
 
