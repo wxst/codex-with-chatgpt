@@ -50,24 +50,34 @@ process.stdout.write(JSON.stringify({ conversationId: result.task.conversationId
 
 describe("global session assignment ledger", () => {
   it("serializes independent process claims and reuses the same task owner", async () => {
-    stateRoot = isolateStateDir();
-    await importStandbyConversation({
-      conversationId: "ledger-chat-one", projectId: "g-p-ledgerpool123", markerText: "C2C_STANDBY_READY",
-      markerMessageId: "ledger-marker-one", markerRole: "user", createdAt: "2026-01-01T00:00:00.000Z",
-    });
-    await importStandbyConversation({
-      conversationId: "ledger-chat-two", projectId: "g-p-ledgerpool123", markerText: "C2C_STANDBY_READY",
-      markerMessageId: "ledger-marker-two", markerRole: "user", createdAt: "2026-01-02T00:00:00.000Z",
-    });
+    // Workers release their lifecycle tickets while their peers scan the same
+    // directory. Several waves make that real cross-process release race part
+    // of the contract instead of relying on a single scheduling outcome.
+    for (let wave = 0; wave < 6; wave += 1) {
+      stateRoot = isolateStateDir();
+      try {
+        await importStandbyConversation({
+          conversationId: "ledger-chat-one", projectId: "g-p-ledgerpool123", markerText: "C2C_STANDBY_READY",
+          markerMessageId: "ledger-marker-one", markerRole: "user", createdAt: "2026-01-01T00:00:00.000Z",
+        });
+        await importStandbyConversation({
+          conversationId: "ledger-chat-two", projectId: "g-p-ledgerpool123", markerText: "C2C_STANDBY_READY",
+          markerMessageId: "ledger-marker-two", markerRole: "user", createdAt: "2026-01-02T00:00:00.000Z",
+        });
 
-    const [first, duplicate, other] = await Promise.all([
-      runClaimWorker("same-task"),
-      runClaimWorker("same-task"),
-      runClaimWorker("other-task"),
-    ]);
+        const [first, duplicate, other] = await Promise.all([
+          runClaimWorker("same-task"),
+          runClaimWorker("same-task"),
+          runClaimWorker("other-task"),
+        ]);
 
-    expect(first.conversationId).toBe(duplicate.conversationId);
-    expect(other.conversationId).not.toBe(first.conversationId);
-    expect(readStandbyPool().entries.filter((entry) => entry.status === "claimed")).toHaveLength(2);
+        expect(first.conversationId).toBe(duplicate.conversationId);
+        expect(other.conversationId).not.toBe(first.conversationId);
+        expect(readStandbyPool().entries.filter((entry) => entry.status === "claimed")).toHaveLength(2);
+      } finally {
+        cleanup(stateRoot);
+        stateRoot = undefined;
+      }
+    }
   }, 30_000);
 });

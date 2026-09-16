@@ -229,8 +229,15 @@ function readTicketEntryOnce(file: string): TicketEntry | null {
   let content: string;
   try {
     const opened = fs.fstatSync(descriptor, { bigint: true });
-    if (!opened.isFile() || opened.nlink !== 1n) {
+    if (!opened.isFile() || opened.nlink > 1n) {
       throw new Error(`Lifecycle ticket path is not a private regular file: ${file}`);
+    }
+    // A scanner can retain the old inode while its owner releases the ticket.
+    // Its link count then becomes zero, which proves that this descriptor no
+    // longer represents an entry at `file`. Re-read the path so a replacement
+    // ticket is still observed; an absent path is safely ignored.
+    if (opened.nlink === 0n) {
+      throw new LifecycleTicketChangedError(`Lifecycle ticket was released while it was being opened: ${file}`);
     }
     if (!sameTicketIdentity(before, opened)) {
       let current: fs.BigIntStats;
