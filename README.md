@@ -42,6 +42,16 @@ to move all reasoning to Codex. Already specified, independently authorized work
 can continue. Neither a BOOT receipt nor a keyword test proves reasoning delegation
 or a measured quota saving.
 
+Pending receipts remain the coordinator's active responsibility. Follow CLI
+`coordinatorAction` and `readbackDueAt` through read/record/confirm, using
+`resume --use-id` to continue the same lease and `--use-id` on every receipt command.
+`businessGate` distinguishes BOOT, planning and review waits; local read-only
+investigation is not an automatic fallback. Independent specified work must not
+delay due reads. Diagnose persistent observation gaps, record `observation_blocked`
+with concrete evidence, and resume the same request when reading is restored.
+Use `--kind analysis` for follow-up reasoning after a weak PLAN, not a fabricated
+EXECUTED. The CLI provides decisions; it does not poll Chat in the background.
+
 ## Installation-trial scope
 
 This branch is prepared for a first controlled installation trial on:

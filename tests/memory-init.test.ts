@@ -15,6 +15,7 @@ import {
   readTaskSession,
   recordTaskHostControl,
   sessionLedgerFile,
+  sessionRecoveryGuidance,
   switchTaskWorkspace,
 } from "../src/session/state.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
@@ -44,6 +45,24 @@ beforeEach(async () => {
 });
 
 afterEach(() => cleanup(root));
+
+it("has a truthful analysis follow-up after weak PLAN without reinitializing mem or pretending execution", async () => {
+  await expect(beginTaskSend(workspace, taskId, newMessageId(), 1, { messageKind: "analysis" })).rejects.toThrow("MEMORY_INIT_REQUIRED");
+  const prepared = await prepareTaskInit(workspace, taskId, input);
+  expect(sessionRecoveryGuidance("exact", prepared.task).businessGate).toBe("await_plan");
+  await confirmTaskDelivery(workspace, taskId, prepared.messageId, prepared.messageDigest);
+  const ready = await confirmTaskReply(workspace, taskId, prepared.messageId, "PLAN", undefined, {
+    project: input.memoryProject, status: "ready", sources: ["memory_start_task"],
+  });
+  const analysisId = newMessageId();
+  const analysis = await beginTaskSend(workspace, taskId, analysisId, 2, { messageKind: "analysis" });
+  expect(analysis.memoryInitialization).toEqual(ready.memoryInitialization);
+  expect(sessionRecoveryGuidance("exact", analysis).businessGate).toBe("await_plan");
+  await confirmTaskDelivery(workspace, taskId, analysisId);
+  await confirmTaskReply(workspace, taskId, analysisId, "PLAN");
+  const executed = await beginTaskSend(workspace, taskId, newMessageId(), 3, { messageKind: "executed" });
+  expect(sessionRecoveryGuidance("exact", executed).businessGate).toBe("await_review");
+});
 
 it("generates the fixed mem INIT, protects its exact readback, and unlocks EXECUTED only after READY", async () => {
   const prepared = await prepareTaskInit(workspace, taskId, input);
@@ -89,6 +108,7 @@ it("permits explained DEGRADED memory while still fencing a changed generation",
   const moved = await switchTaskWorkspace({ taskId, fromWorkspaceId: workspace, toWorkspaceId: "mem-next", expectedGeneration: 1, connectorName: "C2C", workspaceName: "next", branch: "main" });
   expect(moved.memoryInitialization).toBeUndefined();
   await expect(beginTaskSend("mem-next", taskId, newMessageId(), 2, { messageKind: "executed" })).rejects.toThrow("MEMORY_INIT_REQUIRED");
+  await expect(beginTaskSend("mem-next", taskId, newMessageId(), 2, { messageKind: "analysis" })).rejects.toThrow("MEMORY_INIT_REQUIRED");
 });
 
 it("rejects malformed inputs, too-large generated bodies, and incomplete memory replies without changing the reservation", async () => {

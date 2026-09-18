@@ -53,6 +53,57 @@ not add C2C MCP tools or permissions. Use the delivery procedure under Normal
 control loop for every send, including follow-up analysis. Review requests retain
 the exact REVIEW_HEAD contract below.
 
+### Pending follow-through is the coordinator's active job
+
+A pending receipt is unfinished work, not a passive status to mention before
+switching to local analysis. At the start of every turn/continuation, run
+`session get --brief --json --use-id <own-lease>` (omit use-id when none is held).
+Keep the same lease in continuation context. `session resume --use-id <own-lease>`
+is idempotent even while pending; a stale/wrong lease never grants access.
+Never retrieve another coordinator's lease to bypass this check.
+
+Use this loop until the exact receipt is reconciled or a concrete observation
+blocker is diagnosed. No background worker reads Chat on the coordinator's behalf:
+
+1. Follow `nextAction` for workspace/ownership/tool prerequisites first.
+2. For pending, execute `coordinatorAction`: `read_now` reads the exact Chat;
+   `wait_then_read` waits only until `readbackDueAt` (at most 60 seconds per wait);
+   `confirm_receipt` uses the actual matching message with normal confirmation
+   commands, never the visibility hint alone. Start from the latest page each time.
+3. Record every actual read with `record-readback`, then obtain fresh guidance.
+   A progress update, another local tool call, idle Chat, or completed host turn
+   does not discharge this responsibility. Due reads take priority over optional work.
+4. `diagnose_readback` means check host/runtime health and exact-request pagination,
+   retaining the evidence. If the Chat is generating or readable progress exists,
+   continue the same request. If a diagnostic establishes that the host cannot
+   provide the needed result, record `result: observation_blocked`,
+   `errorCategory: unavailable`, and a concrete, sanitized `blockedReason` (1–500
+   characters, no credentials or body). Explain the failed read/health/pagination
+   checks and recovery needed; idle/elapsed time alone is not this evidence.
+5. `restore_observation` preserves pending. Perform available safe tool/routing
+   recovery; if none can resolve it, report a resumable observation blocker, not
+   message failure or completed delegation. A later continuation rechecks the
+   same request: old observations expire for scheduling, never for ownership.
+
+| businessGate | Required work before dependent business can continue |
+| --- | --- |
+| await_boot | Complete BOOT receipts and actual workspace_info confirmation |
+| await_plan | Confirm INIT/ANALYSIS reply, then assess substantive analysis |
+| await_review | Confirm EXECUTED reply before dependent changes or acceptance |
+| await_reply | Reconcile legacy request; do not guess its business authority |
+| connection_required | Resolve the reported connection/ownership prerequisite |
+| assess_reply | Assess scope, evidence and user authorization; ready is not business DONE |
+
+All receipt commands (`confirm-send-accepted`, `record-delivery-pending`,
+`confirm-delivery`, `confirm-reply`, `confirm-workspace`, `fail-delivery`) require the held `--use-id`,
+as do host-control and reservations. Omit it only when there is no lease.
+No pending exception authorizes finish, another send, Chat replacement or promotion
+of local/Gitea investigation into ChatGPT analysis. General planning/TDD/worktree
+skills must preserve this loop; they cannot turn a pending status into a fallback.
+After an initial BOOT DONE, `workspace_confirmation_required` keeps `await_boot`
+until actual workspace_info and confirm-workspace complete. Migration retains its
+separate `migration_workspace_confirmation_required` action. Neither stage resends BOOT.
+
 ### Routing exceptions and unavailable channels
 
 - Simple deterministic operations, such as a trivial mechanical typo edit, may
@@ -61,17 +112,29 @@ the exact REVIEW_HEAD contract below.
   impact still needs ChatGPT analysis before execution.
 - With a complete user-supplied plan, ask ChatGPT only for necessary code mapping
   and gap analysis. Do not force replanning or expand the approved scope. Work
-  already fully specified by the user need not wait for redundant planning.
+  already fully specified by the user need not wait for redundant planning, but
+  an already-sent request still requires the pending loop above. Only independent,
+  bounded execution may overlap; dependent analysis/review cannot be bypassed.
 - Review-only requests stay review-only. A user prohibition on external sharing
   takes precedence; do not send prohibited task content.
 - An unavailable channel is not permission to silently perform all reasoning locally.
   Report the offload blocker and preserve the binding and pending receipts. Continue
-  only independently authorized, fully specified work; if substantial reasoning
+  only independently authorized, fully specified work that does not depend on the
+  missing reply and does not postpone due reads. “Read-only local/memory/Gitea
+  investigation” is still reasoning, not a blanket exception. If substantial reasoning
   must move back to Codex, obtain the user's direction. Do not claim ChatGPT analysis
   or acceptance without an observed substantive reply.
 
 These exceptions do not waive host preflight, receipt readback, binding ownership,
 or the exact REVIEW_HEAD requirement whenever a ChatGPT message is sent.
+
+After confirming a weak PLAN, request missing analysis with
+`begin-send --kind analysis --message-id <new-id> --iteration <next> --use-id <own-lease>`
+and normal preflight/delivery/reply checks. Send `STATE: ANALYSIS`, the four exact
+identity fields, and `REQUEST: supply the missing code evidence/actions/tests/success
+criteria`. This reuses current-generation mem; it does not pretend execution occurred.
+Use `--kind executed` only for actual execution results. Neither kind reuses an old
+generation's mem initialization; new business tasks still start with prepare-init.
 
 ### C2C recovery is already authorized
 

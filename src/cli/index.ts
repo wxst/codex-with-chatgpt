@@ -1326,19 +1326,21 @@ session.command("get", { isDefault: true })
 session.command("resume")
   .description("Acquire one continuation lease after resolving the current task binding")
   .option("-w, --workspace <path>").option("--task-id <id>").option("--brief", "emit only continuation decision", false)
+  .option("--use-id <id>", "resume the same coordinator lease without acquiring a new one")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; taskId?: string; brief: boolean; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; useId?: string; brief: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const binding = resolveTaskBinding(workspace.id, resolved.taskId);
-    const current = binding.task;
-    const guidance = sessionRecoveryGuidance(binding.resolution, current);
+    const current = opts.useId !== undefined && binding.resolution === "exact"
+      ? await resumeTaskSession(workspace.id, resolved.taskId, opts.useId) : binding.task;
+    const guidance = sessionRecoveryGuidance(binding.resolution, current, opts.useId);
     if (guidance.nextAction !== "resume_bound_chat") {
       const m = current?.migrationHandshake;
       const payload = { ok: true, taskId: resolved.taskId, requestedWorkspaceId: workspace.id,
         boundWorkspaceId: binding.boundWorkspaceId, workspaceId: workspace.id, resolution: binding.resolution,
         conversationId: current?.conversationId ?? null, generation: current?.generation ?? null,
-        useId: null, ...guidance,
+        useId: binding.resolution === "exact" ? opts.useId ?? null : null, ...guidance,
         migration: m && !m.completedAt ? { fromWorkspaceId: m.fromWorkspaceId, toWorkspaceId: m.toWorkspaceId,
           assignmentEpoch: m.assignmentEpoch, bootMessageId: m.bootMessageId ?? null } : null,
         migrationLeaseActive: Boolean(current?.activeUse),
@@ -1346,7 +1348,7 @@ session.command("resume")
       if (opts.json) say(JSON.stringify(payload)); else say(`续接：${guidance.nextAction}`);
       return;
     }
-    const task = await resumeTaskSession(workspace.id, resolved.taskId);
+    const task = await resumeTaskSession(workspace.id, resolved.taskId, opts.useId);
     const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, resolution: "exact", conversationId: task.conversationId, generation: task.generation, useId: task.useId, ...sessionRecoveryGuidance("exact", task, task.useId) };
     if (opts.json) say(JSON.stringify(opts.brief ? payload : { ...payload, task })); else check(`已续接同一 Chat；use-id：${task.useId}`);
   });
@@ -1567,6 +1569,7 @@ pool.command("quarantine")
 session.command("confirm-workspace")
   .description("Promote a user-confirmed binding after workspace_info matches")
   .option("-w, --workspace <path>").option("--task-id <id>")
+  .option("--use-id <id>", "current coordinator lease")
   .requiredOption("--observed-workspace-id <id>")
   .option("--observed-route-task-id <id>", "exact routeTaskId returned by workspace_info")
   .option("--observed-connector-name <name>", "legacy display value; not used for identity verification")
@@ -1574,7 +1577,7 @@ session.command("confirm-workspace")
   .option("--observed-branch <branch>")
   .option("--json", "machine-readable output", false)
   .action(async (opts: {
-    workspace?: string; taskId?: string; observedWorkspaceId: string; observedRouteTaskId?: string; observedConnectorName?: string;
+    workspace?: string; taskId?: string; useId?: string; observedWorkspaceId: string; observedRouteTaskId?: string; observedConnectorName?: string;
     observedWorkspaceName: string; observedBranch?: string; json: boolean;
   }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
@@ -1590,7 +1593,7 @@ session.command("confirm-workspace")
         routeTaskId: opts.observedRouteTaskId,
         workspaceName: opts.observedWorkspaceName,
         branch: opts.observedBranch ?? null,
-      },
+      }, opts.useId,
     );
     if (opts.json) say(JSON.stringify({ ok: true, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check("工作区及路由任务身份已核对；会话进入 ready");
@@ -1636,7 +1639,7 @@ session.command("host-control")
     const task = await recordTaskHostControl(workspace.id, resolved.taskId, {
       result: opts.result, migrationObservation: opts.observationFile ? JSON.parse(fs.readFileSync(opts.observationFile, "utf8").replace(/^\uFEFF/u, "")) : undefined, tools: opts.tools === "none" ? [] : opts.tools?.split(",").map(x => x.trim()),
       conversationId: opts.conversationId, observedTaskId: opts.observedTaskId,
-      observedWorkspaceId: opts.observedWorkspaceId, messageId: opts.messageId,
+      observedWorkspaceId: opts.observedWorkspaceId, messageId: opts.messageId, useId: opts.useId,
     });
     const status = task.hostControl!.status;
     const migrationRecovery = migrationRecoveryGuidance(task);
@@ -1708,7 +1711,7 @@ session.command("record-read")
   });
 
 function addChannelCommandOptions(command: Command): Command {
-  return command.option("-w, --workspace <path>").option("--task-id <id>").requiredOption("--message-id <id>").option("--json", "machine-readable output", false);
+  return command.option("-w, --workspace <path>").option("--task-id <id>").requiredOption("--message-id <id>").option("--use-id <id>", "current coordinator lease").option("--json", "machine-readable output", false);
 }
 
 function addObservedIdentityOptions(command: Command): Command {
@@ -1761,10 +1764,9 @@ addChannelCommandOptions(session.command("begin-send").description("Atomically r
   .requiredOption("--iteration <n>")
   .option("--probe", "allow one recovery probe for a degraded channel", false)
   .option("--bootstrap", "reserve the workspace_info boot message before ready", false)
-  .option("--kind <kind>", "executed for a post-INIT business message")
+  .option("--kind <kind>", "analysis for follow-up reasoning; executed for execution results")
   .option("--review-head <sha>", "bind this review to an exact full Git HEAD")
   .option("--expected-generation <n>", "fence this send to the resumed binding generation")
-  .option("--use-id <id>", "fence this send to the active session resume lease")
   .action(async (opts: { workspace?: string; taskId?: string; messageId: string; iteration: string; probe: boolean; bootstrap: boolean; kind?: string; reviewHead?: string; expectedGeneration?: string; useId?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
@@ -1776,8 +1778,8 @@ addChannelCommandOptions(session.command("begin-send").description("Atomically r
     }
     if (opts.bootstrap || opts.probe) {
       if (opts.kind !== undefined) throw new Error("BUSINESS_MESSAGE_KIND_FORBIDDEN: BOOT and recovery probes have no business kind");
-    } else if (opts.kind !== "executed") {
-      throw new Error("BUSINESS_MESSAGE_KIND_REQUIRED: use session prepare-init for INIT or --kind executed after it is confirmed");
+    } else if (opts.kind !== "executed" && opts.kind !== "analysis") {
+      throw new Error("BUSINESS_MESSAGE_KIND_REQUIRED: use session prepare-init for INIT or --kind analysis|executed after it is confirmed");
     }
     const task = await beginTaskSend(
       workspace.id,
@@ -1786,33 +1788,33 @@ addChannelCommandOptions(session.command("begin-send").description("Atomically r
       parseReceiptIteration(opts.iteration),
       { probe: opts.probe, bootstrap: opts.bootstrap, reviewHead: opts.reviewHead,
         expectedGeneration: opts.expectedGeneration === undefined ? undefined : parseReceiptIteration(opts.expectedGeneration),
-        useId: opts.useId, messageKind: opts.kind === "executed" ? "executed" : undefined }
+        useId: opts.useId, messageKind: opts.kind === "executed" || opts.kind === "analysis" ? opts.kind : undefined }
     );
     if (opts.json) say(JSON.stringify({ ok: true, reserved: true, accepted: false, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`已保留发送 ${task.pendingMessageId}；尚未确认送达`);
   });
 
 addChannelCommandOptions(session.command("confirm-send-accepted").description("Record that the direct ChatGPT host accepted the outbound request"))
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; useId?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
-    const task = await confirmTaskSendAccepted(workspace.id, resolved.taskId, opts.messageId);
+    const task = await confirmTaskSendAccepted(workspace.id, resolved.taskId, opts.messageId, opts.useId);
     if (opts.json) say(JSON.stringify({ ok: true, reserved: true, accepted: true, delivered: false, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`宿主已接受 ${task.pendingMessageId}；正在等待 ChatGPT 显示该消息`);
   });
 
 addChannelCommandOptions(session.command("record-delivery-pending").description("Keep an accepted direct message in flight after a short readback window"))
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; useId?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
-    const task = await recordTaskDeliveryPending(workspace.id, resolved.taskId, opts.messageId);
+    const task = await recordTaskDeliveryPending(workspace.id, resolved.taskId, opts.messageId, opts.useId);
     if (opts.json) say(JSON.stringify({ ok: true, reserved: true, accepted: true, delivered: false, pending: true, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else say(`消息仍在等待显示：${task.pendingMessageId}`);
   });
 
 addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-delivery").description("Confirm an outbound message was observed in ChatGPT")))
   .option("--observed-message-file <path>", "exact UTF-8 body read back from the bound Chat; required for generated INIT")
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; observedMessageFile?: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; useId?: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; observedMessageFile?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const current = readTaskSession(workspace.id, resolved.taskId);
@@ -1824,7 +1826,7 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-del
     const observedDigest = opts.observedMessageFile === undefined ? undefined : digestBusinessMessage(
       new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(path.resolve(opts.observedMessageFile)))
     );
-    const task = await confirmTaskDelivery(workspace.id, resolved.taskId, opts.messageId, observedDigest);
+    const task = await confirmTaskDelivery(workspace.id, resolved.taskId, opts.messageId, observedDigest, opts.useId);
     if (opts.json) say(JSON.stringify({ ok: true, accepted: Boolean(current.sendAcceptedAt), delivered: true, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`已确认送达 ${task.lastDeliveredMessageId}；正在等待回复`);
   });
@@ -1836,7 +1838,7 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-rep
   .option("--memory-status <status>", "MEMORY_STATUS: READY or DEGRADED")
   .option("--memory-sources <csv>", "MEMORY_SOURCES from the INIT reply")
   .option("--memory-reason <reason>", "MEMORY_REASON required for DEGRADED")
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; state: string; observedReviewHead?: string; memoryProject?: string; memoryStatus?: string; memorySources?: string; memoryReason?: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; useId?: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; state: string; observedReviewHead?: string; memoryProject?: string; memoryStatus?: string; memorySources?: string; memoryReason?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const current = readTaskSession(workspace.id, resolved.taskId);
@@ -1852,7 +1854,7 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-rep
       sources: opts.memorySources === undefined ? [] : opts.memorySources.split(",").map(value => value.trim()).filter(Boolean),
       reason: opts.memoryReason,
     };
-    const task = await confirmTaskReply(workspace.id, resolved.taskId, opts.messageId, opts.state, opts.observedReviewHead, memory);
+    const task = await confirmTaskReply(workspace.id, resolved.taskId, opts.messageId, opts.state, opts.observedReviewHead, memory, opts.useId);
     if (opts.json) say(JSON.stringify({ ok: true, accepted: Boolean(current.sendAcceptedAt), delivered: true, replied: true, identityVerified: true, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else check(`已确认回复；任务迭代推进到 ${task.iteration}`);
   });
@@ -1860,11 +1862,11 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-rep
 addChannelCommandOptions(session.command("fail-delivery").description("Record an explicit terminal host failure and its binding state"))
   .requiredOption("--kind <kind>", "host_rejected, conversation_gone, or identity_mismatch")
   .requiredOption("--reason <reason>")
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; kind: string; reason: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; useId?: string; kind: string; reason: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const current = readTaskSession(workspace.id, resolved.taskId);
-    const task = await failTaskDelivery(workspace.id, resolved.taskId, opts.messageId, opts.kind, opts.reason);
+    const task = await failTaskDelivery(workspace.id, resolved.taskId, opts.messageId, opts.kind, opts.reason, opts.useId);
     if (opts.json) say(JSON.stringify({ ok: false, accepted: Boolean(current?.sendAcceptedAt), delivered: current?.lastDeliveredMessageId === opts.messageId, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
     else if (task.bindingState === "unavailable") say(`会话已退役：${task.replacementReason}`);
     else if (task.bindingState === "quarantined") say(`会话已隔离：${task.lastDeliveryError}`);

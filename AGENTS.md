@@ -31,6 +31,13 @@
 
 ## 消息等待与恢复
 
+- pending 是主协调者必须持续处理的工作，不是汇报后可搁置的状态。每次续接先 get；持有租约时用 resume --use-id 幂等续接，不重新领取，也不使用其他协调者的租约。
+- 按 coordinatorAction 执行读取、等待至 readbackDueAt、精确确认、诊断或恢复观察；记录每次真实读取。到期读回优先于可选本地工作，CLI 不会替协调者后台轮询。
+- businessGate 区分 BOOT、INIT/ANALYSIS、EXECUTED 和历史消息等待。ready 或 PLAN 回显不等于业务验收；依赖该回复的分析、修改或发布不能越过等待。只读的本地/记忆/Gitea 分析也不是自动豁免，Superpowers 等通用流程必须保留读回责任。
+- 完整用户方案允许的独立、确定性工作可交错执行，但不能拖延到期读回。真实宿主健康/分页诊断无法提供结果时，记录 observation_blocked、errorCategory=unavailable 和脱敏 blockedReason，报告可恢复的观察阻塞；不得凭 idle、completed 或等待时长判失败。续接后重新观察同一请求。
+- 所有回执变更命令均传自己的 --use-id（无租约时省略）；弱 PLAN 先确认回执，再用 --kind analysis / STATE: ANALYSIS 请求补充，不能伪造 EXECUTED 或重新发送旧消息。
+- 首次 BOOT DONE 后仍须按 workspace_confirmation_required 完成实际 workspace_info 与 confirm-workspace（携带自身租约）；旧代 DONE 不代表当前 BOOT。迁移继续使用独立迁移动作，不重发 BOOT。
+
 - get、resume、host-control 使用统一恢复决策：工作区、其他协调者租约及工具可用性优先，随后对账 pending，再完成迁移或续接。
 - 送达与回复独立计时：前 60 秒每 5 秒、之后每 15 秒、超过 5 分钟每 30 秒读取；单次等待不超过 60 秒。十五分钟触发健康和分页诊断，不自动判失败。
 - idle、completed、空页、超时均不证明没有回复。每次从最新页读起，按需分页定位精确请求和回复；用 session record-readback 记录真实观察，不能改写已确认送达进度。

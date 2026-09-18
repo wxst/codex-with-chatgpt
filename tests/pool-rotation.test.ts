@@ -15,10 +15,11 @@ const claim = (taskId: string, id = workspaceId, observations?: ReclaimObservati
   claimStandbyConversation({ workspaceId: id, taskId, connectorName: "C2C", workspaceName: "repo", branch: "main", reclaimObservations: observations });
 async function boot(taskId: string, id = workspaceId) {
   const msg = newMessageId();
-  await beginTaskSend(id, taskId, msg, 0, { bootstrap: true, useId: readTaskSession(id, taskId)?.activeUse?.useId });
-  await confirmTaskDelivery(id, taskId, msg);
-  await confirmTaskReply(id, taskId, msg, "DONE");
-  await confirmTaskWorkspace(id, taskId, { workspaceId: id, routeTaskId: taskId, workspaceName: "repo", branch: "main" });
+  const useId = readTaskSession(id, taskId)?.activeUse?.useId;
+  await beginTaskSend(id, taskId, msg, 0, { bootstrap: true, useId });
+  await confirmTaskDelivery(id, taskId, msg, undefined, useId);
+  await confirmTaskReply(id, taskId, msg, "DONE", undefined, undefined, useId);
+  await confirmTaskWorkspace(id, taskId, { workspaceId: id, routeTaskId: taskId, workspaceName: "repo", branch: "main" }, useId);
 }
 function observationsFor() {
   return readReclaimCandidates().candidates.map(row => ({ conversationId: row.conversationId,
@@ -219,7 +220,7 @@ async function failedRequester(target = workspaceId, withLease = false): Promise
   const routingCheckedAt = new Date().toISOString();
   const messageId = newMessageId();
   await beginTaskSend(target, "requester", messageId, 1, { useId: lease?.useId });
-  const failed = await failTaskDelivery(target, "requester", messageId, "host_rejected", "correct ChatGPT routing rejected");
+  const failed = await failTaskDelivery(target, "requester", messageId, "host_rejected", "correct ChatGPT routing rejected", lease?.useId);
   const observedAt = new Date().toISOString();
   return { taskId: "requester", workspaceId: target, conversationId: "requester-chat", generation: failed.generation,
     failureCheckedAt: failed.lastDeliveryCheckedAt!, routingCheckedAt, chatReadAt: observedAt,

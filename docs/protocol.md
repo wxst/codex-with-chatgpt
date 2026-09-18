@@ -52,6 +52,9 @@ stays review-only, and user restrictions on external sharing take precedence.
 An unavailable channel is an offload blocker: preserve binding and receipts, do
 not claim analysis occurred, and do not silently move all reasoning to Codex.
 Only independently authorized, fully specified work may continue without it.
+This exception never suspends pending readback: due observations take priority.
+Read-only local/memory/Gitea investigation is reasoning and cannot silently replace
+the delegated analysis. Generic planning/TDD/worktree workflows preserve this rule.
 
 See the [Skill templates](../skill/SKILL.md#normal-control-loop). Documentation
 tests prove instruction presence; real acceptance requires observed source reads,
@@ -206,9 +209,32 @@ Each wait is at most 60 seconds. Start with the newest page and follow cursors t
 find the exact pending request/reply. `idle`, completed turns, partial/empty pages,
 timeout and late delivery are observation gaps, not proof of absent replies.
 
+The current coordinator owns an active read/record/confirm loop. CLI guidance does
+not start a worker. `coordinatorAction` distinguishes read_now, wait_then_read,
+confirm_receipt, diagnose_readback, restore_observation and follow_next_action.
+`readbackDueAt` and `observationAgeMs` are derived from actual observations;
+no observation means read now. Matching visible replies take priority over an
+elapsed diagnostic threshold. Visibility never bypasses exact receipt validation.
+Old/mismatched/future observations cannot keep a resumed task waiting indefinitely.
+
+`businessGate` separately identifies await_boot, await_plan (INIT or ANALYSIS),
+await_review (EXECUTED), await_reply (legacy), connection_required or assess_reply.
+These describe required work, not a grant of filesystem execution authority.
+Ready/PLAN alone never proves substantive analysis or business completion.
+An initial BOOT DONE with workspace verification still pending returns
+workspace_confirmation_required + await_boot. The recorded bootReplyGeneration
+prevents an old-generation DONE from being promoted as the current BOOT; legacy
+generation-one receipts remain compatible. Migration uses its existing distinct
+action. confirm-workspace is also lease-fenced and requires actual MCP identity.
+
 `session record-readback --observation-file <UTF8 JSON>` records actual taskId,
 workspaceId, conversationId, generation, assignmentEpoch, messageId, iteration,
 readAt and result (empty/request_visible/reply_visible/missing/timeout/read_failed).
+After concrete health/read/pagination diagnosis, observation_blocked additionally
+requires errorCategory=unavailable and a sanitized nonempty blockedReason up to
+500 characters. It is a recoverable observation gap, never terminal send failure.
+Idle/completed/time alone is insufficient; report what prevents observing the
+result and the needed recovery. A later continuation rechecks the original request.
 Optional paginationComplete, hostTurnId, hostTurnStatus, chatStatus, errorCategory
 and useId remain unknown when absent. Observations must be within 60 seconds,
 match the lock-protected current binding/message/lease and never regress in time.
@@ -223,6 +249,12 @@ With no pending, expired or missing preflight returns probe_then_read_bound_chat
 Send only after reservation exits successfully and returns the matching identity;
 a failed reservation never authorizes a host send. Pass the held use-id to get
 and host-control so lease guidance distinguishes the current coordinator.
+`resume --use-id` idempotently validates the existing lease under lock, including
+pending and expired preflight, without changing its start time or acquiring another.
+Absent/wrong/stale lease IDs cannot advance an owned receipt. All receipt commands
+accept --use-id and check ownership in the same lock as their state transition.
+Unleased historical bindings remain supported. Never recover another coordinator's
+lease by reading it from the ledger; preserve ownership across interruption.
 Temporary read failures retain sending/awaiting_reply. Legacy degraded pending
 records recover their phase from the registered delivery receipt. Continuation
 must reconcile pending before any new send. Only explicit terminal evidence uses
@@ -230,6 +262,11 @@ fail-delivery; inability to observe is a resumable blocker, never resend authori
 
 Matching PLAN receipts and substantive analysis are separate: confirm the receipt,
 then require code evidence/actions/tests/success criteria or request supplementation.
+Use `begin-send --kind analysis` / `STATE: ANALYSIS` for that supplementation or
+diagnosis, with four receipt IDs and a concrete REQUEST. It requires this generation's
+mem INIT, reuses that initialization and makes no claim that execution occurred.
+Use executed only to report actual execution. Business exemptions do not abandon
+already-sent messages or authorize dependent work before the needed reply.
 MEMORY_STATUS READY alone does not prove tools ran; acceptance needs tool evidence.
 
 

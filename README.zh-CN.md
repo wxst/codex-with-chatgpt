@@ -10,6 +10,13 @@ ChatGPT 能看到的 MCP 接口始终只读。
 
 ## 日常使用：先交给 ChatGPT 分析
 
+pending 是协调者必须持续完成的工作，不能汇报“待回读”后转为本地分析。
+按 CLI 的 `coordinatorAction`、`readbackDueAt` 读取、记录和确认，使用
+`resume --use-id` 续用同一租约，所有回执命令携带自己的 `--use-id`。
+`businessGate` 分开 BOOT、规划和复核等待；已明确的独立工作不能拖延到期读回。
+长期观察缺口须诊断并记录有具体原因的 `observation_blocked`，恢复后继续同一消息。
+弱 PLAN 确认后使用 `--kind analysis` 补充分析，不伪造 EXECUTED。CLI 不会后台代为轮询。
+
 利用 ChatGPT 订阅额度承担代码探索、方案比较、根因分析、测试设计和复核，
 减少 Codex 在这些环节的额度消耗。Codex 先检查任务范围与连接状态，再把实质
 分析交给 ChatGPT；Codex 保留执行权和必要判断，不先完成整套分析再请求复核。

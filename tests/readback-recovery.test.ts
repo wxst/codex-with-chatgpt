@@ -62,7 +62,7 @@ it("replays late delivery and >6-minute reply, idle/completed empty pages and ti
     vi.setSystemTime(start + 367_000 + elapsed);
     await recordTaskReadback(workspace, taskId, observation({ result, chatStatus: "idle", hostTurnStatus: "completed", paginationComplete: false }));
     expect(current()).toMatchObject({ channelState: "awaiting_reply", pendingMessageId: messageId, lastDeliveredMessageId: messageId, replyWaitingSince: deliveredAt });
-    expect(sessionRecoveryGuidance("exact", current())).toMatchObject({ nextAction: "reply_readback_required", waitingMs: elapsed, diagnosticRequired: elapsed >= 900_000 });
+    expect(sessionRecoveryGuidance("exact", current())).toMatchObject({ nextAction: "reply_readback_required", waitingMs: elapsed, diagnosticRequired: elapsed >= 900_000 && result !== "reply_visible" });
   }
   const before = disk();
   await expect(confirmTaskReply(workspace, taskId, newMessageId(), "DONE")).rejects.toThrow();
@@ -141,4 +141,116 @@ it("runs observation files and recovery through real CLI with legacy degraded re
   expect(disk()).toBe(before);
   expect(cli("confirm-reply", ...receipt, "--state", "DONE").status).toBe(0);
   expect(current().pendingMessageId).toBeUndefined();
+});
+
+it("continues the same CLI lease through delivery, interruption and reply, fencing every receipt", async () => {
+  const run = (...args: string[]) => {
+    const r = cli(...args);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    return JSON.parse(r.stdout);
+  };
+  const lease = run("resume", "--brief").useId;
+  const beforeResume = disk();
+  expect(run("resume", "--use-id", lease).useId).toBe(lease);
+  expect(disk()).toBe(beforeResume);
+  run("begin-send", "--message-id", messageId, "--iteration", "0", "--bootstrap", "--use-id", lease);
+  const identity = ["--message-id", messageId, "--observed-task-id", taskId, "--observed-workspace-id", workspace, "--observed-iteration", "0"];
+  for (const args of [
+    ["confirm-send-accepted", "--message-id", messageId],
+    ["record-delivery-pending", "--message-id", messageId],
+    ["confirm-delivery", ...identity],
+    ["confirm-reply", ...identity, "--state", "DONE"],
+    ["fail-delivery", "--message-id", messageId, "--kind", "host_rejected", "--reason", "explicit rejection"],
+  ]) {
+    const before = disk();
+    expect(cli(...args).status).not.toBe(0);
+    expect(cli(...args, "--use-id", "c2c_use_00000000-0000-0000-0000-000000000000").status).not.toBe(0);
+    expect(disk()).toBe(before);
+  }
+  run("confirm-send-accepted", "--message-id", messageId, "--use-id", lease);
+  run("record-delivery-pending", "--message-id", messageId, "--use-id", lease);
+  expect(run("resume", "--use-id", lease)).toMatchObject({ useId: lease, nextAction: "delivery_readback_required", coordinatorAction: "read_now", businessGate: "await_boot" });
+  run("confirm-delivery", ...identity, "--use-id", lease);
+  const file = path.join(root, "continued.json");
+  fs.writeFileSync(file, JSON.stringify(observation({ useId: lease, result: "reply_visible" })));
+  run("record-readback", "--observation-file", file);
+  for (const surface of ["get", "resume"]) {
+    expect(run(surface, "--use-id", lease)).toMatchObject({ nextAction: "reply_readback_required", coordinatorAction: "confirm_receipt" });
+  }
+  expect(cli("finish", "--use-id", lease).status).not.toBe(0);
+  expect(cli("begin-send", "--message-id", newMessageId(), "--iteration", "0", "--bootstrap", "--use-id", lease).status).not.toBe(0);
+  run("confirm-reply", ...identity, "--state", "DONE", "--use-id", lease);
+  for (const surface of ["get", "resume"]) {
+    expect(run(surface, "--use-id", lease)).toMatchObject({ nextAction: "workspace_confirmation_required", businessGate: "await_boot" });
+  }
+  const confirmWorkspace = ["confirm-workspace", "--observed-workspace-id", workspace, "--observed-route-task-id", taskId,
+    "--observed-workspace-name", "repo", "--observed-branch", "main"];
+  const beforeWorkspace = disk();
+  expect(cli(...confirmWorkspace).status).not.toBe(0);
+  expect(disk()).toBe(beforeWorkspace);
+  run(...confirmWorkspace, "--use-id", lease);
+  // A long real-CLI sequence may outlive the preflight; refresh it explicitly.
+  run("host-control", "--result", "probe", "--tools", "read_thread,send_message_to_thread", "--use-id", lease);
+  run("host-control", "--result", "read-ok", "--conversation-id", chat,
+    "--observed-task-id", taskId, "--observed-workspace-id", workspace, "--use-id", lease);
+  expect(run("resume", "--use-id", lease)).toMatchObject({ nextAction: "resume_bound_chat", businessGate: "assess_reply" });
+  run("finish", "--use-id", lease);
+  const finished = disk();
+  expect(cli("resume", "--use-id", lease).status).not.toBe(0);
+  expect(disk()).toBe(finished);
+  expect(current().pendingMessageId).toBeUndefined();
+});
+
+it("does not mistake an old generation's DONE for the current BOOT", async () => {
+  await beginTaskSend(workspace, taskId, messageId, 0, { bootstrap: true });
+  await confirmTaskDelivery(workspace, taskId, messageId);
+  await confirmTaskReply(workspace, taskId, messageId, "DONE");
+  expect(current().bootReplyGeneration).toBe(1);
+  const changed = { ...current(), generation: 2 };
+  expect(sessionRecoveryGuidance("exact", changed).nextAction).not.toBe("workspace_confirmation_required");
+  expect(sessionRecoveryGuidance("exact", { ...changed, bootReplyGeneration: 2 }).nextAction).toBe("workspace_confirmation_required");
+});
+
+it("fences host recovery inside the state lock and ignores stale observation scheduling", async () => {
+  const lease = await resumeTaskSession(workspace, taskId);
+  await beginTaskSend(workspace, taskId, messageId, 0, { bootstrap: true, useId: lease.useId });
+  const before = disk();
+  await expect(recordTaskHostControl(workspace, taskId, { result: "timeout" })).rejects.toThrow("TASK_USE_STALE");
+  await expect(recordTaskHostControl(workspace, taskId, { result: "not-invoked", messageId })).rejects.toThrow("TASK_USE_STALE");
+  expect(disk()).toBe(before);
+  await recordTaskHostControl(workspace, taskId, { result: "timeout", useId: lease.useId });
+  await recordTaskReadback(workspace, taskId, observation({ useId: lease.useId }));
+  for (const patch of [{ generation: 2 }, { messageId: newMessageId() }, { readAt: new Date(Date.now() + 60_000).toISOString() }]) {
+    const changed = { ...current(), readbackObservation: { ...current().readbackObservation!, ...patch } };
+    expect(sessionRecoveryGuidance("exact", changed, lease.useId)).toMatchObject({ coordinatorAction: "read_now", observationAgeMs: null });
+  }
+});
+
+it("makes diagnostics and concrete observation blockers resumable without turning them into send failure", async () => {
+  await beginTaskSend(workspace, taskId, messageId, 0, { bootstrap: true });
+  await confirmTaskDelivery(workspace, taskId, messageId);
+  const now = Date.now();
+  expect(sessionRecoveryGuidance("exact", current(), undefined, now + 900_001)).toMatchObject({ coordinatorAction: "diagnose_readback", diagnosticRequired: true });
+  await recordTaskReadback(workspace, taskId, observation({ result: "observation_blocked", errorCategory: "unavailable", blockedReason: "Host read tool unavailable after health check; exact result cannot be retrieved" }));
+  expect(sessionRecoveryGuidance("exact", current())).toMatchObject({ coordinatorAction: "restore_observation", businessGate: "await_boot", nextAction: "reply_readback_required" });
+  expect(current().pendingMessageId).toBe(messageId);
+  // Returning to a task never leaves it parked forever on an old blocker.
+  expect(sessionRecoveryGuidance("exact", current(), undefined, Date.now() + 60_001).coordinatorAction).toBe("read_now");
+  await recordTaskReadback(workspace, taskId, observation({ result: "request_visible", chatStatus: "idle", hostTurnStatus: "completed" }));
+  expect(sessionRecoveryGuidance("exact", current()).coordinatorAction).toBe("wait_then_read");
+  await recordTaskReadback(workspace, taskId, observation({ result: "reply_visible" }));
+  expect(sessionRecoveryGuidance("exact", current()).coordinatorAction).toBe("confirm_receipt");
+  await confirmTaskReply(workspace, taskId, messageId, "DONE");
+});
+
+it.each([
+  { result: "observation_blocked" },
+  { result: "observation_blocked", blockedReason: "", errorCategory: "unavailable" },
+  { result: "observation_blocked", blockedReason: "idle", errorCategory: "timeout" },
+  { result: "empty", blockedReason: "unexpected" },
+])("rejects malformed diagnostic evidence without writes: %j", async patch => {
+  await beginTaskSend(workspace, taskId, messageId, 0, { bootstrap: true });
+  const before = disk();
+  await expect(recordTaskReadback(workspace, taskId, { ...observation(), ...patch })).rejects.toThrow("INVALID");
+  expect(disk()).toBe(before);
 });
