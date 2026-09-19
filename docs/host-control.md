@@ -42,8 +42,8 @@ with host version, timestamp, task id and tool names. Never include credentials,
 route tokens, or private message bodies. C2C cannot fix host tool injection.
 
 An unbound task reports its actual tool inventory without creating an owner or
-claiming a Chat just to save a host observation. A different worktree's existing
-owner is not transferable. A completed host turn with no readable messages is
+claiming a Chat just to save a host observation. Another task's existing
+owner cannot be imported. A completed host turn with no readable messages is
 an observation gap; neither completion metadata nor another task's available
 tools proves consumer recovery.
 
@@ -55,6 +55,22 @@ binding. A unique binding in another workspace returns
 `workspace_switch_required`; after a fresh exact Chat readback, use
 `session switch-workspace` to move that same binding. Do not move a worktree,
 change the task id, or claim another Chat to work around the path change.
+
+If that source binding has pending, the shared decision is instead
+`reconcile_source_pending`. The source receipt commands support `--bound-workspace`
+from the current checkout, retaining the exact task and old workspace identities.
+After normal confirmation, release only your own source lease with the same flag
+on finish, then migrate. No send command accepts this override.
+
+Fresh idle/terminal host reads that omit a phase receipt trigger
+`read_exact_chat_in_browser`. Read only the get/resume `chatUrl` in a supported
+browser and record source=browser, the final exact URL, and the actual read time.
+Do not copy host turn metadata into browser observations. If visible, validate the
+assistant body with normal confirm-reply --observed-reply-file; INIT delivery still
+requires the exact user body digest. The browser is a second observer, not another
+send surface. No private APIs, regeneration, edits, clearing pending or Chat replacement.
+If no browser page can be observed, record the concrete observer blocker without
+inventing a URL; pending remains intact.
 
 The ten live pool entries are reusable only when a candidate is locally ready,
 has no pending/accepted/uncertain delivery and no active coordinator lease, and

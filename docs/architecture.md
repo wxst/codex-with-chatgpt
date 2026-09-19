@@ -47,5 +47,7 @@ no raw capability token or claimed Chat model name is fabricated.
 - ChatGPT executes no shell, writes, deletes, package actions, or Git mutations.
 - Codex App direct tools are the Chat control plane.
 - The MCP Router is the source-data plane.
-- ChatGPT Work, web pages, browser automation, UIA, ChatGPT Classic, drafts,
-  and clipboard interaction are excluded.
+- ChatGPT Work, UIA, ChatGPT Classic, drafts, clipboard sending and browser
+  control messages are excluded. A supported browser may only read the exact
+  bound Chat URL when host transcript omissions require a second observer.
+  DOM evidence uses the normal receipt validators; no private Chat API is used.

@@ -27,9 +27,13 @@
 - 只有当前 generation 已记录 `READY` 或 `DEGRADED` INIT 时才可发送 `begin-send --kind executed`。generation、Chat 或 workspace 改变会清除该记录，必须重新初始化。
 - C2C 自身的回执对账、错误 BOOT 修复、迁移握手、租约释放、终态绑定退役及固定池安全轮换属于已授权的内部恢复；主协调者自动完成，不再向用户索取单独授权。该约定不扩大到发布、部署、重启、凭据或其他任务的 pending/租约。
 - 未完成迁移的目标 BOOT 已送达且得到匹配 `DONE`、无 pending 时，`session get`/`resume` 必须返回 `migration_workspace_confirmation_required`；主协调者立即读取目标 C2C `workspace_info` 并执行 `confirm-workspace`。不得重新核对源 INIT、重发 BOOT、换 Chat 或把本地/Gitea 工作描述成已经完成 ChatGPT 委派。源回执缺少 `REVIEW_HEAD` 时保持省略，不能用普通 HEAD 填充。
-- 工作区解析优先于迁移子状态：在旧或其他 workspace 调用时，`session get`/`resume` 必须先返回 `switch_workspace`。宿主缺少精确 Chat 的读取或发送工具时，必须先返回并完成 `restore_host_tools_then_read_bound_chat`，不得误报普通迁移 preflight，也不得在工具尚不可用时尝试源读回或目标 `workspace_info`。
+- 工作区解析优先于迁移子状态：在旧或其他 workspace 调用且无 pending 时，`session get`/`resume` 返回 `switch_workspace`；有 pending 则先对唯一源绑定执行 `reconcile_source_pending`。其他协调者租约和 `restore_host_tools_then_read_bound_chat` 仍优先，不得把工具缺失误报为迁移 preflight。宿主返回内容不完整时使用下述只读浏览器观察，不放宽发送权限。
 
 ## 消息等待与恢复
+
+- `read_thread` 的 completed/idle 和空读可能遗漏网页上已经存在的回复。出现 `read_exact_chat_in_browser` 时，自动用受支持浏览器只读打开 get/resume 的精确 `chatUrl`，核对最终 URL 与实际助手正文；不得继续只轮询同一个不完整来源。禁止浏览器发送、重生成、编辑、删除和私有 Chat API。
+- 浏览器观察记录 `source=browser`、实际 `sourceUrl` 和读取时间，不伪造宿主轮次字段。看到匹配回复后，保存精确 UTF-8 正文，用普通 `confirm-reply --observed-reply-file` 完成原消息确认；INIT 的送达摘要、REVIEW_HEAD、mem 和租约校验仍必须通过。只有 visibility hint 不算确认。浏览器不可用则如实记录 observation_blocked，不清 pending、不重发、不换 Chat。
+- 当前 worktree 与绑定工作区不同且有 pending 时，先按 `reconcile_source_pending` 对账原 Chat。使用当前任务自身身份以及回执命令的 `--bound-workspace`，保留源 workspace 身份；无需旧目录存在。确认后用 `finish --bound-workspace --use-id` 释放自己的旧租约，再执行正常迁移。该入口不能发送新业务消息，也不允许操作其他任务。
 
 - pending 是主协调者必须持续处理的工作，不是汇报后可搁置的状态。每次续接先 get；持有租约时用 resume --use-id 幂等续接，不重新领取，也不使用其他协调者的租约。
 - 按 coordinatorAction 执行读取、等待至 readbackDueAt、精确确认、诊断或恢复观察；记录每次真实读取。到期读回优先于可选本地工作，CLI 不会替协调者后台轮询。

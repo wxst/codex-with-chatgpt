@@ -70,6 +70,7 @@ blocker is diagnosed. No background worker reads Chat on the coordinator's behal
    `wait_then_read` waits only until `readbackDueAt` (at most 60 seconds per wait);
    `confirm_receipt` uses the actual matching message with normal confirmation
    commands, never the visibility hint alone. Start from the latest page each time.
+   `read_exact_chat_in_browser` performs the read-only fallback below immediately.
 3. Record every actual read with `record-readback`, then obtain fresh guidance.
    A progress update, another local tool call, idle Chat, or completed host turn
    does not discharge this responsibility. Due reads take priority over optional work.
@@ -84,6 +85,58 @@ blocker is diagnosed. No background worker reads Chat on the coordinator's behal
    recovery; if none can resolve it, report a resumable observation blocker, not
    message failure or completed delegation. A later continuation rechecks the
    same request: old observations expire for scheduling, never for ownership.
+
+### Host transcript omissions: exact Chat browser readback
+
+`read_thread` can return a completed user-only turn even when the matching
+assistant DONE/PLAN already exists on the Chat web page. Repeated host-only
+polls cannot resolve this observation defect. When guidance returns
+`read_exact_chat_in_browser`, use the supported browser tool to navigate only
+the `chatUrl` returned by `session get --brief --json`. Verify the final HTTPS
+ChatGPT URL, project and conversation before reading the visible DOM. Do this
+automatically; it is authorized internal receipt recovery, not a new task.
+
+Browser access here is **read-only observation**. Do not send, edit, regenerate,
+delete, change models, inspect network traffic, call private Chat APIs, or read
+unrelated Chats. Do not substitute browser visibility for a receipt check.
+Read the exact request and its assistant response, including four identity
+fields, STATE, any REVIEW_HEAD and INIT memory fields. An old or quoted reply,
+user message, title, preview or generic DONE is not the current assistant receipt.
+
+Record a fresh observation with the normal task/workspace/Chat/generation/epoch/
+message/iteration/useId fields and `source: "browser"`, `sourceUrl: "<actual URL>"`,
+`result: "reply_visible"` (or the actual absent/error result), and `readAt`.
+Browser observations must omit `hostTurnId` and `hostTurnStatus`; DOM evidence
+is not host telemetry. Save the exact assistant body as UTF-8 and pass
+`confirm-reply --observed-reply-file <file>` along with the usual actual identity,
+STATE, REVIEW_HEAD and memory flags. The CLI validates the body and stores only
+its SHA-256 and observer provenance. If delivery is not yet confirmed, first use
+normal `confirm-delivery`; generated INIT still requires its exact user body
+with `--observed-message-file`. Never reconstruct or normalize that INIT body.
+MEMORY_SOURCES must be comma-separated exact tool names with no empty or duplicate
+entries; pass the same set to --memory-sources. READY omits MEMORY_REASON;
+DEGRADED includes its exact reason. Never rewrite an observed assistant body to
+make a malformed memory declaration pass validation.
+
+If `resolution=workspace_switch_required` has pending, guidance returns
+`reconcile_source_pending`, not an impossible migration instruction. Use the
+current task identity from the current checkout with `--bound-workspace` on
+`record-readback`, `confirm-delivery`, and `confirm-reply`; observed workspace
+identity remains the **source** workspace. This resolves the unique existing
+owner and does not require the old directory to exist. `host-control` can use
+the same flag to restore source observation tools. After confirmation, release
+only your own source lease with `finish --bound-workspace --use-id <own-id>`;
+then follow the existing `switch-workspace → migration BOOT → workspace_info`
+flow. The flag does not permit new business sends into the old workspace.
+
+If browser access is unavailable, record `source: "browser"`,
+`result: "observation_blocked"`, `errorCategory: "unavailable"` and the concrete
+`blockedReason`; omit `sourceUrl` when no page could actually be observed. Never
+invent a URL observation or host turn. If the exact page has no matching reply,
+record the actual result and continue observing the same pending request.
+Neither absence nor elapsed time authorizes clearing, superseding, resending,
+changing generation, or replacing the Chat. Receipt recovery is complete only
+after normal confirmation, not after opening the page.
 
 | businessGate | Required work before dependent business can continue |
 | --- | --- |
@@ -171,8 +224,9 @@ permission to resend or clear it.
 - A bound Chat stays with its task while it has a pending receipt, uncertain
   dispatch, active coordinator lease, or degraded channel. An idle, verified
   Chat can later be safely reclaimed only through the fixed-pool contract below.
-- ChatGPT Work, browser control, UIA, ChatGPT Classic, drafts, and clipboard
-  workflows are outside this Skill.
+- ChatGPT Work, UIA, ChatGPT Classic, drafts, clipboard sending and browser
+  control messages are outside this Skill. The exact-Chat read-only browser
+  observer above is the sole browser exception.
 
 ## Workspace migration BOOT handshake
 
@@ -243,8 +297,10 @@ delegation had completed. The absence of `REVIEW_HEAD` on the registered source
 receipt remains valid and does not alter this step.
 
 Binding resolution has priority over migration substate: from an old or any other
-workspace, `session get` and `session resume` must say `switch_workspace` before
-giving a migration action. Host-tool recovery also comes first: when either exact
+workspace without pending, `session get` and `session resume` say `switch_workspace`
+before giving a migration action. A unique source binding with pending first uses
+`reconcile_source_pending` and the receipt-only `--bound-workspace` path above.
+Host-tool recovery also comes first: when either exact
 Chat read or send is unavailable, `restore_host_tools_then_read_bound_chat` comes
 before source readback or target `workspace_info`; do not label that condition as
 ordinary migration preflight.
@@ -358,8 +414,9 @@ Interpret the result exactly:
   C2C local token-file paths. They never select or replace the managed Runtime
   Key.
 
-Neither diagnostic nor normal control traffic uses browser, UIA, ChatGPT
-Classic, or ChatGPT Work.
+Control traffic never uses browser, UIA, ChatGPT Classic, or ChatGPT Work.
+Read-only exact-Chat browser observation is allowed when host transcript
+recovery requests it; it never sends control traffic.
 
 ## Acquire the task Chat
 

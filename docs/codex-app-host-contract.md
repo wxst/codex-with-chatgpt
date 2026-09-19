@@ -1,6 +1,6 @@
 # Codex App host contract
 
-C2C uses only the existing ordinary Chat background tools:
+C2C uses the existing ordinary Chat background tools for its control plane:
 
 ```text
 list_threads
@@ -19,3 +19,10 @@ than creating a duplicate control message.
 C2C does not require host-side Chat creation, model mutation, browser control,
 UIA, ChatGPT Classic, ChatGPT Work, drafts, clipboard, or private HTTPS calls.
 The host verifier checks only these three direct tools.
+
+An incomplete host transcript is not proof of a missing reply. Shared guidance
+may require a supported browser to read the exact bound `chatUrl` as a second
+observer. This is read-only visible-DOM access, never browser sending or private
+HTTPS calls. Browser observations carry a validated URL and source, omit host
+turn fields, and still require normal identity/digest/reply confirmation. The
+direct-tool verifier does not certify browser availability or transcript completeness.

@@ -7,6 +7,16 @@ const hostControl = fs.readFileSync("docs/host-control.md", "utf8").replace(/\r\
 
 // These are instruction contracts, not evidence of model behavior or quota savings.
 describe("ChatGPT-first Skill instruction contract", () => {
+  it("requires exact read-only browser fallback and source receipts without a second send plane", () => {
+    for (const document of [skill, protocol, hostControl]) {
+      expect(document).toContain("read_exact_chat_in_browser");
+      expect(document).toContain("--bound-workspace");
+      expect(document).toContain("--observed-reply-file");
+    }
+    expect(skill).toContain("Browser access here is **read-only observation**");
+    expect(skill).toContain("omit `hostTurnId` and `hostTurnStatus`");
+    expect(skill).toContain("Neither absence nor elapsed time authorizes clearing");
+  });
   it("puts the reasoning workflow before transport setup", () => {
     expect(skill).toContain("reduce Codex quota consumption");
     const workflow = skill.indexOf("## Daily reasoning workflow");

@@ -225,6 +225,13 @@ readback receipts before state advances. The first 60 seconds poll every 5 secon
 An accepted send whose user turn is late stays in flight; repeated temporary
 read misses mark the channel degraded and retain the same Chat.
 
+If host readback omits a reply already visible on the web, shared guidance returns
+`read_exact_chat_in_browser`. Codex reads only the exact `chatUrl`, records browser
+provenance, and uses normal `confirm-reply --observed-reply-file` validation.
+No browser sending or private Chat API is allowed. A pending source-workspace
+receipt is reconciled with `--bound-workspace` before ordinary same-Chat migration;
+it is never discarded merely because the host transcript is incomplete.
+
 When both `CODEX_THREAD_ID` and `--task-id` are supplied, they must be identical;
 `TASK_ID_IDENTITY_MISMATCH` occurs before a ledger write when they differ. The
 Boot reply also reports `routeTaskId`, `workspaceName`, and `git.branch`

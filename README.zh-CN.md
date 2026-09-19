@@ -8,6 +8,12 @@
 加固了本机 Bridge、凭证生命周期、进程停止、依赖管理和上游同步流程。
 ChatGPT 能看到的 MCP 接口始终只读。
 
+宿主 `read_thread` 可能遗漏网页上已有的回复。出现
+`read_exact_chat_in_browser` 时，协调者自动只读核查精确 `chatUrl`，记录
+浏览器来源，并通过普通 `confirm-reply --observed-reply-file` 校验原回复。
+禁止浏览器发送和私有 Chat API。旧工作区有 pending 时先使用回执命令的
+`--bound-workspace` 对账并释放自己的租约，再正常迁移同一 Chat；不清除或重发旧请求。
+
 ## 日常使用：先交给 ChatGPT 分析
 
 pending 是协调者必须持续完成的工作，不能汇报“待回读”后转为本地分析。

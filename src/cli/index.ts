@@ -67,6 +67,7 @@ import {
   type LastEndpoint,
 } from "../config/endpoint.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
+import { validateObservedReplyText } from "../session/reply-text.js";
 import {
   assertReceiptIdentity,
   beginTaskSend,
@@ -87,6 +88,7 @@ import {
   migrateSessionLedger,
   newMessageId,
   readSessionRegistry,
+  boundReceiptWorkspaceId,
   readTaskSession,
   resolveTaskBinding,
   resumeTaskSession,
@@ -109,6 +111,12 @@ import {
 } from "../session/state.js";
 
 const program = new Command();
+
+/** Receipt-only source access; never grants sending or migration authority. */
+function receiptWorkspaceId(requested: string, taskId: string, bound?: boolean): string {
+  if (!bound) return requested;
+  return boundReceiptWorkspaceId(taskId);
+}
 
 const say = (msg: string): void => {
   process.stdout.write(msg + "\n");
@@ -1301,7 +1309,7 @@ session.command("get", { isDefault: true })
     if (opts.json) say(JSON.stringify(opts.brief ? {
       ok: result.ok, taskId: result.taskId, requestedWorkspaceId: result.requestedWorkspaceId,
       boundWorkspaceId: result.boundWorkspaceId, resolution: result.resolution,
-      conversationId: task?.conversationId ?? null, generation: task?.generation ?? null,
+      conversationId: task?.conversationId ?? null, chatUrl: task?.url ?? null, generation: task?.generation ?? null,
       pendingMessageId: task?.pendingMessageId ?? null,
       ...guidance, assignmentEpoch: result.assignmentEpoch, migration: result.migration,
       migrationLeaseActive: result.migrationLeaseActive,
@@ -1339,7 +1347,7 @@ session.command("resume")
       const m = current?.migrationHandshake;
       const payload = { ok: true, taskId: resolved.taskId, requestedWorkspaceId: workspace.id,
         boundWorkspaceId: binding.boundWorkspaceId, workspaceId: workspace.id, resolution: binding.resolution,
-        conversationId: current?.conversationId ?? null, generation: current?.generation ?? null,
+        conversationId: current?.conversationId ?? null, chatUrl: current?.url ?? null, generation: current?.generation ?? null,
         useId: binding.resolution === "exact" ? opts.useId ?? null : null, ...guidance,
         migration: m && !m.completedAt ? { fromWorkspaceId: m.fromWorkspaceId, toWorkspaceId: m.toWorkspaceId,
           assignmentEpoch: m.assignmentEpoch, bootMessageId: m.bootMessageId ?? null } : null,
@@ -1349,19 +1357,21 @@ session.command("resume")
       return;
     }
     const task = await resumeTaskSession(workspace.id, resolved.taskId, opts.useId);
-    const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, resolution: "exact", conversationId: task.conversationId, generation: task.generation, useId: task.useId, ...sessionRecoveryGuidance("exact", task, task.useId) };
+    const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, resolution: "exact", conversationId: task.conversationId, chatUrl: task.url, generation: task.generation, useId: task.useId, ...sessionRecoveryGuidance("exact", task, task.useId) };
     if (opts.json) say(JSON.stringify(opts.brief ? payload : { ...payload, task })); else check(`已续接同一 Chat；use-id：${task.useId}`);
   });
 
 session.command("finish")
   .description("Release the current continuation lease while preserving the exact Chat binding")
   .option("-w, --workspace <path>").option("--task-id <id>").requiredOption("--use-id <id>")
+  .option("--bound-workspace", "release own source lease after receipt reconciliation", false)
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; taskId?: string; useId: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; useId: string; boundWorkspace: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
-    const task = await finishTaskSession(workspace.id, resolved.taskId, opts.useId);
-    const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, conversationId: task.conversationId, activeUse: null };
+    const sourceId = receiptWorkspaceId(workspace.id, resolved.taskId, opts.boundWorkspace);
+    const task = await finishTaskSession(sourceId, resolved.taskId, opts.useId);
+    const payload = { ok: true, taskId: resolved.taskId, workspaceId: sourceId, conversationId: task.conversationId, activeUse: null };
     if (opts.json) say(JSON.stringify(payload)); else check("已释放本轮使用占用，Chat 绑定保留。");
   });
 
@@ -1618,6 +1628,7 @@ session.command("host-control")
   .option("-w, --workspace <path>").option("--task-id <id>")
   .requiredOption("--result <result>", "probe, read-ok, migration-read-ok, timeout, call-failed, or not-invoked")
   .option("--use-id <id>", "current coordinator lease")
+  .option("--bound-workspace", "restore this task's source observer before receipt reconciliation", false)
   .option("--observation-file <path>", "UTF-8 migration readback evidence JSON")
   .option("--tools <names>", "comma-separated callable host tool names; use none if both are absent")
   .option("--conversation-id <id>")
@@ -1626,17 +1637,18 @@ session.command("host-control")
   .option("--confirm-not-invoked", "attest that the send tool was never called for this reservation", false)
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; taskId?: string; result: HostControlObservation["result"]; useId?: string; observationFile?: string; tools?: string;
-    conversationId?: string; observedTaskId?: string; observedWorkspaceId?: string; messageId?: string; confirmNotInvoked: boolean; json: boolean }) => {
+    conversationId?: string; observedTaskId?: string; observedWorkspaceId?: string; messageId?: string; confirmNotInvoked: boolean; boundWorkspace: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
-    const binding = resolveTaskBinding(workspace.id, resolved.taskId);
+    const sourceId = receiptWorkspaceId(workspace.id, resolved.taskId, opts.boundWorkspace);
+    const binding = resolveTaskBinding(sourceId, resolved.taskId);
     const before = sessionRecoveryGuidance(binding.resolution, binding.task, opts.useId);
     if (binding.resolution !== "exact" || before.nextAction === "wait_for_coordinator_lease") {
       say(JSON.stringify({ ok: false, taskId: resolved.taskId, ...before }));
       return;
     }
     if (opts.result === "not-invoked" && !opts.confirmNotInvoked) throw new Error("HOST_CONTROL_NOT_INVOKED_ATTESTATION_REQUIRED");
-    const task = await recordTaskHostControl(workspace.id, resolved.taskId, {
+    const task = await recordTaskHostControl(sourceId, resolved.taskId, {
       result: opts.result, migrationObservation: opts.observationFile ? JSON.parse(fs.readFileSync(opts.observationFile, "utf8").replace(/^\uFEFF/u, "")) : undefined, tools: opts.tools === "none" ? [] : opts.tools?.split(",").map(x => x.trim()),
       conversationId: opts.conversationId, observedTaskId: opts.observedTaskId,
       observedWorkspaceId: opts.observedWorkspaceId, messageId: opts.messageId, useId: opts.useId,
@@ -1653,7 +1665,7 @@ session.command("host-control")
     const nextAction = guidance.nextAction;
     const recoveryReady = migrationRecovery?.nextAction === "migration_workspace_confirmation_required";
     const result = { ok: status === "ready" || status === "migration_boot_ready" || recoveryReady, owner: "codex_host", status,
-      workspaceId: workspace.id, task, reserved: Boolean(task.pendingMessageId),
+      workspaceId: sourceId, task, reserved: Boolean(task.pendingMessageId),
       accepted: Boolean(task.pendingMessageId && task.sendAcceptedAt),
       delivered: Boolean(task.pendingMessageId && task.lastDeliveredMessageId === task.pendingMessageId),
       replied: false, ...guidance,
@@ -1665,14 +1677,16 @@ session.command("record-readback")
   .description("Record exact pending-message visibility without confirming or resending")
   .option("-w, --workspace <path>").option("--task-id <id>")
   .requiredOption("--observation-file <path>", "UTF-8 host observation JSON")
+  .option("--bound-workspace", "record this task's source receipt without switching the binding", false)
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; taskId?: string; observationFile: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; observationFile: string; boundWorkspace: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
-    const task = await recordTaskReadback(workspace.id, resolved.taskId,
+    const sourceId = receiptWorkspaceId(workspace.id, resolved.taskId, opts.boundWorkspace);
+    const task = await recordTaskReadback(sourceId, resolved.taskId,
       readUtf8JsonInputFile(opts.observationFile, "READBACK_OBSERVATION_INVALID"));
     const guidance = sessionRecoveryGuidance("exact", task, task.readbackObservation?.useId);
-    const result = { ok: true, taskId: task.taskId, workspaceId: workspace.id, conversationId: task.conversationId,
+    const result = { ok: true, taskId: task.taskId, workspaceId: sourceId, conversationId: task.conversationId,
       generation: task.generation, pendingMessageId: task.pendingMessageId, ...guidance };
     say(opts.json ? JSON.stringify(result) : `${guidance.nextAction}: ${guidance.recoveryReason}`);
   });
@@ -1813,38 +1827,43 @@ addChannelCommandOptions(session.command("record-delivery-pending").description(
   });
 
 addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-delivery").description("Confirm an outbound message was observed in ChatGPT")))
+  .option("--bound-workspace", "confirm this task's source receipt before workspace migration", false)
   .option("--observed-message-file <path>", "exact UTF-8 body read back from the bound Chat; required for generated INIT")
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; useId?: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; observedMessageFile?: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; useId?: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; observedMessageFile?: string; boundWorkspace: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
-    const current = readTaskSession(workspace.id, resolved.taskId);
+    const sourceId = receiptWorkspaceId(workspace.id, resolved.taskId, opts.boundWorkspace);
+    const current = readTaskSession(sourceId, resolved.taskId);
     if (!current?.pendingMessageId || current.pendingIteration === undefined) throw new Error("task has no in-flight message");
     assertReceiptIdentity(
-      { messageId: current.pendingMessageId, taskId: current.taskId, workspaceId: workspace.id, iteration: current.pendingIteration },
+      { messageId: current.pendingMessageId, taskId: current.taskId, workspaceId: sourceId, iteration: current.pendingIteration },
       { messageId: opts.messageId, taskId: opts.observedTaskId, workspaceId: opts.observedWorkspaceId, iteration: parseReceiptIteration(opts.observedIteration) }
     );
     const observedDigest = opts.observedMessageFile === undefined ? undefined : digestBusinessMessage(
       new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(path.resolve(opts.observedMessageFile)))
     );
-    const task = await confirmTaskDelivery(workspace.id, resolved.taskId, opts.messageId, observedDigest, opts.useId);
-    if (opts.json) say(JSON.stringify({ ok: true, accepted: Boolean(current.sendAcceptedAt), delivered: true, replied: false, identityVerified: false, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    const task = await confirmTaskDelivery(sourceId, resolved.taskId, opts.messageId, observedDigest, opts.useId);
+    if (opts.json) say(JSON.stringify({ ok: true, accepted: Boolean(current.sendAcceptedAt), delivered: true, replied: false, identityVerified: false, workspaceId: sourceId, taskIdSource: resolved.source, task }));
     else check(`已确认送达 ${task.lastDeliveredMessageId}；正在等待回复`);
   });
 
 addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-reply").description("Confirm a matching ChatGPT reply and complete the iteration")))
+  .option("--bound-workspace", "confirm this task's source receipt before workspace migration", false)
+  .option("--observed-reply-file <path>", "exact observed assistant body; required for browser readback")
   .requiredOption("--state <state>")
   .option("--observed-review-head <sha>", "exact REVIEW_HEAD echoed by the reply")
   .option("--memory-project <id>", "MEMORY_PROJECT echoed by a generated INIT reply")
   .option("--memory-status <status>", "MEMORY_STATUS: READY or DEGRADED")
   .option("--memory-sources <csv>", "MEMORY_SOURCES from the INIT reply")
   .option("--memory-reason <reason>", "MEMORY_REASON required for DEGRADED")
-  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; useId?: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; state: string; observedReviewHead?: string; memoryProject?: string; memoryStatus?: string; memorySources?: string; memoryReason?: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; messageId: string; useId?: string; observedTaskId: string; observedWorkspaceId: string; observedIteration: string; state: string; observedReviewHead?: string; memoryProject?: string; memoryStatus?: string; memorySources?: string; memoryReason?: string; boundWorkspace: boolean; observedReplyFile?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
-    const current = readTaskSession(workspace.id, resolved.taskId);
+    const sourceId = receiptWorkspaceId(workspace.id, resolved.taskId, opts.boundWorkspace);
+    const current = readTaskSession(sourceId, resolved.taskId);
     if (!current?.pendingMessageId || current.pendingIteration === undefined) throw new Error("task has no in-flight message");
     assertReceiptIdentity(
-      { messageId: current.pendingMessageId, taskId: current.taskId, workspaceId: workspace.id, iteration: current.pendingIteration },
+      { messageId: current.pendingMessageId, taskId: current.taskId, workspaceId: sourceId, iteration: current.pendingIteration },
       { messageId: opts.messageId, taskId: opts.observedTaskId, workspaceId: opts.observedWorkspaceId, iteration: parseReceiptIteration(opts.observedIteration) }
     );
     const memoryFlagProvided = [opts.memoryProject, opts.memoryStatus, opts.memorySources, opts.memoryReason].some(value => value !== undefined);
@@ -1854,8 +1873,12 @@ addObservedIdentityOptions(addChannelCommandOptions(session.command("confirm-rep
       sources: opts.memorySources === undefined ? [] : opts.memorySources.split(",").map(value => value.trim()).filter(Boolean),
       reason: opts.memoryReason,
     };
-    const task = await confirmTaskReply(workspace.id, resolved.taskId, opts.messageId, opts.state, opts.observedReviewHead, memory, opts.useId);
-    if (opts.json) say(JSON.stringify({ ok: true, accepted: Boolean(current.sendAcceptedAt), delivered: true, replied: true, identityVerified: true, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    const replyDigest = opts.observedReplyFile === undefined ? undefined : validateObservedReplyText(
+      new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(path.resolve(opts.observedReplyFile))),
+      { taskId: resolved.taskId, workspaceId: sourceId, messageId: opts.messageId, iteration: current.pendingIteration },
+      opts.state.trim().toUpperCase(), opts.observedReviewHead, memory);
+    const task = await confirmTaskReply(sourceId, resolved.taskId, opts.messageId, opts.state, opts.observedReviewHead, memory, opts.useId, replyDigest);
+    if (opts.json) say(JSON.stringify({ ok: true, accepted: Boolean(current.sendAcceptedAt), delivered: true, replied: true, identityVerified: true, workspaceId: sourceId, taskIdSource: resolved.source, task }));
     else check(`已确认回复；任务迭代推进到 ${task.iteration}`);
   });
 

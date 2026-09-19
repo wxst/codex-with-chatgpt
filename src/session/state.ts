@@ -118,6 +118,7 @@ export interface SavedTaskSession {
   pendingMessageDigest?: string;
   pendingMemoryProject?: string;
   lastReviewHead?: string;
+  lastReplyEvidence?: { sha256: string; source: "host" | "browser"; sourceUrl?: string; readAt: string; messageId: string; generation: number };
   /** The direct host accepted the outbound request, but ChatGPT has not yet exposed its user turn. */
   sendAcceptedAt?: string;
   /** The first readback check that found the accepted message still absent. */
@@ -154,6 +155,10 @@ export interface SavedTaskSession {
 
 /** Exact host observations, not permission to send or a business success receipt. */
 export interface ReadbackObservation {
+  /** Legacy observations without a source came from the host tool. */
+  source?: "host" | "browser";
+  /** Actual visible browser location, never a private Chat API URL. */
+  sourceUrl?: string;
   taskId: string;
   workspaceId: string;
   conversationId: string;
@@ -179,7 +184,7 @@ export interface SessionRecoveryGuidance {
   waitingMs: number | null;
   nextReadInMs: number | null;
   diagnosticRequired: boolean;
-  coordinatorAction: "follow_next_action" | "read_now" | "wait_then_read" | "diagnose_readback" | "restore_observation" | "confirm_receipt";
+  coordinatorAction: "follow_next_action" | "read_now" | "wait_then_read" | "diagnose_readback" | "restore_observation" | "confirm_receipt" | "read_exact_chat_in_browser";
   businessGate: "connection_required" | "await_boot" | "await_plan" | "await_review" | "await_reply" | "assess_reply";
   readbackDueAt: string | null;
   observationAgeMs: number | null;
@@ -195,6 +200,12 @@ export function sessionRecoveryGuidance(
     readbackDueAt: null, observationAgeMs: null };
   const action = (nextAction: string, recoveryReason: string | null = null): SessionRecoveryGuidance =>
     ({ ...base, nextAction, recoveryReason });
+  if (resolution === "workspace_switch_required" && task?.pendingMessageId) {
+    const source = sessionRecoveryGuidance("exact", task, useId, nowMs);
+    if (source.nextAction === "wait_for_coordinator_lease" || source.nextAction === "restore_host_tools_then_read_bound_chat") return source;
+    return { ...source, nextAction: "reconcile_source_pending",
+      recoveryReason: `reconcile the exact source Chat before migration; use record-readback/confirm-delivery/confirm-reply --bound-workspace from the current workspace; ${source.recoveryReason}` };
+  }
   if (resolution !== "exact") return action(resolution === "workspace_switch_required" ? "switch_workspace" :
     resolution === "ambiguous" ? "stop_manual_resolution" : "claim_pool_chat");
   if (!task) return action("stop_manual_resolution", "exact binding is missing");
@@ -220,13 +231,16 @@ export function sessionRecoveryGuidance(
     const confirmVisible = fresh && (delivered ? o?.result === "reply_visible" :
       o?.result === "request_visible" || o?.result === "reply_visible");
     const blocked = fresh && o?.result === "observation_blocked";
+    const browserReadRequired = fresh && !confirmVisible && o?.source !== "browser" &&
+      (blocked || (o?.chatStatus !== "active" && (o?.chatStatus === "idle" || ["completed", "failed", "interrupted"].includes(o?.hostTurnStatus ?? ""))));
     const diagnosticRequired = !confirmVisible && (blocked || waitingMs === null || waitingMs >= 900_000);
     return {
       nextAction: migrationBoot ? "migration_boot_readback_required" : delivered ? "reply_readback_required" : "delivery_readback_required",
-      recoveryReason: blocked ? `observation blocked: ${o!.blockedReason}; preserve pending and restore observation, never resend` : delivered ? "request delivered; read the matching reply, including late or paginated results; never resend" :
+      recoveryReason: browserReadRequired ? "host readback can omit a completed reply; inspect the exact bound Chat in a supported browser, record source=browser and its URL, then confirm actual matching receipts; never resend" :
+        blocked ? `observation blocked: ${o!.blockedReason}; preserve pending and restore observation, never resend` : delivered ? "request delivered; read the matching reply, including late or paginated results; never resend" :
         "reserved request requires exact delivery readback; an empty read never authorizes resend",
       waitingMs, nextReadInMs: cadence, diagnosticRequired,
-      coordinatorAction: confirmVisible ? "confirm_receipt" : blocked ? "restore_observation" :
+      coordinatorAction: confirmVisible ? "confirm_receipt" : browserReadRequired ? "read_exact_chat_in_browser" : blocked ? "restore_observation" :
         diagnosticRequired ? "diagnose_readback" : fresh ? "wait_then_read" : "read_now",
       businessGate: task.verificationState === "pending" ? "await_boot" : task.pendingMessageKind === "init" || task.pendingMessageKind === "analysis" ?
         "await_plan" : task.pendingMessageKind === "executed" ? "await_review" : "await_reply",
@@ -753,7 +767,7 @@ export function validateInitMessageInput(input: unknown): InitMessageInput {
 
 function renderInitMessage(workspaceId: string, taskId: string, messageId: string, iteration: number, input: InitMessageInput, reviewHead?: string): string {
   const review = reviewHead ? `\nREVIEW_HEAD: ${reviewHead}` : "";
-  const message = `[C2C]\nSTATE: INIT\nTASK_ID: ${taskId}\nWORKSPACE_ID: ${workspaceId}\nITERATION: ${iteration}\nMESSAGE_ID: ${messageId}\n\nGOAL: ${input.goal}\nCONSTRAINTS: ${input.constraints}\nSUCCESS_CRITERIA: ${input.successCriteria}\nREPOSITORY: ${input.repository.provider} ${input.repository.name} ${input.repository.branch}\nLOCAL_STATE: ${input.localState}\nMEMORY_PROJECT: ${input.memoryProject}${review}\nMEM: First call memory_start_task(task=GOAL+CONSTRAINTS+SUCCESS_CRITERIA, project=MEMORY_PROJECT, detail=standard, intent=start, mode=hybrid, includeProjectContext=true). Then memory_search for needed history/docs; for Gitea read-only codewiki_*/gitea_*. No memory_write_summary, Gitea, or other writes. C2C local source wins.\n\nREPLY: Echo 4 IDs; STATE: PLAN; MEMORY_PROJECT; MEMORY_STATUS READY|DEGRADED; MEMORY_SOURCES; MEMORY_REASON if DEGRADED; SOURCE_EVIDENCE, ACTIONS, TESTS, SUCCESS_CRITERIA.`;
+  const message = `[C2C]\nSTATE: INIT\nTASK_ID: ${taskId}\nWORKSPACE_ID: ${workspaceId}\nITERATION: ${iteration}\nMESSAGE_ID: ${messageId}\n\nGOAL: ${input.goal}\nCONSTRAINTS: ${input.constraints}\nSUCCESS_CRITERIA: ${input.successCriteria}\nREPOSITORY: ${input.repository.provider} ${input.repository.name} ${input.repository.branch}\nLOCAL_STATE: ${input.localState}\nMEMORY_PROJECT: ${input.memoryProject}${review}\nMEM: First call memory_start_task(task=GOAL+CONSTRAINTS+SUCCESS_CRITERIA, project=MEMORY_PROJECT, detail=standard, intent=start, mode=hybrid, includeProjectContext=true). Then memory_search for needed history/docs; for Gitea read-only codewiki_*/gitea_*. No memory_write_summary, Gitea, or other writes. C2C local source wins.\n\nREPLY: Echo 4 IDs; STATE: PLAN; MEMORY_PROJECT; MEMORY_STATUS READY|DEGRADED; MEMORY_SOURCES (CSV names); MEMORY_REASON if DEGRADED; SOURCE_EVIDENCE, ACTIONS, TESTS, SUCCESS_CRITERIA.`;
   if (Buffer.byteLength(message, "utf8") > 1024) throw new Error("C2C_INIT_MESSAGE_TOO_LARGE");
   return message;
 }
@@ -960,6 +974,14 @@ function normalizeRegistry(registry: SessionRegistry): SessionRegistry {
       throw new Error("READBACK_CLOCK_INVALID");
     }
     if (task.readbackObservation !== undefined) validateReadbackObservation(task.readbackObservation);
+    const proof = task.lastReplyEvidence;
+    if (proof !== undefined && (!proof || typeof proof !== "object" ||
+      typeof proof.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(proof.sha256) ||
+      !["host", "browser"].includes(proof.source) || !isValidReclaimTimestamp(proof.readAt) ||
+      !MESSAGE_ID_PATTERN.test(proof.messageId) || !Number.isSafeInteger(proof.generation) ||
+      proof.generation < 1 || proof.generation > task.generation ||
+      (proof.source === "browser" ? typeof proof.sourceUrl !== "string" || !exactBrowserChatUrl(proof.sourceUrl) ||
+        normalizeChatUrl(proof.sourceUrl) !== normalizeChatUrl(task.url) : proof.sourceUrl !== undefined))) throw new Error("REPLY_EVIDENCE_INVALID");
   }
   return {
     ...registry,
@@ -1760,6 +1782,15 @@ export function readTaskSession(workspaceId: string, taskId: string): SavedTaskS
   return readSessionRegistry(workspaceId).registry.tasks.find((task) => task.taskId === id) ?? null;
 }
 
+/** Resolve only this task's unique live owner for source receipt reconciliation. */
+export function boundReceiptWorkspaceId(taskIdInput: string): string {
+  const taskId = validateTaskId(taskIdInput);
+  const matches = readSessionLedger().registries.flatMap(r => r.tasks
+    .filter(t => t.taskId === taskId && t.bindingState === "bound").map(() => r.workspaceId));
+  if (matches.length !== 1) throw new Error("RECEIPT_BINDING_AMBIGUOUS: exact unique task binding required");
+  return matches[0];
+}
+
 /** Read-only resolver for continuation. It never lets historical ownership act as current ownership. */
 export function resolveTaskBinding(workspaceIdInput: string, taskIdInput: string): TaskBindingResult {
   const requestedWorkspaceId = validateWorkspaceId(workspaceIdInput);
@@ -2473,10 +2504,18 @@ export async function recordTaskDeliveryPending(
   });
 }
 
+function exactBrowserChatUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password && !url.port &&
+      !url.search && !url.hash && normalizeChatUrl(value) !== null;
+  } catch { return false; }
+}
+
 function validateReadbackObservation(value: unknown): ReadbackObservation {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("READBACK_OBSERVATION_INVALID");
   const o = value as ReadbackObservation;
-  const keys = ["taskId", "workspaceId", "conversationId", "generation", "assignmentEpoch", "messageId", "iteration", "readAt", "result", "paginationComplete", "hostTurnId", "hostTurnStatus", "chatStatus", "errorCategory", "useId", "blockedReason"];
+  const keys = ["source", "sourceUrl", "taskId", "workspaceId", "conversationId", "generation", "assignmentEpoch", "messageId", "iteration", "readAt", "result", "paginationComplete", "hostTurnId", "hostTurnStatus", "chatStatus", "errorCategory", "useId", "blockedReason"];
   if (Object.keys(o).some(key => !keys.includes(key)) ||
     ![o.taskId, o.workspaceId, o.conversationId, o.messageId].every(s => typeof s === "string" && s.length > 0 && s.length <= 128) ||
     !Number.isSafeInteger(o.generation) || o.generation < 1 || !Number.isSafeInteger(o.assignmentEpoch) || o.assignmentEpoch < 0 ||
@@ -2490,8 +2529,17 @@ function validateReadbackObservation(value: unknown): ReadbackObservation {
     (o.hostTurnStatus !== undefined && !["inProgress", "completed", "failed", "interrupted"].includes(o.hostTurnStatus)) ||
     (o.chatStatus !== undefined && !["active", "idle"].includes(o.chatStatus)) ||
     (o.errorCategory !== undefined && !["timeout", "unavailable", "missing", "other"].includes(o.errorCategory)) ||
-    (o.useId !== undefined && (typeof o.useId !== "string" || !USE_ID_PATTERN.test(o.useId)))) {
+    (o.useId !== undefined && (typeof o.useId !== "string" || !USE_ID_PATTERN.test(o.useId))) ||
+    (o.source !== undefined && o.source !== "host" && o.source !== "browser") ||
+    (o.source !== "browser" && o.sourceUrl !== undefined)) {
     throw new Error("READBACK_OBSERVATION_INVALID");
+  }
+  if (o.source === "browser") {
+    if (o.hostTurnId !== undefined || o.hostTurnStatus !== undefined) throw new Error("READBACK_BROWSER_HOST_FIELDS_FORBIDDEN");
+    if (!(o.result === "observation_blocked" && o.sourceUrl === undefined) &&
+      (typeof o.sourceUrl !== "string" || o.sourceUrl.length > 512 || !exactBrowserChatUrl(o.sourceUrl))) {
+      throw new Error("READBACK_BROWSER_URL_INVALID: read the exact bound Chat URL");
+    }
   }
   return o;
 }
@@ -2513,9 +2561,12 @@ export async function recordTaskReadback(workspaceId: string, taskId: string, va
       throw new Error("READBACK_CANDIDATE_CHANGED: reread the current binding and pending message");
     }
     assertTaskUse(task, o.useId);
+    if (o.source === "browser" && o.sourceUrl !== undefined && normalizeChatUrl(o.sourceUrl) !== normalizeChatUrl(task.url)) {
+      throw new Error("READBACK_BROWSER_URL_MISMATCH: read the exact bound Chat including its project");
+    }
     if (task.readbackObservation && Date.parse(task.readbackObservation.readAt) > readAt) throw new Error("READBACK_OBSERVATION_STALE");
     // Visibility hints never confirm delivery/reply or overwrite registered receipts.
-    return { ...task, readbackObservation: { ...o },
+    return { ...task, readbackObservation: { ...o, source: o.source ?? "host" },
       channelState: task.lastDeliveredMessageId === task.pendingMessageId ? "awaiting_reply" : "sending",
       savedAt: new Date(now).toISOString() };
   });
@@ -2559,7 +2610,8 @@ export async function confirmTaskReply(
   state: string,
   observedReviewHead?: string,
   observedMemory?: MemoryReplyObservation,
-  useId?: string
+  useId?: string,
+  observedReplyDigest?: string,
 ): Promise<SavedTaskSession> {
   const id = validateMessageId(messageId);
   const normalizedState = state.trim().toUpperCase();
@@ -2570,6 +2622,14 @@ export async function confirmTaskReply(
     assertTaskUse(task, useId);
     if (task.channelState !== "awaiting_reply" || task.pendingMessageId !== id || task.pendingIteration === undefined) {
       throw new Error("reply receipt does not match the delivered in-flight message");
+    }
+    const read = task.readbackObservation;
+    if (read?.source === "browser" && observedReplyDigest === undefined) throw new Error("OBSERVED_REPLY_FILE_REQUIRED");
+    if (observedReplyDigest !== undefined && (!/^[0-9a-f]{64}$/u.test(observedReplyDigest) ||
+      !read || read.result !== "reply_visible" || read.messageId !== id || read.generation !== task.generation ||
+      read.iteration !== task.pendingIteration || read.useId !== task.activeUse?.useId ||
+      Date.parse(read.readAt) > Date.now() || Date.now() - Date.parse(read.readAt) > 60_000)) {
+      throw new Error("OBSERVED_REPLY_READBACK_REQUIRED: record a fresh exact reply observation first");
     }
     // Older clients could reserve BOOT with REVIEW_HEAD. BOOT replies intentionally
     // prove workspace identity and do not echo a review commit, so reconcile that
@@ -2591,6 +2651,8 @@ export async function confirmTaskReply(
       channelState: "ready",
       iteration: task.pendingIteration,
       lastState: normalizedState,
+      lastReplyEvidence: observedReplyDigest ? { sha256: observedReplyDigest, source: read!.source ?? "host",
+        sourceUrl: read!.sourceUrl, readAt: read!.readAt, messageId: id, generation: task.generation } : undefined,
       bootReplyGeneration: task.verificationState === "pending" && normalizedState === "DONE" ? task.generation : task.bootReplyGeneration,
       lastReviewHead: legacyMalformedBootstrap ? task.lastReviewHead : task.pendingReviewHead,
       pendingMessageId: undefined,

@@ -65,8 +65,35 @@ send_message_to_thread`.
 
 Data plane: the C2C Router MCP endpoint. It has eight read-only tools.
 
-Browser automation, UIA, ChatGPT Classic, ChatGPT Work, drafts, and clipboard
-flows are not protocol surfaces.
+Browser sending, UIA, ChatGPT Classic, ChatGPT Work, drafts, and clipboard
+flows are not control surfaces. Supported browser tools may read the exact bound
+Chat as an alternate observer when the host transcript omits a visible reply.
+
+### Alternate observer and source-workspace receipts
+
+A fresh host observation with a missing phase receipt and idle/terminal state
+produces `coordinatorAction=read_exact_chat_in_browser` (active generation still
+waits). Open the `chatUrl` from get/resume and verify its final URL and visible
+assistant body. Record `source=browser`, `sourceUrl` and the actual read time;
+omit host turn fields. The normalized URL must match the binding including its
+project. Credentials, ports, query strings, non-HTTPS and other Chats are rejected.
+Legacy observations default to `source=host`. Browser unavailable may be recorded
+as observation_blocked without a fabricated URL. Missing results retain pending.
+
+Visibility remains a hint. Normal `confirm-delivery` enforces the INIT digest;
+normal `confirm-reply --observed-reply-file <UTF-8 body>` validates the four IDs,
+STATE, review HEAD and memory fields against the observed assistant body. Only a
+fresh matching observation can supply its provenance. The ledger stores the
+SHA-256 and source, not the response body. No resend, cancellation or supersession
+is introduced. Network inspectors and private Chat APIs are outside this path.
+
+When a unique task is bound elsewhere with pending, get/resume/host-control return
+`reconcile_source_pending` before migration. The receipt commands and record-readback
+accept `--bound-workspace` from the current checkout; all observed identities remain
+the source identities, and all lease/message/generation checks still apply.
+Host-control can restore source observation with the same flag; finish can release
+the caller's own source lease only after pending is resolved. Sending has no such
+override. Once reconciled, use the existing same-Chat workspace migration handshake.
 
 ## Global Router
 
@@ -330,7 +357,9 @@ or increment generation. A source receipt without `REVIEW_HEAD` is valid when th
 registered receipt omitted it; plain HEAD is never substituted.
 
 Workspace binding resolution wins over migration substate. A command run from the
-old or another workspace returns `switch_workspace` before any migration action.
+old or another workspace returns `switch_workspace` before any migration action
+when no pending exists. A unique source binding with pending first returns
+`reconcile_source_pending`; it must complete normal receipts before switching.
 Likewise, `tools_missing` returns `restore_host_tools_then_read_bound_chat`; the
 coordinator restores the exact read/send tools before attempting source readback or
 target `workspace_info`.

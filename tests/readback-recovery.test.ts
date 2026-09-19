@@ -113,7 +113,8 @@ it("fences leases, future/expired and reordered reads, but accepts repeated obse
   await expect(recordTaskReadback(workspace, taskId, { ...o, readAt: new Date(Date.parse(o.readAt) - 1).toISOString() })).rejects.toThrow("STALE");
   expect(disk()).toBe(after);
   expect(sessionRecoveryGuidance("exact", current()).nextAction).toBe("wait_for_coordinator_lease");
-  expect(sessionRecoveryGuidance("workspace_switch_required", current()).nextAction).toBe("switch_workspace");
+  expect(sessionRecoveryGuidance("workspace_switch_required", current()).nextAction).toBe("wait_for_coordinator_lease");
+  expect(sessionRecoveryGuidance("workspace_switch_required", current(), leased.useId).nextAction).toBe("reconcile_source_pending");
   expect(sessionRecoveryGuidance("exact", current(), leased.useId).nextAction).toBe("delivery_readback_required");
 });
 
@@ -232,12 +233,12 @@ it("makes diagnostics and concrete observation blockers resumable without turnin
   const now = Date.now();
   expect(sessionRecoveryGuidance("exact", current(), undefined, now + 900_001)).toMatchObject({ coordinatorAction: "diagnose_readback", diagnosticRequired: true });
   await recordTaskReadback(workspace, taskId, observation({ result: "observation_blocked", errorCategory: "unavailable", blockedReason: "Host read tool unavailable after health check; exact result cannot be retrieved" }));
-  expect(sessionRecoveryGuidance("exact", current())).toMatchObject({ coordinatorAction: "restore_observation", businessGate: "await_boot", nextAction: "reply_readback_required" });
+  expect(sessionRecoveryGuidance("exact", current())).toMatchObject({ coordinatorAction: "read_exact_chat_in_browser", businessGate: "await_boot", nextAction: "reply_readback_required" });
   expect(current().pendingMessageId).toBe(messageId);
   // Returning to a task never leaves it parked forever on an old blocker.
   expect(sessionRecoveryGuidance("exact", current(), undefined, Date.now() + 60_001).coordinatorAction).toBe("read_now");
   await recordTaskReadback(workspace, taskId, observation({ result: "request_visible", chatStatus: "idle", hostTurnStatus: "completed" }));
-  expect(sessionRecoveryGuidance("exact", current()).coordinatorAction).toBe("wait_then_read");
+  expect(sessionRecoveryGuidance("exact", current()).coordinatorAction).toBe("read_exact_chat_in_browser");
   await recordTaskReadback(workspace, taskId, observation({ result: "reply_visible" }));
   expect(sessionRecoveryGuidance("exact", current()).coordinatorAction).toBe("confirm_receipt");
   await confirmTaskReply(workspace, taskId, messageId, "DONE");
