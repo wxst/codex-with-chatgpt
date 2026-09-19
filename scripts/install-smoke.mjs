@@ -75,8 +75,11 @@ try {
   assert.match(sessionHelp, /confirm-send-accepted/u, "session help did not expose host acceptance tracking");
   assert.match(sessionHelp, /record-delivery-pending/u, "session help did not expose late-delivery tracking");
   assert.match(sessionHelp, /migrate/u, "session help did not expose assignment-ledger migration");
+  assert.match(sessionHelp, /prepare-boot/u, "session help did not expose recoverable BOOT preparation");
   assert.match(sessionHelp, /prepare-init/u, "session help did not expose generated mem INIT preparation");
 
+  const bootHelp = runCli(["session", "prepare-boot", "--help"], env);
+  assert.match(bootHelp, /--expected-generation <n>/u, "prepare-boot did not fence the binding generation");
   const initHelp = runCli(["session", "prepare-init", "--help"], env);
   assert.match(initHelp, /--input-file <path>/u, "prepare-init did not require a UTF-8 input file");
   const deliveryHelp = runCli(["session", "confirm-delivery", "--help"], env);

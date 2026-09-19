@@ -95,6 +95,37 @@ it("generates the fixed mem INIT, protects its exact readback, and unlocks EXECU
   await expect(beginTaskSend(workspace, taskId, newMessageId(), 2, { messageKind: "executed" })).resolves.toMatchObject({ pendingMessageKind: "executed" });
 });
 
+it("turns a matching INIT reply that omits REVIEW_HEAD into a fenced clarification instead of a permanent pending receipt", async () => {
+  const head = "a".repeat(40);
+  const prepared = await prepareTaskInit(workspace, taskId, input, { reviewHead: head });
+  expect(prepared.message).toContain("echo REVIEW_HEAD");
+  await confirmTaskDelivery(workspace, taskId, prepared.messageId, prepared.messageDigest);
+
+  const receipt = await confirmTaskReply(workspace, taskId, prepared.messageId, "PLAN", undefined, {
+    project: input.memoryProject,
+    status: "degraded",
+    sources: ["memory_start_task", "memory_search", "workspace_info", "read_file"],
+    reason: "acceptance connector was unavailable",
+  });
+  expect(receipt.reviewHeadClarification).toMatchObject({ generation: 1, expectedReviewHead: head, sourceMessageId: prepared.messageId });
+  expect(sessionRecoveryGuidance("exact", receipt).nextAction).toBe("probe_then_read_bound_chat");
+  await recordTaskHostControl(workspace, taskId, { result: "probe", tools: ["read_thread", "send_message_to_thread"] });
+  const refreshed = await recordTaskHostControl(workspace, taskId, {
+    result: "read-ok", conversationId: chat, observedTaskId: taskId, observedWorkspaceId: workspace,
+  });
+  expect(sessionRecoveryGuidance("exact", refreshed).nextAction).toBe("review_head_clarification_required");
+  await expect(beginTaskSend(workspace, taskId, newMessageId(), 2, { messageKind: "executed" })).rejects.toThrow("REVIEW_HEAD_CLARIFICATION_REQUIRED");
+  await expect(beginTaskSend(workspace, taskId, newMessageId(), 2, { messageKind: "analysis" })).rejects.toThrow("REVIEW_HEAD_CLARIFICATION_REQUIRED");
+
+  const clarificationId = newMessageId();
+  await beginTaskSend(workspace, taskId, clarificationId, 2, { messageKind: "analysis", reviewHead: head });
+  await confirmTaskDelivery(workspace, taskId, clarificationId);
+  const clarified = await confirmTaskReply(workspace, taskId, clarificationId, "PLAN", head);
+  expect(clarified.reviewHeadClarification).toBeUndefined();
+  expect(clarified.lastReviewHead).toBe(head);
+  await expect(beginTaskSend(workspace, taskId, newMessageId(), 3, { messageKind: "executed" })).resolves.toMatchObject({ pendingMessageKind: "executed" });
+});
+
 it("permits explained DEGRADED memory while still fencing a changed generation", async () => {
   const prepared = await prepareTaskInit(workspace, taskId, input);
   await confirmTaskDelivery(workspace, taskId, prepared.messageId, prepared.messageDigest);

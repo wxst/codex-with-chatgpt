@@ -119,7 +119,7 @@ it("fences leases, future/expired and reordered reads, but accepts repeated obse
 });
 
 it("runs observation files and recovery through real CLI with legacy degraded receipts and malformed UTF-8", async () => {
-  expect(cli("begin-send", "--message-id", messageId, "--iteration", "0", "--bootstrap").status).toBe(0);
+  await beginTaskSend(workspace, taskId, messageId, 0, { bootstrap: true });
   const receipt = ["--message-id", messageId, "--observed-task-id", taskId, "--observed-workspace-id", workspace, "--observed-iteration", "0"];
   expect(cli("confirm-delivery", ...receipt).status).toBe(0);
   // A persisted old client could degrade the already-delivered message.
@@ -154,7 +154,7 @@ it("continues the same CLI lease through delivery, interruption and reply, fenci
   const beforeResume = disk();
   expect(run("resume", "--use-id", lease).useId).toBe(lease);
   expect(disk()).toBe(beforeResume);
-  run("begin-send", "--message-id", messageId, "--iteration", "0", "--bootstrap", "--use-id", lease);
+  await beginTaskSend(workspace, taskId, messageId, 0, { bootstrap: true, useId: lease });
   const identity = ["--message-id", messageId, "--observed-task-id", taskId, "--observed-workspace-id", workspace, "--observed-iteration", "0"];
   for (const args of [
     ["confirm-send-accepted", "--message-id", messageId],
@@ -179,7 +179,7 @@ it("continues the same CLI lease through delivery, interruption and reply, fenci
     expect(run(surface, "--use-id", lease)).toMatchObject({ nextAction: "reply_readback_required", coordinatorAction: "confirm_receipt" });
   }
   expect(cli("finish", "--use-id", lease).status).not.toBe(0);
-  expect(cli("begin-send", "--message-id", newMessageId(), "--iteration", "0", "--bootstrap", "--use-id", lease).status).not.toBe(0);
+  await expect(beginTaskSend(workspace, taskId, newMessageId(), 0, { bootstrap: true, useId: lease })).rejects.toThrow();
   run("confirm-reply", ...identity, "--state", "DONE", "--use-id", lease);
   for (const surface of ["get", "resume"]) {
     expect(run(surface, "--use-id", lease)).toMatchObject({ nextAction: "workspace_confirmation_required", businessGate: "await_boot" });

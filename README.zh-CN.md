@@ -46,6 +46,11 @@ workspace 迁移后，必须重新 INIT 才能发送 EXECUTED。
 回执，报告分析卸载受阻，不默认把全部思考转回 Codex；已明确且独立授权的工作
 可以继续。BOOT 回执或关键词测试均不能证明实际分析分工，也不能证明节省了多少额度。
 
+带 `REVIEW_HEAD` 的 INIT 或 ANALYSIS 回复若四项回执身份匹配但漏回 HEAD，先确认其实际
+传输回执，再遵循 `review_head_clarification_required`：刷新预检、发送带同一 HEAD 的
+ANALYSIS 补充请求。不得填造 HEAD、重发 INIT 或发送 EXECUTED；只有补充回复精确回显后
+才能继续。
+
 ## 本轮安装试用范围
 
 当前版本用于以下环境的首次受控安装试用：
@@ -190,12 +195,14 @@ Skill 每次领取前都通过 Codex App 后台的 `list_threads` 和 `read_thre
 claim`。领取按 FIFO 并在全局锁中完成；库存与任务归属写入同一个原子账本；标题猜测、最近会话和跨任务复用均不参与。
 库存为空会返回 `POOL_EXHAUSTED`，任务正文不会发送。
 
-领取结果包含一次性的任务路由 token。Boot Prompt 以 `C2C_ROUTE_TOKEN` 携带它；8 个
-MCP 工具调用都要附加 `route_token`。Router 只会将该 token 解析到它绑定的工作区。
-日常控制消息只用 `list_threads`、`send_message_to_thread` 和 `read_thread`，必须先
-回读送达和回复，才推进状态。发送工具返回仅表示宿主已接受；前 60 秒每 5 秒读取一次，未读到原消息时，
-任务会保持 `sending` 并继续读取，重复读取缺失只会标记 `degraded`。活跃等待最多 5 分钟；超时后
-下一次任务先读取同一条在途消息。
+领取和工作区迁移只建立绑定。完成宿主预检后，必须运行
+`session prepare-boot --expected-generation <n> --json`，它创建或恢复唯一可续接的
+BOOT 事务。普通 JSON 不含 token，只返回身份、消息元数据、摘要、下一步和私有正文文件路径。
+完整 BOOT 正文中的 `C2C_ROUTE_TOKEN` 只存在该私有文件内；协调者只能在内存中读取并发送到
+精确绑定 Chat。Windows 文件只允许当前用户和 SYSTEM，Unix 使用 `0700`/`0600`。重复调用保留
+同一正文、capability、message ID 和 iteration；已 pending 或发送结果不明时必须读回，不能重发。
+8 个 MCP 工具调用仍需附加 `route_token`，Router 只会将它解析到绑定工作区。日常控制消息只用
+`list_threads`、`send_message_to_thread` 和 `read_thread`，必须先回读送达和回复，才推进状态。
 
 同时给出 `CODEX_THREAD_ID` 和 `--task-id` 时，两者必须完全一致；值不同时会先返回
 `TASK_ID_IDENTITY_MISMATCH`，账本保持原样。Boot 回复还要带上 `workspace_info` 实际返回的

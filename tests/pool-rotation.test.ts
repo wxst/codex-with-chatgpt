@@ -208,7 +208,7 @@ it("CLI exposes read-only candidates and performs rotation from an observation f
   fs.writeFileSync(file, JSON.stringify(notLoadedObservationsFor()));
   const claimed = cli(...args, "--reclaim-observations-file", file);
   expect(claimed.status, claimed.stderr).toBe(0);
-  expect(JSON.parse(claimed.stdout)).toMatchObject({ task: { taskId: "cli-owner", conversationId: "rotation-chat" }, nextAction: "send_boot_prompt" });
+  expect(JSON.parse(claimed.stdout)).toMatchObject({ task: { taskId: "cli-owner", conversationId: "rotation-chat" }, nextAction: "probe_then_read_bound_chat" });
   expect(readTaskSession(workspaceId, "old-owner")).toBeNull();
 });
 
@@ -306,7 +306,7 @@ it("accepts CLI failed-binding recovery from two UTF-8 evidence files", async ()
   const result = cli("claim", "-w", workspace, "--task-id", "requester", "--reclaim-observations-file", candidateFile,
     "--recover-bound-file", recoveryFile, "--json");
   expect(result.status, result.stderr).toBe(0);
-  expect(JSON.parse(result.stdout)).toMatchObject({ task: { generation: 2, conversationId: "rotation-chat" }, nextAction: "send_boot_prompt" });
+  expect(JSON.parse(result.stdout)).toMatchObject({ task: { generation: 2, conversationId: "rotation-chat" }, nextAction: "probe_then_read_bound_chat" });
 });
 
 it("rotates the oldest safe Chat in ten existing entries, skips busy owners, and carries its own lease", async () => {

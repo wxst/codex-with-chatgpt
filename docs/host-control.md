@@ -11,7 +11,7 @@ not proof of model-visible tools or ChatGPT delivery.
 | --- | --- | --- |
 | read and/or send not exposed | tools_missing | Restore host capabilities, preserve binding |
 | both exposed | readback_required | Read exact saved Chat and verify identity |
-| exact readback after probe | ready | Resume receipt checks, or reserve if no pending message |
+| exact readback after probe | ready | Resume receipt checks, or use `prepare-boot` if BOOT is required |
 | host invocation timeout | call_timeout | Keep uncertain send; read before any retry |
 | other temporary call failure | call_failed | Same conservative recovery |
 | proven send never invoked | not_invoked | Release matching unaccepted reservation only |
@@ -110,6 +110,23 @@ BOOT identity automatically reconciles the reply and discards the erroneous head
 after which actual `workspace_info` is still required. Do not resend it or ask
 the user to authorize C2C-internal recovery.
 
+For a generated review-bearing INIT or ANALYSIS, a matching assistant receipt that
+omits `REVIEW_HEAD` is a transport fact, not a completed review. Confirm the actual
+body, preserve it, and follow `review_head_clarification_required`: repeat current
+preflight and send one fresh exact-head ANALYSIS clarification. Never fill the
+missing value from the request, resend INIT, or mark EXECUTED before the matching
+clarification receipt is observed.
+
+New BOOTs use only `session prepare-boot --expected-generation <n>`. Its normal
+JSON is token-free and names a private material file; the coordinator reads that
+file only in memory for the exact Chat send. `pool claim` and `switch-workspace`
+do not output a route token. A repeated preparation returns the same material and
+message identity. If its send outcome is unknown, it returns a readback action,
+not resend permission. A proven `not-invoked` result plus fresh preflight can
+re-reserve the same BOOT; accepted, delivered, awaiting-reply and uncertain sends
+must remain on their original readback path. Confirmation removes private material
+without changing the completed binding if cleanup needs a retry.
+
 The coordinator automatically checks every LRU candidate before reporting pool
 exhaustion; it never asks the user for additional standby Chats. A prior owner's
 binding alone is not a busy condition. ChatGPT sends/readbacks use the exact
@@ -138,8 +155,8 @@ runtime to be available, running, healthy, ready, non-stale and free of errors.
 
 An old-workspace receipt is valid historical evidence, not proof of the new
 workspace. Use `migration-read-ok --observation-file` after tool probe and exact
-Chat read. `migration_boot_ready` is limited to new BOOT, is consumed by reservation,
-and requires current expected generation. Finish normal delivery/reply readback
+Chat read. `migration_boot_ready` is limited to new BOOT, is consumed by
+`prepare-boot`, and requires current expected generation. Finish normal delivery/reply readback
 and actual workspace_info confirmation before business messages. Never report an
 expected new workspace ID as observed in an old message. Preserve unresolved
 sends; migration does not waive receipt or lease protection.

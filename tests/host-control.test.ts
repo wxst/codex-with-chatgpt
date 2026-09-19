@@ -135,8 +135,8 @@ it("CLI refuses missing preflight and reports actual unaccepted failures", async
   const workspaceId = JSON.parse(get.stdout).workspaceId;
   await importStandbyConversation({ conversationId: "cli-chat", projectId: "g-p-host", markerText: "C2C_STANDBY_READY", markerMessageId: "cli-marker", markerRole: "user" });
   await claimStandbyConversation({ workspaceId, taskId: "cli-task", connectorName: "C2C", workspaceName: "repo", branch: "main" });
-  const id = newMessageId();
-  const blocked = cli("begin-send", "--task-id", "cli-task", "--message-id", id, "--iteration", "0", "--bootstrap");
+  let id = newMessageId();
+  const blocked = cli("prepare-boot", "--task-id", "cli-task", "--expected-generation", "1");
   expect(blocked.status).not.toBe(0);
   expect(blocked.stdout + blocked.stderr).toContain("HOST_CONTROL_PREFLIGHT_REQUIRED");
   const missingRouteTask = cli("confirm-workspace", "--task-id", "cli-task",
@@ -147,8 +147,9 @@ it("CLI refuses missing preflight and reports actual unaccepted failures", async
   expect(JSON.parse(missing.stdout)).toMatchObject({ status: "tools_missing", accepted: false, reserved: false });
   await recordTaskHostControl(workspaceId, "cli-task", { result: "probe", tools });
   await recordTaskHostControl(workspaceId, "cli-task", { result: "read-ok", conversationId: "cli-chat", observedTaskId: "cli-task", observedWorkspaceId: workspaceId });
-  const started = cli("begin-send", "--task-id", "cli-task", "--message-id", id, "--iteration", "0", "--bootstrap", "--json");
+  const started = cli("prepare-boot", "--task-id", "cli-task", "--expected-generation", "1", "--json");
   expect(started.status).toBe(0);
+  id = JSON.parse(started.stdout).messageId;
   const resumedPending = cli("resume", "--task-id", "cli-task", "--brief", "--json");
   expect(JSON.parse(resumedPending.stdout)).toMatchObject({ ok: true, useId: null, nextAction: "delivery_readback_required" });
   const failed = cli("fail-delivery", "--task-id", "cli-task", "--message-id", id, "--kind", "host_rejected", "--reason", "explicit rejection", "--json");
@@ -157,7 +158,7 @@ it("CLI refuses missing preflight and reports actual unaccepted failures", async
   await recordTaskHostControl(workspaceId, "cli-task", { result: "probe", tools });
   await recordTaskHostControl(workspaceId, "cli-task", { result: "read-ok", conversationId: "cli-chat", observedTaskId: "cli-task", observedWorkspaceId: workspaceId });
   for (const value of ["1junk", "1.9", "-1"]) {
-    expect(cli("begin-send", "--task-id", "cli-task", "--message-id", newMessageId(), "--iteration", value, "--bootstrap").status).not.toBe(0);
+    expect(cli("prepare-boot", "--task-id", "cli-task", "--expected-generation", value).status).not.toBe(0);
   }
   const uncertainId = newMessageId();
   await beginTaskSend(workspaceId, "cli-task", uncertainId, 0, { bootstrap: true });

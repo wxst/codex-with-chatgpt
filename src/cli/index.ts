@@ -8,10 +8,10 @@ import { startWorkspaceRouter } from "../router/server.js";
 import { resolveWorkspaceRuntimeContext, runtimeContextSummary, type WorkspaceRuntimeContext } from "../router/diagnostics.js";
 import {
   createWorkspaceRouter,
-  issueRouteCapability,
   readWorkspaceRouter,
   RouterDiagnosticError,
 } from "../router/state.js";
+import { cleanupCompletedTaskBoot, prepareTaskBoot } from "../session/boot.js";
 import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
@@ -80,7 +80,6 @@ import {
   migrationRecoveryGuidance,
   sessionRecoveryGuidance,
   recordTaskReadback,
-  attachTaskRouteCapability,
   claimStandbyConversation,
   failTaskDelivery,
   importStandbyConversation,
@@ -1340,15 +1339,26 @@ session.command("resume")
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const binding = resolveTaskBinding(workspace.id, resolved.taskId);
-    const current = opts.useId !== undefined && binding.resolution === "exact"
+    let currentUseId = opts.useId;
+    let current = opts.useId !== undefined && binding.resolution === "exact"
       ? await resumeTaskSession(workspace.id, resolved.taskId, opts.useId) : binding.task;
-    const guidance = sessionRecoveryGuidance(binding.resolution, current, opts.useId);
+    let guidance = sessionRecoveryGuidance(binding.resolution, current, opts.useId);
+    // BOOT preparation is a mutating, lease-fenced recovery action.  A task
+    // that is otherwise idle must be able to obtain its own lease here rather
+    // than forcing callers to bypass `resume` or invent a use-id.
+    if (opts.useId === undefined && binding.resolution === "exact" && current &&
+      (guidance.nextAction === "prepare_boot_required" || guidance.nextAction === "resume_boot_preparation")) {
+      const resumed = await resumeTaskSession(workspace.id, resolved.taskId);
+      current = resumed;
+      currentUseId = resumed.useId;
+      guidance = sessionRecoveryGuidance("exact", current, currentUseId);
+    }
     if (guidance.nextAction !== "resume_bound_chat") {
       const m = current?.migrationHandshake;
       const payload = { ok: true, taskId: resolved.taskId, requestedWorkspaceId: workspace.id,
         boundWorkspaceId: binding.boundWorkspaceId, workspaceId: workspace.id, resolution: binding.resolution,
         conversationId: current?.conversationId ?? null, chatUrl: current?.url ?? null, generation: current?.generation ?? null,
-        useId: binding.resolution === "exact" ? opts.useId ?? null : null, ...guidance,
+        useId: binding.resolution === "exact" ? current?.activeUse?.useId ?? currentUseId ?? null : null, ...guidance,
         migration: m && !m.completedAt ? { fromWorkspaceId: m.fromWorkspaceId, toWorkspaceId: m.toWorkspaceId,
           assignmentEpoch: m.assignmentEpoch, bootMessageId: m.bootMessageId ?? null } : null,
         migrationLeaseActive: Boolean(current?.activeUse),
@@ -1392,10 +1402,10 @@ session.command("switch-workspace")
     await ensureWorkspaceRouter(root);
     const task = await switchTaskWorkspace({ taskId: resolved.taskId, fromWorkspaceId: opts.fromWorkspaceId, toWorkspaceId: workspace.id,
       expectedGeneration: Number(opts.expectedGeneration), connectorName: binding.task.connectorName, workspaceName: workspace.name, branch: gitInfo(workspace.root).branch });
-    const route = await issueRouteCapability({ workspaceId: workspace.id, taskId: resolved.taskId, conversationId: task.conversationId });
-    const attached = await attachTaskRouteCapability(workspace.id, resolved.taskId, route.id);
-    const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, boundWorkspaceId: workspace.id, conversationId: attached.conversationId, generation: attached.generation, routeToken: route.token, nextAction: "send_boot_prompt" };
-    if (opts.json) say(JSON.stringify(payload)); else check("已切换同一 Chat 到当前工作区；请发送新的 BOOT Prompt。");
+    const payload = { ok: true, taskId: resolved.taskId, workspaceId: workspace.id, boundWorkspaceId: workspace.id,
+      conversationId: task.conversationId, generation: task.generation, assignmentEpoch: task.migrationHandshake?.assignmentEpoch ?? null,
+      nextAction: "migration_preflight_required" };
+    if (opts.json) say(JSON.stringify(payload)); else check("已切换同一 Chat 到当前工作区；先完成迁移预检，再使用 session prepare-boot。");
   });
 
 session.command("migrate")
@@ -1528,29 +1538,7 @@ pool.command("claim")
       reclaimObservations: observations,
       recoveryObservation,
     });
-    let routeToken: string | null = null;
-    let task = claimed.task;
-    const activeRoute = task.routeCapabilityId
-      ? readWorkspaceRouter()?.capabilities.find((candidate) =>
-        candidate.id === task.routeCapabilityId &&
-        candidate.workspaceId === workspace.id &&
-        candidate.taskId === resolved.taskId &&
-        candidate.conversationId === task.conversationId &&
-        !candidate.revokedAt && Date.parse(candidate.expiresAt) > Date.now()
-      )
-      : undefined;
-    // A pending Boot Prompt needs a fresh raw token that the coordinator can
-    // place in that exact Chat. Reissuing it updates the task owner id, so an
-    // interrupted earlier preparation never causes a second pool claim.
-    if (!task.pendingMessageId && (!activeRoute || task.verificationState !== "ready")) {
-      const route = await issueRouteCapability({
-        workspaceId: workspace.id,
-        taskId: resolved.taskId,
-        conversationId: task.conversationId,
-      });
-      task = await attachTaskRouteCapability(workspace.id, resolved.taskId, route.id);
-      routeToken = route.token;
-    }
+    const task = claimed.task;
     const payload = {
       ok: true,
       workspaceId: workspace.id,
@@ -1559,11 +1547,10 @@ pool.command("claim")
       reused: claimed.reused,
       task,
       entry: claimed.entry,
-      routeToken,
-      nextAction: task.verificationState === "ready" ? "send_task_message" : "send_boot_prompt",
+      nextAction: task.verificationState === "ready" ? "send_task_message" : "probe_then_read_bound_chat",
     };
     if (opts.json) say(JSON.stringify(payload));
-    else check(claimed.reused ? "已复用本任务的备用 Chat" : "已领取备用 Chat；发送 Boot Prompt 后核对 workspace_info");
+    else check(claimed.reused ? "已复用本任务的备用 Chat" : "已领取备用 Chat；先完成宿主预检，再使用 session prepare-boot。");
   });
 
 pool.command("quarantine")
@@ -1605,7 +1592,15 @@ session.command("confirm-workspace")
         branch: opts.observedBranch ?? null,
       }, opts.useId,
     );
-    if (opts.json) say(JSON.stringify({ ok: true, workspaceId: workspace.id, taskIdSource: resolved.source, task }));
+    let bootMaterialCleanupPending = false;
+    try {
+      await cleanupCompletedTaskBoot(workspace.id, resolved.taskId);
+    } catch {
+      // Confirmation is already durable. Leave metadata intact so prepare-boot
+      // can retry cleanup without inventing a new token or message.
+      bootMaterialCleanupPending = true;
+    }
+    if (opts.json) say(JSON.stringify({ ok: true, workspaceId: workspace.id, taskIdSource: resolved.source, task, bootMaterialCleanupPending }));
     else check("工作区及路由任务身份已核对；会话进入 ready");
   });
 
@@ -1742,6 +1737,50 @@ function parseReceiptIteration(value: string): number {
   return Number(value);
 }
 
+session.command("prepare-boot")
+  .description("Prepare one recoverable private BOOT body and reserve its exact delivery identity")
+  .option("-w, --workspace <path>").option("--task-id <id>")
+  .requiredOption("--expected-generation <n>", "current bound generation")
+  .option("--use-id <id>", "current coordinator lease")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; taskId?: string; expectedGeneration: string; useId?: string; json: boolean }) => {
+    const root = resolveWorkspace(opts.workspace);
+    const workspace = new Workspace(root);
+    const resolved = resolvedSessionTaskId(opts.taskId);
+    await ensureWorkspaceRouter(root);
+    const prepared = await prepareTaskBoot({
+      workspaceId: workspace.id,
+      taskId: resolved.taskId,
+      expectedGeneration: parseReceiptIteration(opts.expectedGeneration),
+      useId: opts.useId,
+    });
+    // The route token and BOOT body live only in messageFile. This payload is
+    // intentionally safe for ordinary command logs and machine consumers.
+    const payload = {
+      ok: true,
+      prepared: true,
+      taskId: prepared.taskId,
+      taskIdSource: resolved.source,
+      workspaceId: prepared.workspaceId,
+      conversationId: prepared.conversationId,
+      generation: prepared.generation,
+      assignmentEpoch: prepared.assignmentEpoch,
+      preparationId: prepared.preparationId,
+      messageId: prepared.messageId,
+      iteration: prepared.iteration,
+      messageFile: prepared.messageFile,
+      bodySha256: prepared.bodySha256,
+      sendAllowed: prepared.sendAllowed,
+      nextAction: prepared.nextAction,
+    };
+    if (opts.json) say(JSON.stringify(payload));
+    else check(prepared.sendAllowed
+      ? `已准备 BOOT ${prepared.messageId}；仅从私有文件读取原文并发送到精确绑定 Chat。`
+      : prepared.nextAction === "boot_already_completed"
+        ? "BOOT 已完成；已清理或保留可重试的私有材料审计。"
+        : `BOOT ${prepared.messageId} 已有未决发送；先读回同一 Chat，绝不重发。`);
+  });
+
 session.command("prepare-init")
   .description("Render and atomically reserve the required mem-initialized business INIT")
   .option("-w, --workspace <path>").option("--task-id <id>")
@@ -1782,15 +1821,18 @@ addChannelCommandOptions(session.command("begin-send").description("Atomically r
   .option("--review-head <sha>", "bind this review to an exact full Git HEAD")
   .option("--expected-generation <n>", "fence this send to the resumed binding generation")
   .action(async (opts: { workspace?: string; taskId?: string; messageId: string; iteration: string; probe: boolean; bootstrap: boolean; kind?: string; reviewHead?: string; expectedGeneration?: string; useId?: string; json: boolean }) => {
+    if (opts.bootstrap) {
+      throw new Error("BOOT_PREPARE_REQUIRED: use session prepare-boot; begin-send cannot reserve a new BOOT");
+    }
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const current = readTaskSession(workspace.id, resolved.taskId);
-    if ((current?.hostControl?.status !== "ready" && !(opts.bootstrap && current?.hostControl?.status === "migration_boot_ready")) ||
+    if (current?.hostControl?.status !== "ready" ||
       !Number.isFinite(Date.parse(current.hostControl.checkedAt)) ||
       Date.now() - Date.parse(current.hostControl.checkedAt) > 60_000 || Date.parse(current.hostControl.checkedAt) > Date.now()) {
       throw new Error("HOST_CONTROL_PREFLIGHT_REQUIRED: record current callable tools and exact bound Chat readback before begin-send");
     }
-    if (opts.bootstrap || opts.probe) {
+    if (opts.probe) {
       if (opts.kind !== undefined) throw new Error("BUSINESS_MESSAGE_KIND_FORBIDDEN: BOOT and recovery probes have no business kind");
     } else if (opts.kind !== "executed" && opts.kind !== "analysis") {
       throw new Error("BUSINESS_MESSAGE_KIND_REQUIRED: use session prepare-init for INIT or --kind analysis|executed after it is confirmed");

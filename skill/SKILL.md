@@ -268,24 +268,32 @@ to supply another Chat or edit the ledger.
 ```text
 node "__C2C_CHECKOUT__/bin/c2c.js" session host-control -w <workspace> --result probe --tools read_thread,send_message_to_thread --json
 node "__C2C_CHECKOUT__/bin/c2c.js" session host-control -w <workspace> --result migration-read-ok --observation-file <evidence.json> --json
-node "__C2C_CHECKOUT__/bin/c2c.js" session begin-send -w <workspace> --bootstrap --expected-generation <current-generation> --message-id <new-message-id> --iteration <next-iteration> --json
+node "__C2C_CHECKOUT__/bin/c2c.js" session prepare-boot -w <workspace> --expected-generation <current-generation> --json
 ```
 
 Numbers above illustrate the schema, not expected values. Read actual values;
-include `--use-id` on begin-send when holding a lease. `migration_boot_ready`
-authorizes BOOT only and is consumed when the request is reserved. Send the normal
-BOOT using the current binding's route token; read back the same Chat and confirm
-delivery and the identity-matching reply, then `confirm-workspace` using the actual
-workspace_info fields. Only then start business INIT. The old receipt cannot
-satisfy the new BOOT confirmation. After acceptance or timeout, read the existing
-pending request directly and use its normal receipt commands; do not resend or
-clear an uncertain send. If an older client incorrectly reserved this BOOT with
+include `--use-id` on `prepare-boot` when holding a lease. `migration_boot_ready`
+authorizes only a private BOOT preparation. `prepare-boot` creates or resumes the
+same capability, body, message ID and iteration and returns a private `messageFile`,
+never a route token or BOOT body. Read that file only into the exact
+`send_message_to_thread` call; do not print, log, copy, or handwrite its contents.
+Before sending, require `sendAllowed: true`. A later invocation that finds the same
+reservation returns `reconcile_boot_receipt`, not resend permission. Send once,
+then read back the same Chat and confirm delivery and the identity-matching reply,
+then `confirm-workspace` using actual workspace_info fields. Only then start
+business INIT. The old receipt cannot satisfy the new BOOT confirmation. After
+acceptance or timeout, read the existing pending request directly and use its
+normal receipt commands; do not resend or clear an uncertain send. If an older
+client incorrectly reserved this BOOT with
 `REVIEW_HEAD`, do not ask for authorization or send another BOOT: after exact
 delivery and reply identity match, `confirm-reply` automatically discards that
 BOOT-only head when the reply omits it. A different non-empty head remains an
 identity mismatch, and `confirm-workspace` still requires the actual MCP identity.
-A proven not-invoked or terminal rejected send requires fresh
-probe and migration evidence before retry.
+A proven not-invoked send requires fresh probe and migration evidence before
+re-preparing the **same** BOOT; an accepted, delivered, reply-waiting or terminal
+uncertain send can never use this path. If preparation was interrupted before a
+send, rerun `prepare-boot`; it resumes the persisted transaction. After workspace
+confirmation it clears private material while retaining a token-free audit record.
 
 `session get` and `session resume` report
 `migration_workspace_confirmation_required` when the destination BOOT is already
@@ -732,7 +740,9 @@ If tools disappear after reservation and the send tool was **never called**,
 release only that reservation with `host-control --result not-invoked
 --message-id <reserved-id> --confirm-not-invoked` and the same workspace/task
 options. Never use this for a timeout or uncertain invocation. No accepted,
-delivered, iteration advance, or reply is recorded. Recovery uses a new id.
+delivered, iteration advance, or reply is recorded. For a CLI-prepared BOOT,
+fresh preflight then restores the same private preparation and message ID; other
+terminal recovery uses the normal next permitted message identity.
 
 For review requests pass `begin-send --review-head <full SHA>`, include
 `REVIEW_HEAD: <full SHA>` in the user turn and require the reply to echo it.
@@ -742,45 +752,57 @@ receipt identity fields match the current request. An older HEAD's DONE is
 historical evidence only. Automated fixtures and a real host read/send/readback
 review must be reported separately.
 
+If a generated review-bearing INIT or ANALYSIS reply has the exact four receipt
+fields and required mem fields but omits `REVIEW_HEAD`, confirm the actual receipt
+without inventing a head. Guidance then returns
+`review_head_clarification_required`: preserve that receipt, refresh host
+preflight, and send a new `STATE: ANALYSIS` with the same exact
+`--review-head`. Do not rewrite the observed reply, resend INIT, or send
+EXECUTED. Only the matching exact-head ANALYSIS reply clears this fence.
+
 ## Boot Prompt and Router capability
 
-For a newly claimed Chat, generate a receipt id and reserve the outbound Boot
-Prompt:
+For every first binding, fixed-pool rotation, workspace migration, or interrupted
+BOOT recovery, complete host preflight and use the single BOOT preparation entrypoint:
 
 ```text
-node "__C2C_CHECKOUT__/bin/c2c.js" session new-message-id --json
-node "__C2C_CHECKOUT__/bin/c2c.js" session begin-send \
-  -w <workspace> --task-id <task-id> --message-id <message-id> \
-  --iteration 0 --bootstrap --json
+node "__C2C_CHECKOUT__/bin/c2c.js" session prepare-boot \
+  -w <workspace> --task-id <task-id> --expected-generation <generation> \
+  --use-id <own-lease> --json
 ```
 
-Send this compact message with `send_message_to_thread` to the exact claimed
-conversation id:
+The JSON returns non-sensitive task identity, generation, assignmentEpoch,
+message ID, iteration, body digest, `sendAllowed`, next action, and a private
+`messageFile`. It never returns `C2C_ROUTE_TOKEN`, the BOOT body, or a route
+token in a normal error. The material file is outside the checkout. On Windows
+it permits only the current user and SYSTEM; on Unix the directory is `0700` and
+the file is `0600`. If that permission cannot be applied, preparation fails; do
+not fall back to a public temporary file.
 
-```text
-[C2C]
-STATE: BOOT
-TASK_ID: <task-id>
-WORKSPACE_ID: <workspace-id>
-ITERATION: 0
-MESSAGE_ID: <message-id>
-C2C_ROUTE_TOKEN: <route-token>
-CONNECTOR: <connector-name>
+When `sendAllowed: true`, read the body from `messageFile` only in memory and pass
+it unchanged to `send_message_to_thread` for the returned exact conversation ID.
+Do not handwrite BOOT, extract its token into a shell command, add `REVIEW_HEAD`,
+or use `begin-send --bootstrap`. Check the command's `ok`, message ID, iteration,
+generation and exact bound conversation before the one send.
 
-Use only the C2C MCP connector. Every MCP call must include
-route_token: <route-token>. `CONNECTOR` names the selected connection; it is
-not a field returned by workspace_info. First call workspace_info. Echo all
-four receipt identity fields, then separately echo the returned `workspaceId`, `routeTaskId`,
-`workspaceName`, and `git.branch` before replying STATE: DONE. Do not copy an
-expected value from this prompt or the ledger as an observed result. A reply
-missing any of those observed workspace fields does not promote the task to
-`ready`.
-```
+`CONNECTOR` remains a local display or selection label only. It is not a field returned by workspace_info,
+so it must never be added to the generated BOOT,
+treated as an MCP identity field, or used to confirm a workspace.
 
-The Router resolves the capability to exactly one fresh workspace instance.
-Every one of the eight C2C read-only tools requires `route_token`; a missing,
-wrong, revoked, or cross-task token returns `ROUTE_ACCESS_DENIED`. The token
-never grants write, shell, Git mutation, or access to another workspace.
+Repeated `prepare-boot` calls recover the same transaction, capability, body,
+message ID and iteration. If a reservation already exists, its body is recoverable
+but `sendAllowed: false`: first read the same Chat and follow normal delivery or
+reply confirmation. Only a proven `host-control --result not-invoked
+--confirm-not-invoked` result, followed by fresh required preflight, permits
+re-reserving that same unsent BOOT. Accepted, delivered, waiting, or uncertain
+sends never get a new token, new message, or replacement Chat. After a matching
+BOOT reply and actual `confirm-workspace`, private material is deleted; a cleanup
+failure remains a retryable, token-free audit record.
+
+The Router resolves the attached capability to exactly one current workspace.
+Every one of the eight C2C read-only tools requires its `route_token`; a missing,
+wrong, revoked, or cross-task token returns `ROUTE_ACCESS_DENIED`. The token never
+grants write, shell, Git mutation, or access to another workspace.
 
 Before calling `send_message_to_thread`, verify the reservation command exited
 successfully and returned ok=true with the exact message ID and iteration.
@@ -900,12 +922,14 @@ Every control message includes `TASK_ID`, `WORKSPACE_ID`, `ITERATION`, and a
 fresh `MESSAGE_ID`. Complete host preflight above, send to the exact bound Chat,
 record host acceptance, poll `read_thread`, and then confirm delivery and reply.
 `session prepare-init` creates the INIT id, iteration, body, digest, and atomic
-reservation together. `session new-message-id` is for BOOT, recovery probes, and
-EXECUTED only; never write a handmade `c2c_msg_*` value.
+reservation together. `session prepare-boot` owns all BOOT identities and private
+route material. `session new-message-id` is only for recovery probes and EXECUTED;
+never write a handmade `c2c_msg_*` value.
 
 `REVIEW_HEAD` belongs only to review-bearing INIT or EXECUTED messages. Never put
-it on BOOT or pass `--review-head` with `begin-send --bootstrap`; the CLI rejects
-that combination. A BOOT proves routing and workspace identity, not a code review.
+it on BOOT. `session prepare-boot` has no review-head input, and legacy malformed
+BOOT receipts are reconciled only through their existing exact readback. A BOOT
+proves routing and workspace identity, not a code review.
 
 A send-tool result means only accepted. It is delivered only after the original
 user turn is read back. It is complete only after an identity-matching reply is
@@ -1031,7 +1055,8 @@ implemented or exposed by this repository's Router.
 1. C2C MCP remains eight read-only tools. Never add write, shell, package,
    Git-mutation, delete, or secret-reading tools.
 2. Never paste repository files, diffs, long logs, credentials, cookies,
-   Tunnel tokens, or route tokens outside the exact Boot Prompt.
+   Tunnel tokens, or route tokens outside the CLI-generated private BOOT body
+   sent to its exact bound Chat.
 3. Only one in-flight request exists per task Chat. Parallel subagents do not
    write to it. ChatGPT reviews only after their results are merged into a
    stable workspace checkpoint.

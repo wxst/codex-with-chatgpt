@@ -26,6 +26,10 @@
 - INIT 的精确 Chat 读回必须以 `--observed-message-file` 校验摘要；回复必须记录 `MEMORY_PROJECT`、`MEMORY_STATUS`、`MEMORY_SOURCES`，`DEGRADED` 还须记录具体 `MEMORY_REASON`。`READY` 仅表示实际初始化成功；`DEGRADED` 保留原因并继续使用 C2C 本地证据。
 - 只有当前 generation 已记录 `READY` 或 `DEGRADED` INIT 时才可发送 `begin-send --kind executed`。generation、Chat 或 workspace 改变会清除该记录，必须重新初始化。
 - C2C 自身的回执对账、错误 BOOT 修复、迁移握手、租约释放、终态绑定退役及固定池安全轮换属于已授权的内部恢复；主协调者自动完成，不再向用户索取单独授权。该约定不扩大到发布、部署、重启、凭据或其他任务的 pending/租约。
+- 新 BOOT（首次分配、池内轮换、workspace 迁移和恢复）只能用 `session prepare-boot --expected-generation <n> [--use-id] --json`。`pool claim` 与 `switch-workspace` 只变更绑定，不能签发或输出 token；`begin-send --bootstrap` 不能绕过此入口。
+- `prepare-boot` 的普通输出只含身份、代次、摘要、消息 ID 和私有 `messageFile` 路径。完整 BOOT 正文和 route token 仅存在该进程外私有材料文件：Windows 只允许当前用户和 SYSTEM，Unix 目录 `0700`、文件 `0600`。协调者只在内存中读取原文并发给精确绑定 Chat，不在日志、JSON、观察文件或错误中复制 token。
+- 重复 `prepare-boot` 必须恢复同一 preparation、正文、capability、message ID 和 iteration。首次调用已预留后若输出丢失，先同 Chat 对账；只有 `host-control --result not-invoked --confirm-not-invoked` 证明发送工具从未调用，且重新完成所需预检后，才可用同一正文重新预留。已接受、送达、等待回复或已完成的 BOOT 绝不换 token、重发或换 Chat。
+- `prepare_boot_required` 与 `resume_boot_preparation` 是自动恢复动作。迁移 BOOT 确认并执行 `confirm-workspace` 后自动清理私有正文；清理失败保留脱敏 preparation 记录以便重试，不能倒退 ready 或重新签发。
 - 未完成迁移的目标 BOOT 已送达且得到匹配 `DONE`、无 pending 时，`session get`/`resume` 必须返回 `migration_workspace_confirmation_required`；主协调者立即读取目标 C2C `workspace_info` 并执行 `confirm-workspace`。不得重新核对源 INIT、重发 BOOT、换 Chat 或把本地/Gitea 工作描述成已经完成 ChatGPT 委派。源回执缺少 `REVIEW_HEAD` 时保持省略，不能用普通 HEAD 填充。
 - 工作区解析优先于迁移子状态：在旧或其他 workspace 调用且无 pending 时，`session get`/`resume` 返回 `switch_workspace`；有 pending 则先对唯一源绑定执行 `reconcile_source_pending`。其他协调者租约和 `restore_host_tools_then_read_bound_chat` 仍优先，不得把工具缺失误报为迁移 preflight。宿主返回内容不完整时使用下述只读浏览器观察，不放宽发送权限。
 
@@ -40,6 +44,7 @@
 - businessGate 区分 BOOT、INIT/ANALYSIS、EXECUTED 和历史消息等待。ready 或 PLAN 回显不等于业务验收；依赖该回复的分析、修改或发布不能越过等待。只读的本地/记忆/Gitea 分析也不是自动豁免，Superpowers 等通用流程必须保留读回责任。
 - 完整用户方案允许的独立、确定性工作可交错执行，但不能拖延到期读回。真实宿主健康/分页诊断无法提供结果时，记录 observation_blocked、errorCategory=unavailable 和脱敏 blockedReason，报告可恢复的观察阻塞；不得凭 idle、completed 或等待时长判失败。续接后重新观察同一请求。
 - 所有回执变更命令均传自己的 --use-id（无租约时省略）；弱 PLAN 先确认回执，再用 --kind analysis / STATE: ANALYSIS 请求补充，不能伪造 EXECUTED 或重新发送旧消息。
+- 带 `REVIEW_HEAD` 的 INIT 或 ANALYSIS 若四项身份、状态和 mem 字段都匹配但漏回 HEAD，先用实际正文完成该条传输回执；CLI 必须返回 `review_head_clarification_required`。保留原回执，完成新鲜预检后发送带同一 HEAD 的 `STATE: ANALYSIS` 补充请求。不得填造 HEAD、重发 INIT 或发送 EXECUTED；只有匹配的补充回执才能解除门禁。
 - 首次 BOOT DONE 后仍须按 workspace_confirmation_required 完成实际 workspace_info 与 confirm-workspace（携带自身租约）；旧代 DONE 不代表当前 BOOT。迁移继续使用独立迁移动作，不重发 BOOT。
 
 - get、resume、host-control 使用统一恢复决策：工作区、其他协调者租约及工具可用性优先，随后对账 pending，再完成迁移或续接。

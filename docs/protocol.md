@@ -118,10 +118,12 @@ A route capability binds:
 workspaceId + taskId + conversationId → SHA-256(route_token)
 ```
 
-The raw `route_token` appears only in the one task Chat Boot Prompt. It is not
-saved in the session registry, Router state, logs, or task outputs. All eight
-MCP tool schemas require `route_token`. An invalid, revoked, expired, or
-cross-task token returns `ROUTE_ACCESS_DENIED` before workspace access.
+The raw `route_token` appears only in the CLI-generated private BOOT material
+that is sent once to its exact task Chat. It is not saved in the session registry,
+Router state, normal CLI JSON, logs, or task outputs. The private file is outside
+the checkout and restricted to current-user plus SYSTEM on Windows or `0700`/`0600`
+on Unix. All eight MCP tool schemas require `route_token`. An invalid, revoked,
+expired, or cross-task token returns `ROUTE_ACCESS_DENIED` before workspace access.
 
 ## Standby Chat pool
 
@@ -211,10 +213,21 @@ Task identity comes from `CODEX_THREAD_ID` when the host provides it. An
 explicit `--task-id` may repeat that value for automation, while a different
 value stops before any registry or pool write with `TASK_ID_IDENTITY_MISMATCH`.
 
-The new Chat's Boot Prompt additionally contains `C2C_ROUTE_TOKEN` and tells
-ChatGPT to call `workspace_info` first with `route_token`. The task becomes
-`ready` only after delivery and reply readback plus matching workspace id,
-routed task id, name, branch, and all four receipt identity fields.
+The coordinator never handwrites a new BOOT. After normal or migration preflight,
+it runs `session prepare-boot --expected-generation <n> [--use-id] --json`.
+That staged transaction persists a token-free preparation record, writes the full
+BOOT body to a private material file, registers an initially inert Router
+capability, attaches it to the current unique binding, and reserves exactly one
+message. Its normal JSON includes only identity, generation, assignmentEpoch,
+message ID, iteration, digest, next action and the material-file path; it never
+includes the body or `route_token`.
+
+Only when `sendAllowed: true` may the coordinator read that private file in memory
+and pass its unchanged body to `send_message_to_thread` for the exact bound Chat.
+The generated Boot Prompt contains `C2C_ROUTE_TOKEN` and tells ChatGPT to call
+`workspace_info` first with `route_token`. The task becomes `ready` only after
+delivery and reply readback plus matching workspace id, routed task id, name,
+branch, and all four receipt identity fields.
 
 The Boot reply must echo `routeTaskId`, `workspaceName`, and `git.branch` as
 returned by `workspace_info`, alongside `TASK_ID`, `WORKSPACE_ID`, `ITERATION`,
@@ -227,6 +240,15 @@ acceptance, then polls `read_thread` on the exact conversation. It confirms
 delivery after the matching user message appears, and confirms reply only after
 the matching ChatGPT reply appears. `wait_threads` is not used for ordinary
 ChatGPT conversations.
+
+Repeated `prepare-boot` calls return the same private preparation/body/message
+instead of issuing another capability. A prepared reservation whose send outcome
+is unknown has `sendAllowed: false`; read the exact existing Chat before any other
+action. Only a `not-invoked` attestation for a send tool that was never called,
+followed by fresh required preflight, permits re-reserving that same BOOT. Accepted,
+delivered, reply-waiting and uncertain sends never receive another token, message,
+or Chat. Confirmation deletes the private body and retains a token-free audit
+record; cleanup failure is retryable and does not revert ready.
 
 Delivery and reply use independent clocks. The first 60 seconds poll every 5
 seconds, then every 15 seconds until five minutes, then every 30 seconds. Five
@@ -296,10 +318,20 @@ Use executed only to report actual execution. Business exemptions do not abandon
 already-sent messages or authorize dependent work before the needed reply.
 MEMORY_STATUS READY alone does not prove tools ran; acceptance needs tool evidence.
 
+If a review-bearing generated INIT or ANALYSIS has matching receipt and required
+memory fields but its observed assistant body omits `REVIEW_HEAD`, confirm that
+actual transport receipt without inventing a value. The binding records
+`review_head_clarification_required`; its original head is not promoted as observed
+review evidence. After fresh preflight, send a new exact-head `STATE: ANALYSIS`
+clarification. Do not rewrite the body, resend INIT, or reserve EXECUTED until a
+matching clarification reply echoes the expected head.
 
-BOOT must not carry `REVIEW_HEAD`. New `begin-send --bootstrap --review-head`
-reservations fail with `BOOT_REVIEW_HEAD_FORBIDDEN`. For legacy ledgers that
-already contain that malformed combination, an exact delivered BOOT reply with
+
+BOOT must not carry `REVIEW_HEAD`. `prepare-boot` has no review-head option and
+the legacy `begin-send --bootstrap` CLI path fails with `BOOT_PREPARE_REQUIRED`;
+attempting to reserve a BOOT with a review head fails with
+`BOOT_REVIEW_HEAD_FORBIDDEN`.
+For legacy ledgers that already contain a malformed BOOT combination, an exact delivered BOOT reply with
 matching task/workspace/iteration/message identity may be confirmed without the
 head. The pending head is discarded and does not become `lastReviewHead`; normal
 review messages still require the exact head, and a non-matching non-empty BOOT
@@ -338,15 +370,17 @@ including source receipt identity, destination, generations and assignmentEpoch.
 The receipt retains its original workspace. `host-control --result
 migration-read-ok --observation-file <UTF8 JSON>` validates a fresh idle exact Chat
 read against that lineage and current owner. Its `migration_boot_ready` status
-permits only BOOT with expected generation, once per reservation. The exact new
-BOOT reply and actual workspace_info confirmation complete the handshake. It
+permits only `prepare-boot` with the expected generation. The staged preparation
+can resume after interrupted material, capability, attachment, or output work;
+it cannot authorize a hand-built BOOT or a second send. The exact new BOOT reply
+and actual workspace_info confirmation complete the handshake. It
 cannot authorize INIT or make the historical DONE a destination BOOT receipt.
 
 Legacy migrations are recovered only from unique workspace_switch history and
 matching current receipt; no Chat replacement or generation increment occurs.
 Ambiguous or incomplete lineage fails closed. Pending sends and leases retain
 normal protection; terminal rejection or proven non-invocation requires fresh
-preflight before retry. See the source Skill for the complete JSON and commands.
+preflight before a same-preparation retry. See the source Skill for the complete JSON and commands.
 
 When `session get` or `session resume` returns
 `migration_workspace_confirmation_required`, the destination BOOT has an exact

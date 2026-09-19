@@ -44,13 +44,17 @@ it("reproduces the CLI identity deadlock and completes the migration BOOT throug
   expect(JSON.parse(authorized.stdout).status).toBe("migration_boot_ready");
   const id = newMessageId();
   expect(cli("begin-send", "--message-id", id, "--iteration", "21", "--expected-generation", "2").status).not.toBe(0);
-  const boot = cli("begin-send", "--message-id", id, "--iteration", "21", "--expected-generation", "2", "--bootstrap");
+  const boot = cli("prepare-boot", "--expected-generation", "2");
   expect(boot.status, boot.stderr).toBe(0);
+  const prepared = JSON.parse(boot.stdout);
+  expect(prepared).toMatchObject({ sendAllowed: true, nextAction: "send_prepared_boot", generation: 2 });
+  expect(prepared).not.toHaveProperty("routeToken");
+  const bootId = prepared.messageId;
   // Simulate a reservation written by the legacy client that allowed REVIEW_HEAD on BOOT.
   const ledger = JSON.parse(fs.readFileSync(sessionLedgerFile(), "utf8"));
   ledger.registries.find((r: any) => r.workspaceId === target).tasks[0].pendingReviewHead = "a".repeat(40);
   fs.writeFileSync(sessionLedgerFile(), JSON.stringify(ledger));
-  const receipt = ["--message-id", id, "--observed-task-id", taskId, "--observed-workspace-id", target, "--observed-iteration", "21"];
+  const receipt = ["--message-id", bootId, "--observed-task-id", taskId, "--observed-workspace-id", target, "--observed-iteration", "21"];
   expect(cli("confirm-delivery", ...receipt).status).toBe(0);
   expect(cli("confirm-reply", ...receipt, "--observed-workspace-id", "wrong", "--state", "DONE").status).not.toBe(0);
   expect(cli("confirm-reply", ...receipt, "--observed-review-head", "b".repeat(40), "--state", "DONE").status).not.toBe(0);

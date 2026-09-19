@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
+import { bootMaterialFile, removeBootMaterial } from "./boot-material.js";
 
 export type VerificationState = "pending" | "ready";
 export type SettingsSource = "pending" | "user_confirmed";
@@ -43,6 +44,34 @@ export interface MigrationHandshake {
   receipt: { iteration: number; messageId: string | null; state: string | null; reviewHead?: string };
   bootMessageId?: string;
   completedAt?: string;
+}
+
+/** Public audit metadata for a private, recoverable BOOT body. */
+export type BootPreparationStage =
+  | "draft"
+  | "material_written"
+  | "capability_registered"
+  | "reserved"
+  | "not_invoked"
+  | "completed";
+
+export interface BootPreparation {
+  id: string;
+  workspaceId: string;
+  taskId: string;
+  conversationId: string;
+  generation: number;
+  assignmentEpoch: number;
+  messageId: string;
+  iteration: number;
+  /** Basename under the private state directory, never a route token or body. */
+  materialFile: string;
+  capabilityId?: string;
+  bodySha256?: string;
+  stage: BootPreparationStage;
+  createdAt: string;
+  updatedAt: string;
+  materialClearedAt?: string;
 }
 
 export interface MigrationReadObservation {
@@ -118,6 +147,15 @@ export interface SavedTaskSession {
   pendingMessageDigest?: string;
   pendingMemoryProject?: string;
   lastReviewHead?: string;
+  /** A matching INIT/ANALYSIS receipt omitted its required review head. It is
+   * acknowledged as transport evidence, but only an exact-head ANALYSIS can
+   * clear this fence before EXECUTED. */
+  reviewHeadClarification?: {
+    generation: number;
+    expectedReviewHead: string;
+    sourceMessageId: string;
+    recordedAt: string;
+  };
   lastReplyEvidence?: { sha256: string; source: "host" | "browser"; sourceUrl?: string; readAt: string; messageId: string; generation: number };
   /** The direct host accepted the outbound request, but ChatGPT has not yet exposed its user turn. */
   sendAcceptedAt?: string;
@@ -137,6 +175,8 @@ export interface SavedTaskSession {
   poolEntryId?: string;
   /** Public id only. The route token itself is never persisted here. */
   routeCapabilityId?: string;
+  /** Recoverable BOOT transaction metadata; sensitive body is outside the ledger. */
+  bootPreparation?: BootPreparation;
   /** An active coordinator lease prevents this Chat from being reclaimed. */
   activeUse?: { useId: string; startedAt: string };
   /** A mem initialization belongs to exactly one binding generation. */
@@ -254,10 +294,28 @@ export function sessionRecoveryGuidance(
     !task.pendingDispatchUncertain && !task.sendAcceptedAt && !task.deliveryPendingSince) {
     return { ...action("workspace_confirmation_required", "BOOT receipt complete; read actual workspace_info then confirm-workspace"), businessGate: "await_boot" };
   }
+  if (task.verificationState === "pending" && task.hostControl?.status === "ready") {
+    const checkedAt = Date.parse(task.hostControl.checkedAt);
+    if (Number.isFinite(checkedAt) && checkedAt <= nowMs && nowMs - checkedAt <= 60_000) {
+      const preparation = task.bootPreparation;
+      return {
+        ...action(preparation && preparation.stage !== "completed" ? "resume_boot_preparation" : "prepare_boot_required",
+          preparation && preparation.stage !== "completed"
+            ? "resume the existing private BOOT preparation after current preflight"
+            : "current host preflight is ready; prepare the only permitted BOOT through session prepare-boot"),
+        businessGate: "await_boot",
+      };
+    }
+  }
   if (task.channelState !== "ready" || (task.hostControl && task.hostControl.status !== "ready")) return action("read_bound_chat", "restore host preflight and read the exact bound Chat");
   const preflightAt = task.hostControl ? Date.parse(task.hostControl.checkedAt) : NaN;
   if (!Number.isFinite(preflightAt) || preflightAt > nowMs || nowMs - preflightAt > 60_000) {
     return action("probe_then_read_bound_chat", "host preflight is missing or expired; refresh it before reserving a message");
+  }
+  if (task.reviewHeadClarification?.generation === task.generation) {
+    return { ...action("review_head_clarification_required",
+      "matching INIT or ANALYSIS receipt omitted its required REVIEW_HEAD; send one exact-head STATE: ANALYSIS clarification after preflight, never resend the original message"),
+      businessGate: "assess_reply" };
   }
   return { ...action("resume_bound_chat"), businessGate: task.verificationState === "pending" ? "await_boot" : "assess_reply" };
 }
@@ -307,6 +365,8 @@ export interface BeginSendOptions {
   messageKind?: BusinessMessageKind;
   messageDigest?: string;
   memoryProject?: string;
+  /** Reserved for the private BOOT preparation transaction. */
+  bootPreparationId?: string;
 }
 
 export interface InitMessageInput {
@@ -359,6 +419,7 @@ const WORKSPACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const CONVERSATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$/u;
 const MESSAGE_ID_PATTERN = /^c2c_msg_[0-9a-f-]{36}$/u;
 const PROVISION_ID_PATTERN = /^c2c_provision_[0-9a-f-]{36}$/u;
+const BOOT_PREPARATION_ID_PATTERN = /^c2c_boot_[0-9a-f-]{36}$/u;
 const SESSION_REGISTRY_LOCK_ID = "session-registry-global";
 const STANDBY_MARKER = "C2C_STANDBY_READY";
 const STANDBY_PRO_MARKER = "C2C_STANDBY_READY_PRO";
@@ -374,7 +435,8 @@ export type DeliveryReadbackPhase = "none" | "fast" | "active" | "deferred";
 export type MigrationRecoveryAction =
   | "restore_host_tools_then_read_bound_chat"
   | "migration_preflight_required"
-  | "begin_boot_with_expected_generation"
+  | "prepare_boot_required"
+  | "resume_boot_preparation"
   | "migration_boot_readback_required"
   | "migration_workspace_confirmation_required";
 
@@ -417,7 +479,7 @@ export function migrationRecoveryGuidance(
   task: Pick<SavedTaskSession,
     "bindingState" | "verificationState" | "migrationHandshake" | "hostControl" |
     "pendingMessageId" | "pendingDispatchUncertain" | "sendAcceptedAt" |
-    "deliveryPendingSince" | "lastDeliveredMessageId" | "lastState" | "activeUse">
+    "deliveryPendingSince" | "lastDeliveredMessageId" | "lastState" | "activeUse" | "bootPreparation">
 ): MigrationRecoveryGuidance | null {
   const migration = task.migrationHandshake;
   if (!migration || migration.completedAt || task.bindingState !== "bound" || task.verificationState !== "pending") {
@@ -435,8 +497,10 @@ export function migrationRecoveryGuidance(
   if (!migration.bootMessageId) {
     if (task.hostControl?.status === "migration_boot_ready") {
       return {
-        nextAction: "begin_boot_with_expected_generation",
-        recoveryReason: "migration preflight is current and no destination BOOT is reserved",
+        nextAction: task.bootPreparation && task.bootPreparation.stage !== "completed" ? "resume_boot_preparation" : "prepare_boot_required",
+        recoveryReason: task.bootPreparation && task.bootPreparation.stage !== "completed"
+          ? "migration preflight is current; resume the existing private BOOT preparation"
+          : "migration preflight is current and no destination BOOT is reserved",
         leaseActive,
       };
     }
@@ -767,7 +831,8 @@ export function validateInitMessageInput(input: unknown): InitMessageInput {
 
 function renderInitMessage(workspaceId: string, taskId: string, messageId: string, iteration: number, input: InitMessageInput, reviewHead?: string): string {
   const review = reviewHead ? `\nREVIEW_HEAD: ${reviewHead}` : "";
-  const message = `[C2C]\nSTATE: INIT\nTASK_ID: ${taskId}\nWORKSPACE_ID: ${workspaceId}\nITERATION: ${iteration}\nMESSAGE_ID: ${messageId}\n\nGOAL: ${input.goal}\nCONSTRAINTS: ${input.constraints}\nSUCCESS_CRITERIA: ${input.successCriteria}\nREPOSITORY: ${input.repository.provider} ${input.repository.name} ${input.repository.branch}\nLOCAL_STATE: ${input.localState}\nMEMORY_PROJECT: ${input.memoryProject}${review}\nMEM: First call memory_start_task(task=GOAL+CONSTRAINTS+SUCCESS_CRITERIA, project=MEMORY_PROJECT, detail=standard, intent=start, mode=hybrid, includeProjectContext=true). Then memory_search for needed history/docs; for Gitea read-only codewiki_*/gitea_*. No memory_write_summary, Gitea, or other writes. C2C local source wins.\n\nREPLY: Echo 4 IDs; STATE: PLAN; MEMORY_PROJECT; MEMORY_STATUS READY|DEGRADED; MEMORY_SOURCES (CSV names); MEMORY_REASON if DEGRADED; SOURCE_EVIDENCE, ACTIONS, TESTS, SUCCESS_CRITERIA.`;
+  const replyReview = reviewHead ? "; echo REVIEW_HEAD exactly" : "";
+  const message = `[C2C]\nSTATE: INIT\nTASK_ID: ${taskId}\nWORKSPACE_ID: ${workspaceId}\nITERATION: ${iteration}\nMESSAGE_ID: ${messageId}\n\nGOAL: ${input.goal}\nCONSTRAINTS: ${input.constraints}\nSUCCESS_CRITERIA: ${input.successCriteria}\nREPOSITORY: ${input.repository.provider} ${input.repository.name} ${input.repository.branch}\nLOCAL_STATE: ${input.localState}\nMEMORY_PROJECT: ${input.memoryProject}${review}\nMEM: First call memory_start_task(task=GOAL+CONSTRAINTS+SUCCESS_CRITERIA, project=MEMORY_PROJECT, detail=standard, intent=start, mode=hybrid, includeProjectContext=true). Then memory_search for needed history/docs; for Gitea read-only codewiki_*/gitea_*. No memory_write_summary, Gitea, or other writes. C2C local source wins.\n\nREPLY: Echo 4 IDs; STATE: PLAN${replyReview}; MEMORY_PROJECT; MEMORY_STATUS READY|DEGRADED; MEMORY_SOURCES (CSV names); MEMORY_REASON if DEGRADED; SOURCE_EVIDENCE, ACTIONS, TESTS, SUCCESS_CRITERIA.`;
   if (Buffer.byteLength(message, "utf8") > 1024) throw new Error("C2C_INIT_MESSAGE_TOO_LARGE");
   return message;
 }
@@ -921,6 +986,20 @@ function normalizeRegistry(registry: SessionRegistry): SessionRegistry {
       (m.receipt.reviewHead !== undefined && (typeof m.receipt.reviewHead !== "string" || !/^[0-9a-f]{40}$/u.test(m.receipt.reviewHead))) ||
       (m.bootMessageId !== undefined && typeof m.bootMessageId !== "string") ||
       (m.completedAt !== undefined && !isValidReclaimTimestamp(m.completedAt)))) throw new Error("MIGRATION_STATE_INVALID");
+    const boot = task.bootPreparation;
+    if (boot !== undefined && (!boot || typeof boot !== "object" ||
+      !BOOT_PREPARATION_ID_PATTERN.test(boot.id) || boot.workspaceId !== registry.workspaceId ||
+      boot.taskId !== task.taskId || boot.conversationId !== task.conversationId ||
+      boot.generation !== task.generation || !Number.isSafeInteger(boot.assignmentEpoch) || boot.assignmentEpoch < 1 ||
+      !MESSAGE_ID_PATTERN.test(boot.messageId) || !Number.isSafeInteger(boot.iteration) || boot.iteration < 0 ||
+      typeof boot.materialFile !== "string" || boot.materialFile !== `boot-${boot.id}.json` ||
+      (boot.capabilityId !== undefined && !/^c2c_route_id_[0-9a-f-]{36}$/u.test(boot.capabilityId)) ||
+      (boot.bodySha256 !== undefined && !/^[0-9a-f]{64}$/u.test(boot.bodySha256)) ||
+      !["draft", "material_written", "capability_registered", "reserved", "not_invoked", "completed"].includes(boot.stage) ||
+      !isValidReclaimTimestamp(boot.createdAt) || !isValidReclaimTimestamp(boot.updatedAt) ||
+      (boot.materialClearedAt !== undefined && !isValidReclaimTimestamp(boot.materialClearedAt)))) {
+      throw new Error("BOOT_PREPARATION_STATE_INVALID");
+    }
     const host = task.hostControl;
     if (host !== undefined && (!host || typeof host !== "object" ||
       !["tools_missing", "readback_required", "migration_boot_ready", "ready", "call_timeout", "call_failed", "not_invoked"].includes(host.status) ||
@@ -935,6 +1014,14 @@ function normalizeRegistry(registry: SessionRegistry): SessionRegistry {
       [task.pendingReviewHead, task.lastReviewHead].some(head => head !== undefined &&
         (typeof head !== "string" || !/^[0-9a-f]{40}$/u.test(head)))) {
       throw new Error("HOST_CONTROL_STATE_INVALID");
+    }
+    const clarification = task.reviewHeadClarification;
+    if (clarification !== undefined && (!clarification || !Number.isSafeInteger(clarification.generation) ||
+      clarification.generation < 1 || clarification.generation !== task.generation ||
+      typeof clarification.expectedReviewHead !== "string" || !/^[0-9a-f]{40}$/u.test(clarification.expectedReviewHead) ||
+      typeof clarification.sourceMessageId !== "string" || !MESSAGE_ID_PATTERN.test(clarification.sourceMessageId) ||
+      typeof clarification.recordedAt !== "string" || !Number.isFinite(Date.parse(clarification.recordedAt)))) {
+      throw new Error("REVIEW_HEAD_CLARIFICATION_STATE_INVALID");
     }
     if (task.pendingMessageKind !== undefined && task.pendingMessageKind !== "init" && task.pendingMessageKind !== "analysis" && task.pendingMessageKind !== "executed") {
       throw new Error("BUSINESS_MESSAGE_STATE_INVALID");
@@ -1777,6 +1864,211 @@ export async function attachTaskRouteCapability(
   return updateTaskChannel(workspaceId, taskId, (task) => ({ ...task, routeCapabilityId: id, savedAt: new Date().toISOString() }));
 }
 
+export interface BootPreparationResult {
+  task: SavedTaskSession;
+  preparation: BootPreparation;
+  /** A reservation may already have been handed to a caller; reconcile it before any send. */
+  pending: boolean;
+}
+
+function currentAssignmentEpoch(ledger: SessionLedger, workspaceId: string, task: SavedTaskSession): number {
+  const entry = task.poolEntryId ? ledger.pool.entries.find(candidate => candidate.id === task.poolEntryId) : undefined;
+  const assignmentEpoch = entry?.assignmentEpoch;
+  if (!entry || entry.status !== "claimed" || entry.conversationId !== task.conversationId ||
+    entry.claimedBy?.workspaceId !== workspaceId || entry.claimedBy.taskId !== task.taskId ||
+    entry.claimedBy.generation !== task.generation || typeof assignmentEpoch !== "number" ||
+    !Number.isSafeInteger(assignmentEpoch) || assignmentEpoch < 1) {
+    throw new Error("BOOT_PREPARATION_OWNER_CHANGED");
+  }
+  return assignmentEpoch as number;
+}
+
+function assertBootPreflight(task: SavedTaskSession, expectedGeneration: number): void {
+  if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1 || task.generation !== expectedGeneration) {
+    throw new Error("TASK_GENERATION_STALE");
+  }
+  if (task.bindingState !== "bound" || task.verificationState !== "pending") throw new Error("BOOT_PREPARATION_NOT_REQUIRED");
+  if (task.settingsSource !== "user_confirmed") throw new Error("task conversation settings lack user confirmation");
+  const migration = task.migrationHandshake && !task.migrationHandshake.completedAt;
+  const requiredStatus = migration ? "migration_boot_ready" : "ready";
+  if (task.hostControl?.status !== requiredStatus) throw new Error("HOST_CONTROL_PREFLIGHT_REQUIRED");
+  const checkedAt = Date.parse(task.hostControl.checkedAt);
+  if (!Number.isFinite(checkedAt) || checkedAt > Date.now() || Date.now() - checkedAt > 60_000) {
+    throw new Error("HOST_CONTROL_PREFLIGHT_REQUIRED");
+  }
+}
+
+/**
+ * Persist the non-secret half of one BOOT transaction before material or Router
+ * state changes. A repeat returns exactly the same message identity.
+ */
+export async function beginTaskBootPreparation(
+  workspaceId: string,
+  taskId: string,
+  expectedGeneration: number,
+  useId?: string,
+): Promise<BootPreparationResult> {
+  let result: BootPreparationResult | undefined;
+  const task = await updateTaskChannel(workspaceId, taskId, (current, ledger) => {
+    assertTaskUse(current, useId);
+    if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1 || current.generation !== expectedGeneration) {
+      throw new Error("TASK_GENERATION_STALE");
+    }
+    const assignmentEpoch = currentAssignmentEpoch(ledger, workspaceId, current);
+    const existing = current.bootPreparation;
+    if (existing) {
+      if (existing.workspaceId !== workspaceId || existing.taskId !== current.taskId || existing.conversationId !== current.conversationId ||
+        existing.generation !== current.generation || existing.assignmentEpoch !== assignmentEpoch) {
+        throw new Error("BOOT_PREPARATION_STALE");
+      }
+      if (existing.stage === "completed") {
+        result = { task: current, preparation: existing, pending: false };
+        return current;
+      }
+      if (current.pendingMessageId && current.pendingMessageId !== existing.messageId) throw new Error("BOOT_SEND_UNRESOLVED");
+      if (current.pendingMessageId && current.pendingIteration !== existing.iteration) throw new Error("BOOT_PREPARATION_STALE");
+      result = { task: current, preparation: existing, pending: current.pendingMessageId === existing.messageId };
+      return current;
+    }
+    assertBootPreflight(current, expectedGeneration);
+    if (current.pendingMessageId || current.pendingDispatchUncertain || current.sendAcceptedAt || current.deliveryPendingSince) {
+      throw new Error("BOOT_SEND_UNRESOLVED");
+    }
+    const now = new Date().toISOString();
+    const preparation: BootPreparation = {
+      id: `c2c_boot_${randomUUID()}`,
+      workspaceId,
+      taskId: current.taskId,
+      conversationId: current.conversationId,
+      generation: current.generation,
+      assignmentEpoch,
+      messageId: newMessageId(),
+      iteration: current.iteration + 1,
+      materialFile: "", // filled below after the id is allocated
+      stage: "draft",
+      createdAt: now,
+      updatedAt: now,
+    };
+    preparation.materialFile = `boot-${preparation.id}.json`;
+    const updated = { ...current, bootPreparation: preparation, savedAt: now };
+    result = { task: updated, preparation, pending: false };
+    return updated;
+  });
+  if (!result) throw new Error("BOOT_PREPARATION_FAILED");
+  return { task, preparation: result.preparation, pending: result.pending };
+}
+
+/** Store only a digest and route capability id after the private material write succeeds. */
+export async function recordTaskBootMaterial(
+  workspaceId: string,
+  taskId: string,
+  input: { preparationId: string; capabilityId: string; bodySha256: string; materialFile: string; useId?: string },
+): Promise<SavedTaskSession> {
+  const preparationId = input.preparationId.trim();
+  const capabilityId = input.capabilityId.trim();
+  if (!BOOT_PREPARATION_ID_PATTERN.test(preparationId) || !/^c2c_route_id_[0-9a-f-]{36}$/u.test(capabilityId) ||
+    !/^[0-9a-f]{64}$/u.test(input.bodySha256) || input.materialFile !== `boot-${preparationId}.json`) {
+    throw new Error("BOOT_MATERIAL_METADATA_INVALID");
+  }
+  return updateTaskChannel(workspaceId, taskId, task => {
+    assertTaskUse(task, input.useId);
+    const boot = task.bootPreparation;
+    if (!boot || boot.id !== preparationId || boot.generation !== task.generation ||
+      boot.workspaceId !== workspaceId || boot.taskId !== task.taskId || boot.conversationId !== task.conversationId) {
+      throw new Error("BOOT_PREPARATION_STALE");
+    }
+    if (boot.bodySha256 !== undefined && (boot.bodySha256 !== input.bodySha256 || boot.capabilityId !== capabilityId || boot.materialFile !== input.materialFile)) {
+      throw new Error("BOOT_MATERIAL_CONFLICT");
+    }
+    if (boot.stage === "completed") throw new Error("BOOT_PREPARATION_COMPLETED");
+    if (boot.stage === "reserved" || boot.stage === "capability_registered") return task;
+    return { ...task, bootPreparation: { ...boot, capabilityId, bodySha256: input.bodySha256,
+      materialFile: input.materialFile, stage: boot.stage === "not_invoked" ? "not_invoked" : "material_written",
+      updatedAt: new Date().toISOString() }, savedAt: new Date().toISOString() };
+  });
+}
+
+/** Record that Router durably knows the inactive capability, without making it usable yet. */
+export async function recordTaskBootCapabilityRegistered(
+  workspaceId: string,
+  taskId: string,
+  preparationId: string,
+  useId?: string,
+): Promise<SavedTaskSession> {
+  return updateTaskChannel(workspaceId, taskId, task => {
+    assertTaskUse(task, useId);
+    const boot = task.bootPreparation;
+    if (!boot || boot.id !== preparationId || !boot.capabilityId || !boot.bodySha256) throw new Error("BOOT_PREPARATION_STALE");
+    if (boot.stage === "completed") throw new Error("BOOT_PREPARATION_COMPLETED");
+    if (boot.stage === "reserved") return task;
+    return { ...task, bootPreparation: { ...boot, stage: "capability_registered", updatedAt: new Date().toISOString() }, savedAt: new Date().toISOString() };
+  });
+}
+
+/**
+ * Attach a prepared capability and reserve its fixed BOOT message under one
+ * session lock. Router registration happened beforehand, but the capability
+ * remains unusable until this exact state write commits.
+ */
+export async function activateTaskBootPreparation(
+  workspaceId: string,
+  taskId: string,
+  preparationId: string,
+  expectedGeneration: number,
+  useId?: string,
+): Promise<BootPreparationResult> {
+  let result: BootPreparationResult | undefined;
+  const task = await updateTaskChannel(workspaceId, taskId, (current, ledger) => {
+    assertTaskUse(current, useId);
+    assertBootPreflight(current, expectedGeneration);
+    const boot = current.bootPreparation;
+    const assignmentEpoch = currentAssignmentEpoch(ledger, workspaceId, current);
+    if (!boot || boot.id !== preparationId || boot.generation !== current.generation || boot.assignmentEpoch !== assignmentEpoch ||
+      !boot.capabilityId || !boot.bodySha256) throw new Error("BOOT_PREPARATION_STALE");
+    if (boot.stage === "completed") {
+      result = { task: current, preparation: boot, pending: false };
+      return current;
+    }
+    if (current.pendingMessageId) {
+      if (current.pendingMessageId !== boot.messageId || current.pendingIteration !== boot.iteration) throw new Error("BOOT_SEND_UNRESOLVED");
+      result = { task: current, preparation: boot, pending: true };
+      return current;
+    }
+    const reserved = reserveTaskSend(current, boot.messageId, boot.iteration, {
+      bootstrap: true,
+      expectedGeneration,
+      useId,
+      bootPreparationId: boot.id,
+    });
+    const updatedAt = new Date().toISOString();
+    const updated = {
+      ...reserved,
+      routeCapabilityId: boot.capabilityId,
+      bootPreparation: { ...boot, stage: "reserved" as const, updatedAt },
+      savedAt: updatedAt,
+    };
+    result = { task: updated, preparation: updated.bootPreparation, pending: false };
+    return updated;
+  });
+  if (!result) throw new Error("BOOT_PREPARATION_FAILED");
+  return { task, preparation: result.preparation, pending: result.pending };
+}
+
+/** Mark private material cleaned after an already-confirmed BOOT; failures leave retryable metadata. */
+export async function markTaskBootMaterialCleared(
+  workspaceId: string,
+  taskId: string,
+  preparationId: string,
+): Promise<SavedTaskSession> {
+  return updateTaskChannel(workspaceId, taskId, task => {
+    const boot = task.bootPreparation;
+    if (!boot || boot.id !== preparationId || boot.stage !== "completed") throw new Error("BOOT_PREPARATION_STALE");
+    if (boot.materialClearedAt) return task;
+    const now = new Date().toISOString();
+    return { ...task, bootPreparation: { ...boot, materialClearedAt: now, updatedAt: now }, savedAt: now };
+  });
+}
+
 export function readTaskSession(workspaceId: string, taskId: string): SavedTaskSession | null {
   const id = validateTaskId(taskId);
   return readSessionRegistry(workspaceId).registry.tasks.find((task) => task.taskId === id) ?? null;
@@ -1807,8 +2099,19 @@ export function resolveTaskBinding(workspaceIdInput: string, taskIdInput: string
   return { resolution: "ambiguous", requestedWorkspaceId, boundWorkspaceId: null, task: null, candidates };
 }
 
+function hasIncompleteBootPreparation(task: SavedTaskSession): boolean {
+  return task.bootPreparation !== undefined && task.bootPreparation.stage !== "completed";
+}
+
 function taskIsBusy(task: SavedTaskSession): boolean {
-  return Boolean(task.pendingMessageId || task.pendingDispatchUncertain || task.sendAcceptedAt || task.deliveryPendingSince || task.activeUse || task.channelState !== "ready");
+  return Boolean(task.pendingMessageId || task.pendingDispatchUncertain || task.sendAcceptedAt || task.deliveryPendingSince ||
+    task.activeUse || task.channelState !== "ready" || hasIncompleteBootPreparation(task));
+}
+
+/** An interrupted private BOOT may be resumed only by this task's next own lease. */
+function canAcquireBootRecoveryLease(task: SavedTaskSession): boolean {
+  return hasIncompleteBootPreparation(task) && !task.pendingMessageId && !task.pendingDispatchUncertain &&
+    !task.sendAcceptedAt && !task.deliveryPendingSince && !task.activeUse && task.channelState === "ready";
 }
 
 function historyEntry(task: SavedTaskSession, workspaceId: string, reason: AssignmentHistoryEntry["reason"], now: string): AssignmentHistoryEntry {
@@ -1850,7 +2153,9 @@ export async function switchTaskWorkspace(input: SwitchTaskWorkspaceOptions): Pr
       workspaceName,
       branch: input.branch,
       routeCapabilityId: undefined,
+      bootPreparation: undefined,
       memoryInitialization: undefined,
+      reviewHeadClarification: undefined,
       verificationState: "pending",
       channelState: "ready",
       hostControl: undefined,
@@ -1884,7 +2189,9 @@ export async function resumeTaskSession(workspaceIdInput: string, taskIdInput: s
       if (current.bindingState !== "bound") throw new Error("TASK_CHAT_BUSY");
       return current;
     }
-    if (current.bindingState !== "bound" || taskIsBusy(current)) throw new Error("TASK_CHAT_BUSY");
+    if (current.bindingState !== "bound" || (taskIsBusy(current) && !canAcquireBootRecoveryLease(current))) {
+      throw new Error("TASK_CHAT_BUSY");
+    }
     const now = new Date().toISOString();
     return { ...current, activeUse: { useId, startedAt: now }, savedAt: now };
   });
@@ -2003,7 +2310,7 @@ export async function confirmTaskWorkspace(
   useId?: string,
 ): Promise<SavedTaskSession> {
   const expectedWorkspace = validateWorkspaceId(workspaceId);
-  return updateTaskChannel(expectedWorkspace, taskId, (task) => {
+  const confirmed = await updateTaskChannel(expectedWorkspace, taskId, (task) => {
     assertTaskUse(task, useId);
     if (task.bindingState !== "bound") throw new Error("task conversation binding is unavailable");
     if (observation.workspaceId.trim() !== expectedWorkspace) {
@@ -2043,11 +2350,25 @@ export async function confirmTaskWorkspace(
       ...task,
       migrationHandshake: task.migrationHandshake ? { ...task.migrationHandshake, completedAt: new Date().toISOString() } : undefined,
       hostControl: task.migrationHandshake ? { status: "ready", missingTools: [], checkedAt: new Date().toISOString() } : task.hostControl,
+      bootPreparation: task.bootPreparation && task.bootPreparation.generation === task.generation &&
+        task.bootPreparation.messageId === task.lastDeliveredMessageId
+        ? { ...task.bootPreparation, stage: "completed", updatedAt: new Date().toISOString() }
+        : task.bootPreparation,
       verificationState: "ready",
       channelState: "ready",
       savedAt: new Date().toISOString(),
     };
   });
+  const preparation = confirmed.bootPreparation;
+  if (!preparation || preparation.stage !== "completed" || preparation.materialClearedAt) return confirmed;
+  try {
+    removeBootMaterial(bootMaterialFile(preparation.id));
+    return await markTaskBootMaterialCleared(expectedWorkspace, taskId, preparation.id);
+  } catch {
+    // Ready is already durable. The token-free completed record lets a later
+    // prepare-boot invocation retry cleanup without recreating the capability.
+    return confirmed;
+  }
 }
 
 function unavailableTask(task: SavedTaskSession, reason: string): SavedTaskSession {
@@ -2161,6 +2482,7 @@ export async function restoreTaskConversation(
       replacedConversations: current.replacedConversations.filter((item) => item.conversationId !== conversationId),
       replacementReason: undefined,
       memoryInitialization: undefined,
+      reviewHeadClarification: undefined,
       consecutiveReadFailures: 0,
       lastReadError: undefined,
       lastReadCheckedAt: now,
@@ -2268,11 +2590,18 @@ export async function recordTaskHostControl(
         task.pendingDispatchUncertain) {
         throw new Error("HOST_CONTROL_NOT_INVOKED_UNPROVEN");
       }
+      const boot = task.bootPreparation && task.bootPreparation.messageId === task.pendingMessageId
+        ? { ...task.bootPreparation, stage: "not_invoked" as const, updatedAt: checkedAt }
+        : task.bootPreparation;
+      const migration = task.migrationHandshake && task.migrationHandshake.bootMessageId === task.pendingMessageId
+        ? { ...task.migrationHandshake, bootMessageId: undefined }
+        : task.migrationHandshake;
       return { ...task, pendingMessageId: undefined, pendingStartedAt: undefined, replyWaitingSince: undefined, readbackObservation: undefined, pendingIteration: undefined,
         pendingReviewHead: undefined, pendingMessageKind: undefined,
         pendingMessageDigest: undefined, pendingMemoryProject: undefined,
         pendingDispatchUncertain: undefined,
         deliveryPendingSince: undefined, channelState: "degraded",
+        migrationHandshake: migration, bootPreparation: boot,
         hostControl: { status: "not_invoked", missingTools, checkedAt }, savedAt: checkedAt };
     } else if (observation.result === "timeout") status = "call_timeout";
     else if (observation.result === "call-failed") status = "call_failed";
@@ -2350,6 +2679,18 @@ function reserveTaskSend(
   iteration: number,
   flags: BeginSendOptions,
 ): SavedTaskSession {
+  if (flags.bootPreparationId !== undefined) {
+    if (!flags.bootstrap || !BOOT_PREPARATION_ID_PATTERN.test(flags.bootPreparationId)) {
+      throw new Error("BOOT_PREPARE_REQUIRED");
+    }
+    const boot = task.bootPreparation;
+    if (!boot || boot.id !== flags.bootPreparationId || boot.messageId !== id || boot.iteration !== iteration ||
+      boot.generation !== task.generation || boot.workspaceId === "" || boot.taskId !== task.taskId ||
+      boot.conversationId !== task.conversationId || !boot.capabilityId || !boot.bodySha256 ||
+      !["material_written", "capability_registered", "not_invoked"].includes(boot.stage)) {
+      throw new Error("BOOT_PREPARATION_STALE");
+    }
+  }
   if (flags.messageKind !== undefined && flags.messageKind !== "init" && flags.messageKind !== "analysis" && flags.messageKind !== "executed") {
     throw new Error("BUSINESS_MESSAGE_KIND_INVALID");
   }
@@ -2364,6 +2705,11 @@ function reserveTaskSend(
   }
   if ((flags.messageKind === "executed" || flags.messageKind === "analysis") && task.memoryInitialization?.generation !== task.generation) {
     throw new Error("MEMORY_INIT_REQUIRED: send a generated INIT for this binding generation first");
+  }
+  const clarification = task.reviewHeadClarification;
+  if (clarification?.generation === task.generation &&
+    (flags.messageKind !== "analysis" || flags.reviewHead !== clarification.expectedReviewHead)) {
+    throw new Error("REVIEW_HEAD_CLARIFICATION_REQUIRED: send one exact-head STATE: ANALYSIS clarification before execution");
   }
   if (flags.expectedGeneration !== undefined && task.generation !== flags.expectedGeneration) throw new Error("TASK_GENERATION_STALE");
   assertTaskUse(task, flags.useId);
@@ -2636,7 +2982,14 @@ export async function confirmTaskReply(
     // already-delivered legacy state instead of trapping the binding forever.
     const legacyMalformedBootstrap = task.verificationState === "pending" &&
       task.pendingReviewHead !== undefined && observedReviewHead === undefined;
-    if (task.pendingReviewHead && !legacyMalformedBootstrap && observedReviewHead !== task.pendingReviewHead) {
+    // A generated INIT can be delivered and fully identified while an assistant
+    // omits its required review echo. Acknowledge that transport receipt instead
+    // of leaving it permanently pending, then fence execution to one new,
+    // exact-head ANALYSIS request. A non-empty wrong head remains unsafe.
+    const reviewHeadClarificationRequired = task.verificationState === "ready" &&
+      task.pendingReviewHead !== undefined && observedReviewHead === undefined &&
+      (task.pendingMessageKind === "init" || task.pendingMessageKind === "analysis");
+    if (task.pendingReviewHead && !legacyMalformedBootstrap && !reviewHeadClarificationRequired && observedReviewHead !== task.pendingReviewHead) {
       throw new Error("REVIEW_HEAD_MISMATCH");
     }
     if (task.pendingMessageKind !== "init" && observedMemory !== undefined) {
@@ -2654,7 +3007,14 @@ export async function confirmTaskReply(
       lastReplyEvidence: observedReplyDigest ? { sha256: observedReplyDigest, source: read!.source ?? "host",
         sourceUrl: read!.sourceUrl, readAt: read!.readAt, messageId: id, generation: task.generation } : undefined,
       bootReplyGeneration: task.verificationState === "pending" && normalizedState === "DONE" ? task.generation : task.bootReplyGeneration,
-      lastReviewHead: legacyMalformedBootstrap ? task.lastReviewHead : task.pendingReviewHead,
+      lastReviewHead: legacyMalformedBootstrap || reviewHeadClarificationRequired ? task.lastReviewHead : task.pendingReviewHead,
+      reviewHeadClarification: reviewHeadClarificationRequired ? {
+        generation: task.generation,
+        expectedReviewHead: task.pendingReviewHead!,
+        sourceMessageId: id,
+        recordedAt: checkedAt,
+      } : task.reviewHeadClarification?.generation === task.generation &&
+        observedReviewHead === task.reviewHeadClarification.expectedReviewHead ? undefined : task.reviewHeadClarification,
       pendingMessageId: undefined,
       pendingStartedAt: undefined,
       replyWaitingSince: undefined,

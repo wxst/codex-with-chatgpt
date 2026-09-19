@@ -116,13 +116,41 @@ describe("ChatGPT-first Skill instruction contract", () => {
     const agents = fs.readFileSync("AGENTS.md", "utf8");
     expect(skill).toContain("C2C recovery is already authorized");
     expect(skill).toContain("do not ask for authorization or send another BOOT");
-    expect(skill).toContain("Never put\nit on BOOT or pass `--review-head` with `begin-send --bootstrap`");
+    expect(skill).toContain("`session prepare-boot` has no review-head input");
     expect(skill).toContain("does not require another user decision");
     expect(protocol).toContain("BOOT_REVIEW_HEAD_FORBIDDEN");
     expect(protocol).toContain("does not become `lastReviewHead`");
     expect(hostControl).toContain("Do not resend it or ask");
     expect(agents).toContain("错误 BOOT 修复");
     expect(agents).toContain("不再向用户索取单独授权");
+  });
+
+  it("documents recovery when a real review-bearing reply omits REVIEW_HEAD", () => {
+    const agents = fs.readFileSync("AGENTS.md", "utf8");
+    const readme = fs.readFileSync("README.md", "utf8");
+    const readmeZh = fs.readFileSync("README.zh-CN.md", "utf8");
+    for (const document of [skill, protocol, hostControl, agents, readme, readmeZh]) {
+      expect(document).toContain("review_head_clarification_required");
+    }
+    expect(skill).toContain("Do not rewrite the observed reply, resend INIT, or send\nEXECUTED");
+    expect(protocol).toContain("not promoted as observed\nreview evidence");
+    expect(agents).toContain("不得填造 HEAD、重发 INIT 或发送 EXECUTED");
+  });
+
+  it("requires private, recoverable BOOT preparation instead of one-time token output", () => {
+    const agents = fs.readFileSync("AGENTS.md", "utf8");
+    const readme = fs.readFileSync("README.md", "utf8");
+    const readmeZh = fs.readFileSync("README.zh-CN.md", "utf8");
+    for (const document of [skill, protocol, agents, readme, readmeZh]) {
+      expect(document).toContain("prepare-boot");
+    }
+    expect(skill).toContain("sendAllowed");
+    expect(skill).toContain("messageFile");
+    expect(skill).toContain("same private preparation");
+    expect(skill).toContain("not-invoked");
+    expect(protocol).toContain("token-free preparation record");
+    expect(agents).toContain("Windows 只允许当前用户和 SYSTEM");
+    expect(agents).toContain("已接受、送达、等待回复或已完成的 BOOT 绝不换 token");
   });
 
   it("requires the post-BOOT migration confirmation instead of revisiting an old source receipt", () => {

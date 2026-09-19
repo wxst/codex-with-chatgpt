@@ -51,6 +51,11 @@ delay due reads. Diagnose persistent observation gaps, record `observation_block
 with concrete evidence, and resume the same request when reading is restored.
 Use `--kind analysis` for follow-up reasoning after a weak PLAN, not a fabricated
 EXECUTED. The CLI provides decisions; it does not poll Chat in the background.
+If a review-bearing INIT or ANALYSIS reply matches its receipt but omits
+`REVIEW_HEAD`, record that transport receipt and follow
+`review_head_clarification_required`: refresh preflight, send an exact-head
+ANALYSIS clarification, and do not fabricate the head, retry INIT, or send
+EXECUTED until the clarification is confirmed.
 
 ## Installation-trial scope
 
@@ -217,13 +222,18 @@ globally locked; inventory and task ownership are committed in one atomic ledger
 title guesses, recent conversations, and cross-task reuse are
 excluded. Empty stock returns `POOL_EXHAUSTED` before task content is sent.
 
-The claim returns a one-time task route token. The Boot Prompt places it in
-`C2C_ROUTE_TOKEN`; every one of the eight MCP calls then includes `route_token`.
-The Router resolves that token to only its bound workspace. Normal Chat control
-uses only `list_threads`, `send_message_to_thread`, and `read_thread`, with
-readback receipts before state advances. The first 60 seconds poll every 5 seconds.
-An accepted send whose user turn is late stays in flight; repeated temporary
-read misses mark the channel degraded and retain the same Chat.
+Claim and workspace migration only establish the binding. After host preflight,
+`session prepare-boot --expected-generation <n> --json` creates or resumes one
+recoverable BOOT transaction. Its ordinary JSON is token-free and returns only
+identity, message metadata, digest, next action, and a private body-file path.
+The complete BOOT body contains `C2C_ROUTE_TOKEN` only inside that private file;
+read it in memory solely to send the exact bound Chat. Windows files permit only
+the current user and SYSTEM; Unix uses `0700`/`0600`. Repeated calls preserve the
+same body, capability, message ID, and iteration. A pending or uncertain send is
+read back, never resent. Every one of the eight MCP calls then includes
+`route_token`, resolved only to its bound workspace. Normal Chat control uses
+only `list_threads`, `send_message_to_thread`, and `read_thread`, with readback
+receipts before state advances.
 
 If host readback omits a reply already visible on the web, shared guidance returns
 `read_exact_chat_in_browser`. Codex reads only the exact `chatUrl`, records browser
