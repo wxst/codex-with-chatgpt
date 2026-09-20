@@ -1335,7 +1335,7 @@ session.command("resume")
   .description("Acquire one continuation lease after resolving the current task binding")
   .option("-w, --workspace <path>").option("--task-id <id>").option("--brief", "emit only continuation decision", false)
   .option("--use-id <id>", "resume the same coordinator lease without acquiring a new one")
-  .option("--recover-own", "recover the private continuation of the actual host task", false)
+  .option("--recover-own", "restore the actual host task lease and rebuild its private continuation cache", false)
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; taskId?: string; useId?: string; recoverOwn: boolean; brief: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));

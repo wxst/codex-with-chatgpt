@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { Workspace } from "../src/workspace/manager.js";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { claimStandbyConversation, importStandbyConversation, readTaskSession, resumeTaskSession,
   sessionRecoveryGuidance, sessionLedgerFile, recordTaskHostControl, canAcquireContinuationLease, switchTaskWorkspace } from "../src/session/state.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
@@ -16,12 +16,13 @@ const cli = (args: string[], hostTask = taskId) => spawnSync(process.execPath,
 const current = () => readTaskSession(workspace, taskId)!;
 beforeEach(async () => {
   root = isolateStateDir();
+  vi.stubEnv("CODEX_THREAD_ID", taskId);
   await importStandbyConversation({ conversationId: chat, projectId: "g-p-lease", markerText: "C2C_STANDBY_READY", markerMessageId: "marker", markerRole: "user" });
   await claimStandbyConversation({ workspaceId: workspace, taskId, connectorName: "C2C", workspaceName: "repo", branch: "main" });
   await recordTaskHostControl(workspace, taskId, { result: "probe", tools: ["read_thread", "send_message_to_thread"] });
   await recordTaskHostControl(workspace, taskId, { result: "read-ok", conversationId: chat, observedTaskId: taskId, observedWorkspaceId: workspace });
 });
-afterEach(() => cleanup(root));
+afterEach(() => { cleanup(root); vi.unstubAllEnvs(); });
 
 it("automatic CLI continuation acquires and persists only when no active lease exists and acquisition is safe", async () => {
   expect(sessionRecoveryGuidance("exact", current()).leaseStatus).toBe("none");
@@ -120,13 +121,18 @@ it.each(["after_record", "after_ledger", "before_output"] as const)("recovers in
   expect(readContinuation(taskId)?.stage).toBe("active");
 });
 
-it.each(["missing", "corrupt", "mismatch"])("never adopts an unproven %s continuation", async fault => {
+it.each(["missing", "corrupt", "malformed", "released", "mismatch"])("rebuilds an own %s continuation from the authoritative ledger", async fault => {
   await resumeTaskSession(workspace, taskId);
   if (fault === "missing") fs.unlinkSync(continuationFile(taskId));
   else if (fault === "corrupt") fs.writeFileSync(continuationFile(taskId), "{}");
+  else if (fault === "malformed") fs.writeFileSync(continuationFile(taskId), "{broken");
+  else if (fault === "released") writeContinuation({ ...readContinuation(taskId)!, stage: "released" });
   else writeContinuation({ ...readContinuation(taskId)!, assignmentEpoch: 2 });
   const before = fs.readFileSync(sessionLedgerFile(), "utf8");
-  await expect(resumeTaskSession(workspace, taskId, undefined, true)).rejects.toThrow(/LEASE_/);
+  const recovered = cli(["resume", "--recover-own"]);
+  expect(recovered.status).toBe(0);
+  expect(JSON.parse(recovered.stdout).useId).toBe(current().activeUse!.useId);
+  expect(readContinuation(taskId)?.assignmentEpoch).toBe(1);
   expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
   expect(sessionRecoveryGuidance("exact", current()).businessGate).toBe("connection_required");
 });
@@ -152,6 +158,7 @@ it("concurrent recoveries converge on the same lease", async () => {
 
 it("CLI get/resume/host-control agree without leaking an unproven lease", async () => {
   const { useId } = await resumeTaskSession(workspace, taskId);
+  fs.unlinkSync(continuationFile(taskId));
   for (const args of [["get"], ["resume"], ["host-control", "--result", "probe", "--tools", "read_thread"]]) {
     const result = cli(args);
     expect(result.stdout).not.toContain(useId);
@@ -171,6 +178,7 @@ it("source workspace pending can recover through CLI without migrating or changi
   const { useId } = await resumeTaskSession(workspace, taskId);
   const messageId = newMessageId();
   await beginTaskSend(workspace, taskId, messageId, 0, { bootstrap: true, useId });
+  fs.unlinkSync(continuationFile(taskId));
   const before = fs.readFileSync(sessionLedgerFile(), "utf8");
   const result = cli(["resume", "--recover-own", "-w", root]);
   expect(JSON.parse(result.stdout)).toMatchObject({ useId, boundWorkspaceId: workspace, nextAction: "reconcile_source_pending", businessGate: "await_boot" });
@@ -180,12 +188,11 @@ it("source workspace pending can recover through CLI without migrating or changi
 it("known own lease can enroll a legacy binding, and a released receipt cannot resurrect its useId", async () => {
   const { useId } = await resumeTaskSession(workspace, taskId);
   fs.unlinkSync(continuationFile(taskId));
-  expect(sessionRecoveryGuidance("exact", current()).leaseStatus).toBe("ownership_unproven");
+  expect(sessionRecoveryGuidance("exact", current()).leaseStatus).toBe("recoverable_own");
   const before = fs.readFileSync(sessionLedgerFile(), "utf8");
-  const blocked = cli(["resume", "--recover-own"]);
-  expect(blocked.status).not.toBe(0);
-  expect(JSON.parse(blocked.stdout)).toMatchObject({ ok: false, leaseStatus: "ownership_unproven", nextAction: "lease_ownership_unproven", businessGate: "connection_required" });
-  expect(blocked.stdout).not.toContain(useId);
+  const recovered = cli(["resume", "--recover-own"]);
+  expect(recovered.status).toBe(0);
+  expect(JSON.parse(recovered.stdout)).toMatchObject({ ok: true, useId, leaseStatus: "own" });
   expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
   await resumeTaskSession(workspace, taskId, useId);
   await finishTaskSession(workspace, taskId, useId);
@@ -193,12 +200,14 @@ it("known own lease can enroll a legacy binding, and a released receipt cannot r
   expect(next.useId).not.toBe(useId);
 });
 
-it.each(["boundWorkspaceId", "conversationId", "generation", "assignmentEpoch", "useId"] as const)("rejects changed private identity %s with no ledger writes", async field => {
+it.each(["boundWorkspaceId", "conversationId", "generation", "assignmentEpoch", "useId"] as const)("rebuilds stale cached identity %s with no ledger writes", async field => {
   await resumeTaskSession(workspace, taskId);
   const r = readContinuation(taskId)!;
   writeContinuation({ ...r, [field]: typeof r[field] === "number" ? Number(r[field]) + 1 : field === "boundWorkspaceId" ? "0123456789ab" : field === "useId" ? "c2c_use_00000000-0000-4000-8000-000000000000" : "wrong-chat" });
   const before = fs.readFileSync(sessionLedgerFile(), "utf8");
-  await expect(resumeTaskSession(workspace, taskId, undefined, true)).rejects.toThrow("LEASE_CONFLICT");
+  const recovered = await resumeTaskSession(workspace, taskId, undefined, true);
+  expect(recovered.useId).toBe(current().activeUse!.useId);
+  expect(readContinuation(taskId)).toMatchObject({ useId: recovered.useId, generation: current().generation, conversationId: chat });
   expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
 });
 
@@ -213,5 +222,43 @@ it("rejects hard-linked or publicly readable continuation material", async () =>
     expect(spawnSync("icacls.exe", [file, "/grant", "*S-1-1-0:R"], { windowsHide: true }).status).toBe(0);
   } else fs.chmodSync(file, 0o644);
   await expect(resumeTaskSession(workspace, taskId, undefined, true)).rejects.toThrow("LEASE_CONTINUATION_INVALID");
+  expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
+});
+
+it.each(["missing", "different"])("state layer rejects %s host identity even with a private cache", async mode => {
+  await resumeTaskSession(workspace, taskId);
+  const before = fs.readFileSync(sessionLedgerFile(), "utf8");
+  vi.stubEnv("CODEX_THREAD_ID", mode === "missing" ? "" : "other-task");
+  await expect(resumeTaskSession(workspace, taskId, undefined, true)).rejects.toThrow("LEASE_HOST_IDENTITY_REQUIRED");
+  expect(sessionRecoveryGuidance("exact", current()).leaseStatus).toBe("ownership_unproven");
+  expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
+});
+
+it.each(["owner", "generation", "duplicate"])("rejects authoritative %s conflict without rewriting cache or ledger", async mode => {
+  await resumeTaskSession(workspace, taskId);
+  const ledger = JSON.parse(fs.readFileSync(sessionLedgerFile(), "utf8"));
+  if (mode === "owner") ledger.pool.entries[0].claimedBy.taskId = "other-task";
+  else if (mode === "generation") ledger.pool.entries[0].claimedBy.generation++;
+  else ledger.registries[0].tasks.push({ ...ledger.registries[0].tasks[0], taskId: "other-task" });
+  fs.writeFileSync(sessionLedgerFile(), JSON.stringify(ledger));
+  const before = fs.readFileSync(sessionLedgerFile(), "utf8"), cache = fs.readFileSync(continuationFile(taskId), "utf8");
+  const result = cli(["resume", "--recover-own"]);
+  expect(result.status).not.toBe(0);
+  expect(result.stdout + result.stderr).not.toContain(JSON.parse(cache).useId);
+  expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
+  expect(fs.readFileSync(continuationFile(taskId), "utf8")).toBe(cache);
+});
+
+it("restores a legacy lease without an optional assignment epoch or cache", async () => {
+  const { useId } = await resumeTaskSession(workspace, taskId);
+  fs.unlinkSync(continuationFile(taskId));
+  const ledger = JSON.parse(fs.readFileSync(sessionLedgerFile(), "utf8"));
+  delete ledger.pool.entries[0].assignmentEpoch;
+  fs.writeFileSync(sessionLedgerFile(), JSON.stringify(ledger));
+  const before = fs.readFileSync(sessionLedgerFile(), "utf8");
+  const result = cli(["resume", "--recover-own"]);
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ useId, leaseStatus: "own" });
+  expect(readContinuation(taskId)?.assignmentEpoch).toBe(1);
   expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
 });

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { describe, expect, it } from "vitest";
 const read = (p: string) => fs.readFileSync(p, "utf8").replace(/\r\n/g, "\n");
 const skill = read("skill/SKILL.md"), protocol = read("docs/protocol.md"), host = read("docs/host-control.md"), agents = read("AGENTS.md");
+const recoveryMatrix = read("docs/lease-recovery-matrix.md");
 // Instruction checks supplement real CLI/state tests; they do not prove model behavior.
 describe("unified ChatGPT-first Skill contract", () => {
   it("puts reasoning before recovery and keeps execution separate", () => {
@@ -18,12 +19,32 @@ describe("unified ChatGPT-first Skill contract", () => {
     ["own continuation", "resume --recover-own"],
     ["unavailable channel", "does not permit all reasoning to silently move to Codex"],
   ])("retains instruction routing for %s", (_scenario, rule) => expect(skill).toContain(rule));
-  it("requires lease proof and separates decisions from business permission", () => {
+  it("recovers this host task's lease from the authoritative binding", () => {
     for (const document of [skill, protocol, host]) for (const field of ["leaseStatus", "recoverable_own", "ownership_unproven", "conflict", "nextAction"]) expect(document).toContain(field);
     for (const document of [skill, protocol]) for (const field of ["coordinatorAction", "businessGate"]) expect(document).toContain(field);
-    for (const text of ["Never retrieve activeUse.useId from the ledger", "Read-only local, mem, and Gitea research is still reasoning", "does not prove another coordinator exists", "without acquiring a lease for pending readback or host preflight"]) expect(skill).toContain(text);
-    expect(skill).toContain("With no active lease this mode may safely acquire a new lease");
+    for (const document of [skill, protocol, host]) {
+      const normalized = document.replace(/\s+/g, " ");
+      expect(normalized).toContain("CODEX_THREAD_ID");
+      expect(normalized).toMatch(/unique (?:authoritative )?(?:ledger\/pool )?owner|unique authoritative (?:task|binding)/);
+      expect(normalized).toMatch(/cache[^.]*rebuild|rebuild[^.]*cache/i);
+    }
+    expect(agents).toContain("唯一权威绑定 owner");
+    expect(agents).toContain("可重建缓存");
+    for (const text of ["Never retrieve activeUse.useId from the ledger", "Read-only local, mem, and Gitea research is still reasoning", "without acquiring a lease for pending readback or host preflight"]) expect(skill).toContain(text);
+    for (const document of [skill, protocol, host, agents, read("README.md"), read("README.zh-CN.md")]) {
+      expect(document).not.toContain("active ledger lease has no matching private proof");
+      expect(document).not.toContain("requires the matching private proof");
+    }
+    expect(skill).toContain("When it returns prepare_boot_required, use session resume --recover-own to acquire this task's lease");
     expect(skill).not.toContain("Use --recover-own only when");
+  });
+  it("documents terminal conversation-limit recovery without weakening pending protection", () => {
+    for (const document of [skill, protocol, host]) {
+      for (const field of ["conversation_limit_reached", "terminalText", "chatReadAt", "observedAt", "sourceUrl", "60 seconds"]) expect(document).toContain(field);
+      expect(document).toContain("no pending");
+    }
+    expect(skill).toContain("Do not first send a message that is expected to fail");
+    expect(host).toContain("Do not intentionally send a message to provoke rejection");
   });
   it("keeps exact source receipts and read-only browser fallback", () => {
     for (const document of [skill, protocol]) for (const field of ["read_exact_chat_in_browser", "--bound-workspace", "--observed-reply-file"]) expect(document).toContain(field);
@@ -45,6 +66,7 @@ describe("unified ChatGPT-first Skill contract", () => {
   });
   it("retains fixed-pool eligibility and never forces a takeover", () => {
     expect(agents).toContain("固定复用现有 10 个 Chat");
+    expect(skill).toContain("If this task has no binding, or evidence confirms its exact binding is unusable");
     for (const field of ["lastUsedAt", "--reclaim-observations-file", "notLoaded", "inactiveStatus", "recheckReadAt", "receiptMessageId", "assignmentEpoch"]) expect(skill).toContain(field);
     for (const text of ["Never age out a long-lived lease", "Every individual read is within 60 seconds", "no rollout found", "Never clear another task's pending state or lease"]) expect(skill).toContain(text);
   });
@@ -73,5 +95,9 @@ describe("unified ChatGPT-first Skill contract", () => {
       expect(line).not.toContain("--use-id");
     }
     expect(section).toContain("--use-id <new-destination-use-id>");
+  });
+  it("labels acceptance-matrix real evidence as historical for this implementation", () => {
+    expect(recoveryMatrix).toContain("本轮按用户要求不做真实 Chat 往返验收");
+    expect(recoveryMatrix).toContain("不是本轮验收");
   });
 });

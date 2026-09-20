@@ -244,8 +244,8 @@ export function sessionRecoveryGuidance(
   const action = (nextAction: string, recoveryReason: string | null = null): SessionRecoveryGuidance =>
     ({ ...base, nextAction, recoveryReason });
   if (resolution === "ambiguous") return action("stop_manual_resolution", "ambiguous task binding");
-  if (leaseStatus === "recoverable_own") return action("recover_own_lease", "resume --recover-own restores the private task continuation");
-  if (leaseStatus === "ownership_unproven") return action("lease_ownership_unproven", "current caller has not proven possession of this lease; preserve it");
+  if (leaseStatus === "recoverable_own") return action("recover_own_lease", "resume --recover-own restores the owning host task lease and rebuilds its private cache");
+  if (leaseStatus === "ownership_unproven") return action("lease_ownership_unproven", "current caller lacks the owning CODEX_THREAD_ID or a verified use-id; preserve the lease");
   if (leaseStatus === "conflict") return action("lease_conflict", "provided continuation conflicts with the current lease; preserve it");
   if (resolution === "workspace_switch_required" && task?.pendingMessageId) {
     const source = sessionRecoveryGuidance("exact", task, useId, nowMs);
@@ -600,6 +600,8 @@ export interface AssignmentHistoryEntry {
   toTaskId?: string;
   toConversationId?: string;
   assignmentEpoch?: number;
+  /** The terminal evidence that justified replacing an unusable bound Chat. */
+  recoveryReason?: BoundRecoveryObservation["reason"];
   /** Audit snapshot retains receipts after the previous current owner is removed. */
   snapshot?: SavedTaskSession;
 }
@@ -646,26 +648,40 @@ export interface ClaimStandbyConversationOptions {
   recoveryObservation?: BoundRecoveryObservation;
 }
 
-export interface BoundRecoveryObservation {
+interface BoundRecoveryReceiptObservation {
   taskId: string;
   workspaceId: string;
   conversationId: string;
   generation: number;
   useId?: string;
-  failureCheckedAt: string;
-  routingCheckedAt: string;
   chatReadAt: string;
   observedAt: string;
-  hostRoutingChecked: true;
-  routingMode: "conversation_id_only";
   chatStatus: "idle";
   readbackClean: true;
   receiptIteration: number;
   receiptMessageId: string | null;
   receiptState: string | null;
   receiptReviewHead?: string;
+}
+
+/** Existing recovery proof following an explicit, correctly routed host rejection. */
+export interface HostRejectedBoundRecoveryObservation extends BoundRecoveryReceiptObservation {
+  failureCheckedAt: string;
+  routingCheckedAt: string;
+  hostRoutingChecked: true;
+  routingMode: "conversation_id_only";
   reason: "host_rejected";
 }
+
+/** Explicit terminal conversation-length evidence read from this exact Chat. */
+export interface ConversationLimitBoundRecoveryObservation extends BoundRecoveryReceiptObservation {
+  source: "host" | "browser";
+  sourceUrl?: string;
+  terminalText: string;
+  reason: "conversation_limit_reached";
+}
+
+export type BoundRecoveryObservation = HostRejectedBoundRecoveryObservation | ConversationLimitBoundRecoveryObservation;
 
 interface ReclaimObservationIdentity {
   conversationId: string;
@@ -1520,6 +1536,28 @@ function isFreshReclaimTimestamp(value: string, nowMs: number): boolean {
   return Number.isFinite(timestamp) && timestamp <= nowMs && nowMs - timestamp <= 60_000;
 }
 
+function isExplicitConversationLimitText(value: unknown): value is string {
+  if (!isExactNonEmptyString(value) || value.length > 512) return false;
+  const normalized = value.replace(/\byou've\b/giu, "you have");
+  if (/["'“”‘’`]/u.test(normalized) || /\b(?:says|said|reported|transcript|quote|quoted)\b/iu.test(normalized)) return false;
+  return /\b(?:this|the) (?:conversation|chat) is (?:too long|full)\b/iu.test(value) ||
+    /\b(?:this|the) (?:conversation|chat) (?:has )?reached (?:its |the )?(?:maximum length|length limit)\b/iu.test(value) ||
+    /\b(?:you(?:'ve| have) )?reached (?:the )?(?:maximum length|length limit) (?:for|of) (?:this |the )?(?:conversation|chat)\b/iu.test(value) ||
+    /(?:你已达到|您已达到|已达到).{0,12}(?:此对话|该对话|对话).{0,12}(?:长度上限|消息上限)|(?:此对话|该对话|对话)(?:已达到|已达|已满).{0,12}(?:长度上限|最大长度|消息上限)/u.test(value);
+}
+
+function isMatchingBoundChatUrl(value: unknown, conversationId: string): boolean {
+  if (!isExactNonEmptyString(value)) return false;
+  try {
+    const url = new URL(value);
+    const segments = url.pathname.split("/").filter(Boolean);
+    const exactConversationPath = segments.length >= 2 && segments[segments.length - 2] === "c" && segments[segments.length - 1] === conversationId;
+    return url.protocol === "https:" && url.port === "" && !url.username && !url.password && !url.hash &&
+      ["chatgpt.com", "chat.openai.com"].includes(url.hostname.toLowerCase()) &&
+      exactConversationPath;
+  } catch { return false; }
+}
+
 function hasValidReclaimIdentity(item: Record<string, unknown>): boolean {
   return [item.conversationId, item.workspaceId, item.taskId].every(isExactNonEmptyString) &&
     Number.isSafeInteger(item.generation) && (item.generation as number) >= 1 &&
@@ -1562,43 +1600,64 @@ export function validateReclaimObservations(value: unknown): ReclaimObservation[
 export function validateBoundRecoveryObservation(value: unknown): BoundRecoveryObservation {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("RECOVERY_OBSERVATION_INVALID: expected exact bound Chat evidence");
   const item = value as Record<string, unknown>;
-  if (![item.taskId, item.workspaceId, item.conversationId].every(isExactNonEmptyString) ||
-    !Number.isSafeInteger(item.generation) || (item.generation as number) < 1 ||
-    (item.useId !== undefined && (typeof item.useId !== "string" || !USE_ID_PATTERN.test(item.useId))) ||
-    ![item.failureCheckedAt, item.routingCheckedAt, item.chatReadAt, item.observedAt].every(isValidReclaimTimestamp) ||
-    item.hostRoutingChecked !== true || item.routingMode !== "conversation_id_only" ||
-    item.chatStatus !== "idle" || item.readbackClean !== true || item.reason !== "host_rejected" ||
-    !Number.isSafeInteger(item.receiptIteration) || (item.receiptIteration as number) < 0 ||
-    !(item.receiptMessageId === null || isExactNonEmptyString(item.receiptMessageId)) ||
-    !(item.receiptState === null || isExactNonEmptyString(item.receiptState)) ||
-    ((item.receiptMessageId === null) !== (item.receiptState === null)) ||
-    (item.receiptReviewHead !== undefined && !isExactNonEmptyString(item.receiptReviewHead))) {
-    throw new Error("RECOVERY_OBSERVATION_INVALID: verify host routing and read the exact idle Chat after explicit rejection");
+  const commonValid = [item.taskId, item.workspaceId, item.conversationId].every(isExactNonEmptyString) &&
+    Number.isSafeInteger(item.generation) && (item.generation as number) >= 1 &&
+    (item.useId === undefined || (typeof item.useId === "string" && USE_ID_PATTERN.test(item.useId))) &&
+    [item.chatReadAt, item.observedAt].every(isValidReclaimTimestamp) &&
+    item.chatStatus === "idle" && item.readbackClean === true &&
+    Number.isSafeInteger(item.receiptIteration) && (item.receiptIteration as number) >= 0 &&
+    (item.receiptMessageId === null || isExactNonEmptyString(item.receiptMessageId)) &&
+    (item.receiptState === null || isExactNonEmptyString(item.receiptState)) &&
+    ((item.receiptMessageId === null) === (item.receiptState === null)) &&
+    (item.receiptReviewHead === undefined || isExactNonEmptyString(item.receiptReviewHead));
+  if (!commonValid) {
+    throw new Error("RECOVERY_OBSERVATION_INVALID: verify exact task, Chat, generation, receipt, idle state, and fresh readback");
   }
-  return value as BoundRecoveryObservation;
+  if (item.reason === "host_rejected") {
+    if (![item.failureCheckedAt, item.routingCheckedAt].every(isValidReclaimTimestamp) ||
+      item.hostRoutingChecked !== true || item.routingMode !== "conversation_id_only") {
+      throw new Error("RECOVERY_OBSERVATION_INVALID: verify host routing and read the exact idle Chat after explicit rejection");
+    }
+    return value as HostRejectedBoundRecoveryObservation;
+  }
+  if (item.reason === "conversation_limit_reached" &&
+    (item.source === "host" || item.source === "browser") && isExplicitConversationLimitText(item.terminalText) &&
+    (item.source === "browser" ? isMatchingBoundChatUrl(item.sourceUrl, item.conversationId as string) : item.sourceUrl === undefined)) {
+    return value as ConversationLimitBoundRecoveryObservation;
+  }
+  throw new Error("RECOVERY_OBSERVATION_INVALID: read an explicit conversation-length limit from the exact bound Chat; a browser URL must match the conversation ID");
 }
 
 function assertBoundRecovery(task: SavedTaskSession | undefined, workspaceId: string, observation: BoundRecoveryObservation): void {
   if (!task || task.bindingState !== "bound" || task.taskId !== observation.taskId || workspaceId !== observation.workspaceId ||
     task.conversationId !== observation.conversationId || task.generation !== observation.generation ||
-    task.lastDeliveryCheckedAt !== observation.failureCheckedAt) throw new Error("RECOVERY_BINDING_CHANGED: reread the current binding and terminal failure");
+    (observation.reason === "host_rejected" && task.lastDeliveryCheckedAt !== observation.failureCheckedAt)) {
+    throw new Error("RECOVERY_BINDING_CHANGED: reread the current binding and terminal evidence");
+  }
   if (task.pendingMessageId || task.pendingIteration !== undefined || task.pendingDispatchUncertain || task.sendAcceptedAt ||
     task.deliveryPendingSince || task.activeUse?.useId !== observation.useId) {
     throw new Error("TASK_CHAT_BUSY: resolve the original receipt or prove lease ownership before recovery");
   }
-  if (task.channelState !== "degraded" || !task.lastDeliveryError?.startsWith("host_rejected:")) {
+  if (observation.reason === "host_rejected" && (task.channelState !== "degraded" || !task.lastDeliveryError?.startsWith("host_rejected:"))) {
     throw new Error("RECOVERY_NOT_REQUIRED: reuse the healthy binding; uncertain sends and read failures cannot authorize rotation");
+  }
+  if (observation.reason === "conversation_limit_reached" && task.channelState !== "ready" && task.channelState !== "degraded") {
+    throw new Error("RECOVERY_NOT_REQUIRED: resolve the current channel state before replacing this Chat");
   }
   if (observation.receiptIteration !== task.iteration || observation.receiptMessageId !== (task.lastDeliveredMessageId ?? null) ||
     observation.receiptState !== (task.lastState ?? null) || observation.receiptReviewHead !== task.lastReviewHead) {
     throw new Error("RECOVERY_BINDING_CHANGED: reread the exact Chat; completed receipt no longer matches the ledger");
   }
-  const times = [observation.routingCheckedAt, observation.failureCheckedAt, observation.chatReadAt, observation.observedAt];
+  const times = observation.reason === "host_rejected"
+    ? [observation.routingCheckedAt, observation.failureCheckedAt, observation.chatReadAt, observation.observedAt]
+    : [observation.chatReadAt, observation.observedAt];
   if (!times.every(time => isFreshReclaimTimestamp(time, Date.now()))) {
     throw new Error("RECLAIM_OBSERVATION_EXPIRED: refresh all host reads once before retrying");
   }
   if (times.some((time, index) => index > 0 && Date.parse(times[index - 1]) > Date.parse(time))) {
-    throw new Error("RECOVERY_OBSERVATION_INVALID: verify routing before a new rejection, then read the exact Chat");
+    throw new Error(observation.reason === "host_rejected"
+      ? "RECOVERY_OBSERVATION_INVALID: verify routing before a new rejection, then read the exact Chat"
+      : "RECOVERY_OBSERVATION_INVALID: read the terminal prompt from the exact Chat before recording the observation");
   }
 }
 
@@ -1746,9 +1805,11 @@ export async function claimStandbyConversation(
       }
       if (retiredPriorId && entry.id === retiredPriorId && entry.status === "claimed") {
         if (input.recoveryObservation) {
-          // Keep the fixed inventory; unavailable routing is not proof of deletion.
+          const recoveryReason = input.recoveryObservation.reason === "host_rejected"
+            ? "host rejected the correctly routed send" : "conversation reached length limit";
+          // Keep the fixed inventory; preserve the exact terminal reason for audit.
           return { ...entry, status: "quarantined" as const, claimedBy: undefined,
-            reason: "binding_recovered: host rejected the correctly routed send", assignmentEpoch: (entry.assignmentEpoch ?? 0) + 1 };
+            reason: `binding_recovered: ${recoveryReason}`, assignmentEpoch: (entry.assignmentEpoch ?? 0) + 1 };
         }
         return { ...entry, status: "retired" as const, retiredAt: now, reason: existing?.replacementReason ?? "replaced" };
       }
@@ -1782,19 +1843,20 @@ export async function claimStandbyConversation(
           toConversationId: task.conversationId, assignmentEpoch: claimed.assignmentEpoch }] : []),
         ...(input.recoveryObservation && existing ? [{ ...historyEntry(existing, workspaceId, "binding_recovered", now),
           snapshot: existing, toWorkspaceId: workspaceId, toTaskId: taskId, toConversationId: task.conversationId,
-          assignmentEpoch: claimed.assignmentEpoch }] : [])],
+          assignmentEpoch: claimed.assignmentEpoch, recoveryReason: input.recoveryObservation.reason }] : [])],
       savedAt: now,
     });
     if (input.recoveryObservation && existing?.activeUse && task.activeUse) {
-      // Ledger commit is authoritative. Refresh only an already proven private
-      // continuation; a crash here is recovered through the committed lineage.
+      // The committed ledger owns the lease. Cache repair is best-effort here;
+      // resume --recover-own can reconstruct it after an interrupted write.
       try {
-        const receipt = readContinuation(taskId);
-        if (receipt && receipt.stage !== "released" && continuationMatches(receipt, existing, workspaceId, ledger)) {
-          writeContinuation({ ...receipt, boundWorkspaceId: workspaceId, conversationId: task.conversationId,
-            generation: task.generation, assignmentEpoch: claimed.assignmentEpoch ?? 1, stage: "active", updatedAt: now });
-        }
-      } catch { /* preserve committed binding; resume validates the durable history */ }
+        const receipt = readContinuation(taskId, true);
+        writeContinuation({ version: 1, taskId, useId: task.activeUse.useId,
+          boundWorkspaceId: workspaceId, conversationId: task.conversationId,
+          generation: task.generation, assignmentEpoch: claimed.assignmentEpoch ?? 1,
+          createdAt: receipt?.useId === task.activeUse.useId ? receipt.createdAt : now,
+          stage: "active", updatedAt: now });
+      } catch { /* preserve committed binding; resume reports unsafe cache storage */ }
     }
     return { task, entry: claimed, reused: false };
   });
@@ -2208,32 +2270,31 @@ export async function switchTaskWorkspace(input: SwitchTaskWorkspaceOptions): Pr
   });
 }
 
-function continuationMatches(r: ContinuationReceipt, task: SavedTaskSession, workspaceId: string, ledger: SessionLedger): boolean {
-  const epoch = ledger.pool.entries.find(e => e.id === task.poolEntryId)?.assignmentEpoch ?? 1;
-  if (r.taskId !== task.taskId || r.useId !== task.activeUse?.useId) return false;
-  if (r.boundWorkspaceId === workspaceId && r.conversationId === task.conversationId && r.generation === task.generation && r.assignmentEpoch === epoch) return true;
-  // Only a unique committed binding-recovery transition may carry this same
-  // lease to a new Chat. History proves lineage, never independent authority.
-  return (ledger.assignmentHistory ?? []).filter(h => h.reason === "binding_recovered" &&
-    h.taskId === r.taskId && h.fromWorkspaceId === r.boundWorkspaceId && h.conversationId === r.conversationId &&
-    h.generation === r.generation && task.generation === r.generation + 1 &&
-    h.toTaskId === task.taskId && h.toWorkspaceId === workspaceId && h.toConversationId === task.conversationId &&
-    h.assignmentEpoch === epoch && h.snapshot?.taskId === r.taskId && h.snapshot.conversationId === r.conversationId &&
-    h.snapshot.generation === r.generation && h.snapshot.activeUse?.useId === r.useId &&
-    ledger.pool.entries.some(e => e.id === h.snapshot?.poolEntryId && e.status === "quarantined" &&
-      e.assignmentEpoch === r.assignmentEpoch + 1 && e.reason === "binding_recovered: host rejected the correctly routed send")).length === 1;
+/** Authoritative ownership is task-scoped; a private cache is never a second owner. */
+function assertContinuationOwner(ledger: SessionLedger, task: SavedTaskSession): void {
+  const owners = ledger.registries.flatMap(r => r.tasks.filter(t => t.bindingState === "bound" &&
+    (t.taskId === task.taskId || t.conversationId === task.conversationId)).map(t => ({ workspaceId: r.workspaceId, task: t })));
+  if (owners.length !== 1 || owners[0].task.taskId !== task.taskId ||
+    owners[0].task.conversationId !== task.conversationId || owners[0].task.generation !== task.generation ||
+    owners[0].task.activeUse?.useId !== task.activeUse?.useId) throw new Error("LEASE_BINDING_CONFLICT");
+  const entries = ledger.pool.entries.filter(e => e.conversationId === task.conversationId || e.id === task.poolEntryId);
+  if (task.poolEntryId && (entries.length !== 1 || entries[0].id !== task.poolEntryId ||
+    entries[0].conversationId !== task.conversationId || entries[0].status !== "claimed" ||
+    entries[0].claimedBy?.taskId !== task.taskId || entries[0].claimedBy?.workspaceId !== owners[0].workspaceId ||
+    entries[0].claimedBy?.generation !== task.generation ||
+    !Number.isSafeInteger(entries[0].assignmentEpoch ?? 1) || (entries[0].assignmentEpoch ?? 1) < 1)) {
+    throw new Error("LEASE_BINDING_CONFLICT");
+  }
+  if (!task.poolEntryId && entries.length) throw new Error("LEASE_BINDING_CONFLICT");
 }
 
 export function classifyTaskLease(task: SavedTaskSession | null, useId?: string): SessionRecoveryGuidance["leaseStatus"] {
   if (!task?.activeUse) return useId ? "conflict" : "none";
-  if (useId !== undefined) return task.activeUse.useId === useId ? "own" : "conflict";
-  try {
-    const r = readContinuation(task.taskId);
-    if (!r || r.stage === "released") return "ownership_unproven";
-    const binding = resolveTaskBinding(r.boundWorkspaceId, task.taskId);
-    return binding.boundWorkspaceId && binding.resolution !== "ambiguous" && continuationMatches(r, task, binding.boundWorkspaceId, readSessionLedger())
-      ? "recoverable_own" : "conflict";
-  } catch { return "ownership_unproven"; }
+  if (useId !== undefined && task.activeUse.useId !== useId) return "conflict";
+  if (useId === undefined && process.env.CODEX_THREAD_ID?.trim() !== task.taskId) return "ownership_unproven";
+  try { assertContinuationOwner(readSessionLedger(), task); }
+  catch { return "conflict"; }
+  return useId === undefined ? "recoverable_own" : "own";
 }
 
 /** Recoverable write-ahead lease acquisition under the session lock. */
@@ -2242,31 +2303,30 @@ export async function resumeTaskSession(workspaceIdInput: string, taskIdInput: s
   if (faultAt && process.env.VITEST !== "true") throw new Error("LEASE_FAULT_INJECTION_TEST_ONLY");
   return withWorkspaceLifecycleLock(SESSION_REGISTRY_LOCK_ID, async () => {
     const workspaceId = validateWorkspaceId(workspaceIdInput), taskId = validateTaskId(taskIdInput);
+    if (recoverOwn && process.env.CODEX_THREAD_ID?.trim() !== taskId) throw new Error("LEASE_HOST_IDENTITY_REQUIRED: recover-own requires the exact CODEX_THREAD_ID");
     const ledger = readSessionLedger();
     const owners = ledger.registries.flatMap(r => r.tasks.filter(t => t.taskId === taskId && t.bindingState === "bound").map(task => ({ registry: r, task })));
     if (owners.length !== 1 || owners[0].registry.workspaceId !== workspaceId) throw new Error("TASK_BINDING_AMBIGUOUS");
     const { registry, task: current } = owners[0];
+    assertContinuationOwner(ledger, current);
+    if (existingUseId !== undefined) assertTaskUse(current, existingUseId);
     const epoch = ledger.pool.entries.find(e => e.id === current.poolEntryId)?.assignmentEpoch ?? 1;
-    const receipt = readContinuation(taskId);
+    const receipt = readContinuation(taskId, recoverOwn || existingUseId !== undefined);
     const matches = (r: ContinuationReceipt) => r.taskId === taskId && r.boundWorkspaceId === workspaceId &&
       r.conversationId === current.conversationId && r.generation === current.generation && r.assignmentEpoch === epoch;
     let useId = existingUseId;
     if (useId !== undefined) {
       assertTaskUse(current, useId);
-      if (receipt && (receipt.stage === "released" || !continuationMatches(receipt, current, workspaceId, ledger))) throw new Error("LEASE_CONFLICT");
     }
     else if (current.activeUse) {
-      if (!recoverOwn) throw new Error("LEASE_OWNERSHIP_UNPROVEN: use resume --recover-own with a private continuation");
-      if (!receipt || receipt.stage === "released") throw new Error("LEASE_OWNERSHIP_UNPROVEN");
-      if (!continuationMatches(receipt, current, workspaceId, ledger)) throw new Error("LEASE_CONFLICT");
-      useId = receipt.useId;
+      if (!recoverOwn) throw new Error("LEASE_OWNERSHIP_UNPROVEN: use resume --recover-own from the owning host task");
+      useId = current.activeUse.useId;
     } else {
       if (recoverOwn && !canAcquireContinuationLease(sessionRecoveryGuidance("exact", current))) {
         throw new Error("LEASE_ACQUISITION_PHASE_BLOCKED");
       }
       if (taskIsBusy(current) && !canAcquireBootRecoveryLease(current)) throw new Error("TASK_CHAT_BUSY");
-      if (receipt?.stage === "prepared" && !matches(receipt)) throw new Error("LEASE_CONFLICT");
-      useId = receipt?.stage === "prepared" ? receipt.useId : `c2c_use_${randomUUID()}`;
+      useId = receipt?.stage === "prepared" && matches(receipt) ? receipt.useId : `c2c_use_${randomUUID()}`;
     }
     const now = new Date().toISOString();
     if (current.activeUse && receipt?.stage === "active" && matches(receipt) && receipt.useId === useId) return { ...current, useId };

@@ -30,11 +30,11 @@ Codex 按计划执行并回传证据，不重复整套探索。模板和送达�
 只有实际 mem 初始化成功才是 READY；DEGRADED 必须说明原因，不能声称缺失分析已完成。
 
 每次续接先运行 `session get`，然后严格跟随 `nextAction`。`get` 不返回租约 id。
-`leaseStatus=none` 时不一律先领取租约：旧 pending 可无租约读回；缺少预检时先按
-动作完成宿主探测和精确 Chat 读取。允许获取租约且当前无租约时，
-`session resume --recover-own` 安全获取并持久化新租约；`recoverable_own` 时恢复原租约。
-该命令不替换归属未证明的现有租约；`ownership_unproven` 不证明“另一个
-coordinator”占用，保留状态，不从账本复制 useId。
+真实 `CODEX_THREAD_ID` 与任务唯一权威绑定 owner 匹配时，
+`session resume --recover-own` 恢复同一个现有租约；缺失、过时或普通内容损坏的
+续接缓存由 CLI 根据账本重建。当前没有租约时仍按 `nextAction` 处理 pending 和无租约预检，
+只在后续动作需要时获取新租约。缓存缺失不表示“另一个 coordinator”占用。
+任务没有绑定或证据确认绑定失效时，从固定池选择最久未使用的安全会话。
 
 pending 必须先对账原消息；read_thread 可用时，即使发送工具缺失也继续读取，不重发、
 不换 Chat、不把本地只读分析当作 ChatGPT 分析。按 `coordinatorAction` 和
@@ -179,8 +179,9 @@ node bin/c2c.js transport -w <workspace> --mode openai --json
 旧版“三次读取缺失”留下的 `unavailable` 记录，先通过后台 `read_thread` 核对原 Chat；
 身份一致时使用 `session restore --confirm` 恢复原会话，避免额外消耗库存。
 
-每个 Codex 任务复用固定 10 个 Chat 中的一个当前绑定。健康绑定继续使用；库存都已分配时，
-按 `lastUsedAt` 从旧到新逐个核实，自动选择第一个安全候选。不要求用户增加备用 Chat。
+每个 Codex 任务复用固定 10 个 Chat 中的一个当前绑定。健康绑定自动续用；只有当前任务没有绑定，
+或有新鲜证据确认原 Chat 已无法继续时才轮换。按 `lastUsedAt` 从旧到新核实并选择首个安全候选；
+缺少续接缓存不代表 Chat 失效，也不要求用户增加备用 Chat。
 用户准备库存时选择非 Pro、思考强度“极高”，并发送一条只含 `C2C_STANDBY_READY` 的用户消息。
 编辑器可能保留为字面文本 `C2C\_STANDBY\_READY`；两种完整拼写都可识别。明确要求 Pro 时，
 只使用 `C2C_STANDBY_READY_PRO` 的库存 Chat。

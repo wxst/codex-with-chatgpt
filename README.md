@@ -26,13 +26,13 @@ actual mem initialization; DEGRADED needs a concrete reason and does not claim
 unavailable analysis occurred.
 
 At each continuation, run `session get` first. `get` never returns a lease id.
-Follow `nextAction`; recover the same task lease with `session resume --recover-own`
-only when required. `leaseStatus=none` does not mean “acquire first”: reconcile an
-old pending receipt or perform unleased host preflight when that is the next action.
-Unknown lease ownership is not evidence of another coordinator.
-When acquisition is permitted and no lease exists, `resume --recover-own` safely
-acquires and persists a new one; with an existing lease it must restore the same
-privately proven lease. It never replaces an unproven active lease.
+Follow `nextAction`. If the real `CODEX_THREAD_ID` owns this task's unique
+authoritative binding, `session resume --recover-own` restores the same active
+lease; a missing or stale private continuation cache is rebuilt from that verified
+ledger state. With no active lease, follow `nextAction` and acquire only when the
+next operation requires it. A missing cache does not mean another coordinator
+owns the task. If this task has no binding or evidence proves the binding unusable,
+choose the oldest safe candidate from the fixed pool.
 
 Pending messages stay with the coordinator. If read_thread is available, read and
 reconcile existing pending work even when sending is unavailable; do not resend,
@@ -201,12 +201,13 @@ For an old `unavailable` record from the former repeated-read-miss rule, first
 verify the exact Chat through background `read_thread`, then use `session
 restore --confirm` to retain that original conversation.
 
-Each task has one current Chat binding from the fixed ten-Chat pool. Keep a healthy
-binding. When unassigned stock is empty, inspect all candidates by oldest
-`lastUsedAt` and automatically take the first candidate proven safe. Do not ask
-for additional standby Chats. Standby markers are verified from exact user turns;
-an old owner by itself is not a busy state. Pool assignment and safe rotation are
-locked and retain ownership history.
+Each task has one current Chat binding from the fixed ten-Chat pool. Reuse a healthy
+binding automatically. Only a task with no binding or fresh evidence that its Chat
+is terminally unusable may rotate. Inspect candidates by oldest `lastUsedAt` and
+take the first proven-safe Chat; a missing continuation cache is not failure proof.
+Do not ask for additional standby Chats. Standby markers come from exact user
+turns, and an old owner by itself is not a busy state. Pool assignment and safe
+rotation are locked and retain ownership history.
 
 Before every pool claim, run the binding check. For a candidate owner in `notLoaded`
 state, require same-host immediate inactive snapshots before and after exact Chat

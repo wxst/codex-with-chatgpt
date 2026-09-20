@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { attachTaskRouteCapability, beginTaskSend, claimStandbyConversation, confirmTaskDelivery,
   confirmTaskReply, confirmTaskWorkspace, importStandbyConversation, newMessageId, readReclaimCandidates,
   readTaskSession, resumeTaskSession, sessionLedgerFile, validateReclaimObservations, failTaskDelivery,
@@ -58,7 +58,7 @@ beforeEach(async () => {
     markerText: "C2C_STANDBY_READY", markerMessageId: "marker", markerRole: "user" });
   await claim("old-owner"); await boot("old-owner");
 });
-afterEach(() => { cleanup(state); cleanup(workspace); });
+afterEach(() => { vi.unstubAllEnvs(); cleanup(state); cleanup(workspace); });
 
 it.each([true, false])("atomically rotates with same workspace=%s and invalidates the old route", async same => {
   const oldRoute = await issueRouteCapability({ workspaceId, taskId: "old-owner", conversationId: "rotation-chat" });
@@ -230,6 +230,21 @@ async function failedRequester(target = workspaceId, withLease = false): Promise
     receiptState: failed.lastState ?? null, receiptReviewHead: failed.lastReviewHead, reason: "host_rejected" };
 }
 
+async function conversationLimitRequester(target = workspaceId, withLease = false, source: "host" | "browser" = "browser"): Promise<BoundRecoveryObservation> {
+  await importStandbyConversation({ conversationId: "requester-chat", projectId: "g-p-rotation",
+    markerText: "C2C_STANDBY_READY", markerMessageId: "requester-marker", markerRole: "user" });
+  await claim("requester", target); await boot("requester", target);
+  const lease = withLease ? await resumeTaskSession(target, "requester") : undefined;
+  const task = readTaskSession(target, "requester")!;
+  const chatReadAt = new Date().toISOString();
+  return { taskId: "requester", workspaceId: target, conversationId: "requester-chat", generation: task.generation,
+    useId: lease?.useId, chatReadAt, observedAt: chatReadAt, chatStatus: "idle", readbackClean: true,
+    receiptIteration: task.iteration, receiptMessageId: task.lastDeliveredMessageId ?? null,
+    receiptState: task.lastState ?? null, receiptReviewHead: task.lastReviewHead,
+    source, ...(source === "browser" ? { sourceUrl: "https://chatgpt.com/c/requester-chat" } : {}),
+    terminalText: "你已达到此对话的长度上限", reason: "conversation_limit_reached" } as unknown as BoundRecoveryObservation;
+}
+
 const recover = (recoveryObservation: BoundRecoveryObservation, reclaimObservations = notLoadedObservationsFor()) =>
   claimStandbyConversation({ workspaceId: recoveryObservation.workspaceId, taskId: "requester", connectorName: "C2C",
     workspaceName: "repo", branch: "main", recoveryObservation, reclaimObservations });
@@ -278,6 +293,43 @@ it.each(["generation", "task", "workspace", "conversation", "failure", "expired"
     await expect(recover(evidence)).rejects.toThrow();
     expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
   });
+
+it.each(["browser", "host"] as const)("recovers a conversation-limit Chat from an exact %s observation without a prior rejected send", async source => {
+  vi.stubEnv("CODEX_THREAD_ID", "requester");
+  const evidence = await conversationLimitRequester(workspaceId, true, source);
+  const original = readTaskSession(workspaceId, "requester")!;
+  const before = JSON.parse(fs.readFileSync(sessionLedgerFile(), "utf8"));
+  const result = await recover(evidence);
+  const after = JSON.parse(fs.readFileSync(sessionLedgerFile(), "utf8"));
+
+  expect(result.task).toMatchObject({ taskId: "requester", conversationId: "rotation-chat", generation: original.generation + 1,
+    activeUse: original.activeUse, verificationState: "pending" });
+  expect(result.entry.status).toBe("claimed");
+  expect(after.pool.entries.find((entry: { conversationId: string }) => entry.conversationId === "requester-chat"))
+    .toMatchObject({ status: "quarantined", reason: "binding_recovered: conversation reached length limit" });
+  expect(after.assignmentHistory).toEqual(expect.arrayContaining([expect.objectContaining({
+    reason: "binding_recovered", recoveryReason: "conversation_limit_reached", taskId: "requester",
+    snapshot: expect.objectContaining({ conversationId: "requester-chat" }),
+  })]));
+  const resumed = await resumeTaskSession(workspaceId, "requester", undefined, true);
+  expect(resumed.useId).toBe(original.activeUse!.useId);
+  expect(fs.readFileSync(sessionLedgerFile(), "utf8")).not.toBe(JSON.stringify(before));
+});
+
+it.each([
+  { source: "browser", sourceUrl: "https://chatgpt.com/c/other-chat" },
+  { source: "browser", sourceUrl: "https://evilchatgpt.com/c/requester-chat" },
+  { source: "browser", sourceUrl: "https://chatgpt.com/g/requester-chat/c/other-chat" },
+  { terminalText: "页面暂时无法加载" },
+  { terminalText: "This conversation is not full." },
+  { terminalText: "The transcript says: ‘This conversation is full.’" },
+  { observedAt: new Date(Date.now() - 61_000).toISOString() },
+] as const)("rejects unsafe conversation-limit evidence %j without changing the binding", async patch => {
+  const evidence = { ...await conversationLimitRequester(), ...patch } as unknown as BoundRecoveryObservation;
+  const before = fs.readFileSync(sessionLedgerFile(), "utf8");
+  await expect(recover(evidence)).rejects.toThrow();
+  expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
+});
 
 it("keeps a healthy binding instead of rotating on plain claim", async () => {
   const before = fs.readFileSync(sessionLedgerFile(), "utf8");
@@ -336,9 +388,10 @@ it("rotates the oldest safe Chat in ten existing entries, skips busy owners, and
   withoutProof.assignmentHistory = withoutProof.assignmentHistory.filter((h: { reason: string }) => h.reason !== "binding_recovered");
   fs.writeFileSync(sessionLedgerFile(), JSON.stringify(withoutProof));
   const unproven = fs.readFileSync(sessionLedgerFile(), "utf8");
-  await expect(resumeTaskSession(workspaceId, "requester", undefined, true)).rejects.toThrow("LEASE_CONFLICT");
+  vi.stubEnv("CODEX_THREAD_ID", "requester");
+  const resumedWithoutHistory = await resumeTaskSession(workspaceId, "requester", undefined, true);
+  expect(resumedWithoutHistory.useId).toBe(current.activeUse!.useId);
   expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(unproven);
-  fs.writeFileSync(sessionLedgerFile(), committed);
   const continuation = await resumeTaskSession(workspaceId, "requester", undefined, true);
   expect(continuation.useId).toBe(current.activeUse!.useId);
   expect(continuation.generation).toBe(result.task.generation);

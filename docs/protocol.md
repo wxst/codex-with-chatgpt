@@ -172,12 +172,23 @@ The fixed inventory is reused automatically, with no request for extra standby
 Chats. Healthy exact bindings continue normally. For an unusable bound Chat,
 `session pool claim --recover-bound-file <UTF-8 JSON object>` combines current
 binding recovery evidence with `--reclaim-observations-file <candidate array>`.
-Only a correctly routed explicit host rejection, an idle Chat read, a matching
-generation/failure receipt, and no unresolved send or other coordinator lease
-permit replacement. The lock archives both displaced assignments with receipts
-and destinations, quarantines the unusable Chat without retiring inventory, and
-assigns the first eligible LRU candidate. Generation and assignment epochs fence
-concurrent recovery. The replacement requires BOOT and workspace confirmation.
+Replacement requires fresh terminal evidence for the current binding, no pending
+or uncertain send, and a complete safe-candidate observation set. The existing
+`host_rejected` evidence shape remains supported. A second reason,
+`conversation_limit_reached`, accepts the current task/workspace/conversation/
+generation and optional own lease, current receipt identity, `chatReadAt`,
+`observedAt`, `chatStatus:"idle"`, `readbackClean:true`, `source:"host"|"browser"`,
+and an explicit `terminalText` of 1–512 characters that identifies the ChatGPT
+conversation length limit. Browser evidence also requires `sourceUrl`: HTTPS on
+`chatgpt.com` or `chat.openai.com`, with the bound conversation id in its path;
+host evidence must omit the URL. It does not require an intentionally failed send
+or `host_rejected` proof. Reads and receipt must match the current binding and be
+no older than 60 seconds; the locked recheck also requires no active pending,
+uncertain send, or conflicting lease. The lock archives displaced assignments
+with receipts and destinations, quarantines the unusable Chat without retiring
+inventory, and assigns the first eligible LRU candidate. Generation and
+assignment epochs fence concurrent recovery. Replacement requires BOOT and
+workspace confirmation.
 
 ChatGPT `send_message_to_thread`/`read_thread` calls omit Codex `hostId` routing.
 `no rollout found` is a routing error to investigate, not deletion proof. Unknown
@@ -297,12 +308,15 @@ No body or route token is stored. Observations never confirm a receipt or resend
 `get`, `resume` and `host-control` use the same recovery decision. `leaseStatus` is
 one of `none`, `own`, `recoverable_own`, `ownership_unproven` or `conflict`.
 `get` never returns `useId`. A blocked command never reveals a lease id.
-`recoverable_own` means the private continuation receipt matches this host task,
-active ledger lease, unique binding, workspace, Chat, generation and assignment
-epoch. `ownership_unproven` means an active ledger lease has no matching proof;
-it does not establish that another coordinator holds it. `conflict` means a
-supplied identity conflicts with current state. Neither permits lease replacement
-or state-changing receipt commands.
+`recoverable_own` means the actual `CODEX_THREAD_ID` matches the unique
+authoritative task and pool owner for this active lease, workspace, Chat,
+generation and assignment epoch. The private continuation is a restricted cache,
+not a second ownership authority: absent, stale, or ordinary corrupt contents are
+reconstructed from the verified ledger under lock. `ownership_unproven` means the
+host task identity is absent or cannot be matched to a unique authoritative
+owner; it is never produced solely because the cache is missing. `conflict` means
+a supplied identity or authoritative binding/pool state conflicts with current
+state. None of these outcomes authorizes replacing another task's lease.
 
 For `leaseStatus=none`, follow `nextAction` without assuming lease acquisition is
 the first step. A legacy pending request may be read and confirmed without
@@ -310,30 +324,36 @@ the first step. A legacy pending request may be read and confirmed without
 only when the next allowed step is ready continuation or a lease-fenced send or
 preparation. For `recoverable_own`, call
 `session resume --recover-own`; this requires the actual `CODEX_THREAD_ID` and
-returns the existing `useId` only after verifying the private receipt. A known
-current lease may instead use `resume --use-id <known-own-id>`. Explicitly known
-legacy leases can enroll a private receipt only after exact task identity and
-binding validation. Never copy a use id from a ledger or blocked output.
+returns the existing `useId` after validating the unique ledger/pool binding. It
+rebuilds the private cache when ordinary contents are absent, stale, or corrupt.
+A known current lease may instead use `resume --use-id <known-own-id>`. Never copy
+a use id from a ledger or blocked output.
 
 `--recover-own` is the automatic task continuation entry, not a restore-only
 flag. With no active ledger lease it acquires and persists a new lease under the
 existing busy/preflight checks, or finishes a matching prepared transaction.
 After release it may acquire a fresh id; it never resurrects the released id.
-With an active lease it must prove the same private lease and never replace it.
+With an active lease owned by this host task's unique binding it restores the same
+lease and never replaces it. A missing cache cannot trigger fresh acquisition.
 Plain `resume` remains a compatible acquisition entry.
 
-The private receipt is outside the repository and has restricted permissions.
-It records task, use id, workspace, Chat, generation, assignment epoch, timestamps
+The private cache is outside the repository and has restricted permissions. It
+records task, use id, workspace, Chat, generation, assignment epoch, timestamps
 and recovery stage. Acquire/restore/release is serialized with the session ledger;
-interruption reuses the same use id. All state-changing receipt commands accept
+interruption reuses the same use id. Ordinary malformed cache contents can be
+rebuilt from verified ledger ownership. Symlinks, hard links, unsafe ACLs or other
+filesystem safety failures remain `LEASE_CONTINUATION_INVALID` storage errors;
+they are not lease-ownership diagnoses. All state-changing receipt commands accept
 `--use-id` and validate ownership under the same lock. `record-readback --use-id`
 may bind an observation that omits its use id; if both values are present they
 must match.
 
-One explicit `binding_recovered` path may carry the same task's lease across a
-one-hop generation/Chat recovery only when unique assignment history and the
-private continuation prove the source owner and lease. This is not a general
-transfer. Normal `switch-workspace` keeps the same Chat and requires releasing
+One explicit `binding_recovered` path may retain the same task's lease across a
+generation/Chat recovery when the actual host task identity and current unique
+authoritative owner still match. One-hop history is retained for audit, not used
+as an extra ownership gate. The private cache may be reconstructed for the
+recovered binding. This is not a general transfer. Normal `switch-workspace`
+keeps the same Chat and requires releasing
 the task's lease before migration. Pending/uncertain sends cannot use terminal
 binding recovery.
 

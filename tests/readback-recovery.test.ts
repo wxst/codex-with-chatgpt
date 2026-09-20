@@ -29,7 +29,7 @@ beforeEach(async () => {
   await recordTaskHostControl(workspace, taskId, { result: "read-ok", conversationId: chat, observedTaskId: taskId, observedWorkspaceId: workspace });
   messageId = newMessageId();
 });
-afterEach(() => { vi.useRealTimers(); cleanup(root); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); cleanup(root); });
 
 it("CLI readback uses its verified lease flag and rejects conflicting file credentials without writes", async () => {
   const { useId } = await resumeTaskSession(workspace, taskId);
@@ -112,6 +112,7 @@ it.each([
 });
 
 it("fences leases, future/expired and reordered reads, but accepts repeated observations", async () => {
+  vi.stubEnv("CODEX_THREAD_ID", taskId);
   const leased = await resumeTaskSession(workspace, taskId);
   await beginTaskSend(workspace, taskId, messageId, 0, { bootstrap: true, useId: leased.useId });
   const before = disk();

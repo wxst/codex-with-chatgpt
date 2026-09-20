@@ -22,17 +22,22 @@ export function continuationFile(taskId: string): string {
   return path.join(getStateDir(), "continuations", createHash("sha256").update(taskId).digest("hex") + ".json");
 }
 
-export function readContinuation(taskId: string): ContinuationReceipt | null {
+export function readContinuation(taskId: string, rebuildInvalidContent = false): ContinuationReceipt | null {
+  let secureFileRead = false;
+  let existingDirectory = false;
   const file = continuationFile(taskId);
   try {
     const directory = fs.lstatSync(path.dirname(file));
     if (!directory.isDirectory() || directory.isSymbolicLink() ||
       (process.platform !== "win32" && (directory.mode & 0o077) !== 0)) throw new Error();
+    existingDirectory = true;
     const stat = fs.lstatSync(file);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 ||
       (process.platform !== "win32" && (stat.mode & 0o077) !== 0)) throw new Error();
     assertPrivateWindowsAcl([path.dirname(file), file]);
-    const r = JSON.parse(fs.readFileSync(file, "utf8")) as ContinuationReceipt;
+    const content = fs.readFileSync(file, "utf8");
+    secureFileRead = true;
+    const r = JSON.parse(content) as ContinuationReceipt;
     if (r.version !== 1 || r.taskId !== taskId || !/^c2c_use_[0-9a-f-]{36}$/.test(r.useId) ||
       typeof r.boundWorkspaceId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(r.boundWorkspaceId) || typeof r.conversationId !== "string" || !r.conversationId.trim() ||
       !Number.isSafeInteger(r.generation) || r.generation < 1 ||
@@ -42,7 +47,14 @@ export function readContinuation(taskId: string): ContinuationReceipt | null {
       !["prepared", "active", "released"].includes(r.stage)) throw new Error();
     return r;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (existingDirectory) {
+        try { assertPrivateWindowsAcl([path.dirname(file)]); }
+        catch { throw new Error("LEASE_CONTINUATION_INVALID: private continuation directory is unsafe"); }
+      }
+      return null;
+    }
+    if (secureFileRead && rebuildInvalidContent) return null;
     throw new Error("LEASE_CONTINUATION_INVALID: private continuation is unreadable or invalid");
   }
 }
