@@ -154,6 +154,31 @@ describe("workspace lifecycle serialization", () => {
     }
   });
 
+  it.each([1, 2, 0])("bounds re-reads of a released zero-link ticket at path inspection %i", async inspection => {
+    isolateStateDir();
+    const workspace = makeWorkspace("lifecycle-released-path");
+    const realLstat = fs.lstatSync.bind(fs);
+    let reads = 0;
+    const lstat = vi.spyOn(fs, "lstatSync").mockImplementation(((target, options) => {
+      const stat = realLstat(target, options as { bigint: true });
+      if (String(target).endsWith(".ticket.json") && (options as { bigint?: boolean })?.bigint && (++reads === inspection || inspection === 0)) {
+        return { ...stat, nlink: 0n, isFile: () => true, isSymbolicLink: () => false } as fs.BigIntStats;
+      }
+      return stat;
+    }) as typeof fs.lstatSync);
+    try {
+      if (inspection === 0) {
+        await expect(acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 })).rejects.toThrow("released while being inspected");
+        expect(reads).toBe(9);
+        return;
+      }
+      const held = await acquireWorkspaceLifecycleLock(workspace.id, { timeoutMs: 1000, pollMs: 5 });
+      expect(reads).toBeGreaterThan(inspection);
+      expect(isWorkspaceLifecycleLockHeldBy(workspace.id, held.nonce)).toBe(true);
+      held.release();
+    } finally { lstat.mockRestore(); }
+  });
+
   it("fails closed when a ticket identity keeps changing during bounded re-reads", async () => {
     isolateStateDir();
     const workspace = makeWorkspace("lifecycle-persistent-ticket-rebind");

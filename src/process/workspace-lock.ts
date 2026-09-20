@@ -207,6 +207,11 @@ function readTicketEntryOnce(file: string): TicketEntry | null {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
+  // Linux can report an unlinked inode even during a pathname stat. Retry
+  // the path; never accept a zero-link snapshot as a live contender.
+  if (before.isFile() && !before.isSymbolicLink() && before.nlink === 0n) {
+    throw new LifecycleTicketChangedError(`Lifecycle ticket was released while being inspected: ${file}`);
+  }
   if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1n) {
     throw new Error(`Lifecycle ticket path is not a private regular file: ${file}`);
   }
@@ -247,6 +252,9 @@ function readTicketEntryOnce(file: string): TicketEntry | null {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
         throw error;
       }
+      if (current.isFile() && !current.isSymbolicLink() && current.nlink === 0n) {
+        throw new LifecycleTicketChangedError(`Lifecycle ticket was released while being inspected: ${file}`);
+      }
       if (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1n) {
         throw new Error(`Lifecycle ticket path is not a private regular file: ${file}`);
       }
@@ -266,6 +274,9 @@ function readTicketEntryOnce(file: string): TicketEntry | null {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
+  }
+  if (current.isFile() && !current.isSymbolicLink() && current.nlink === 0n) {
+    throw new LifecycleTicketChangedError(`Lifecycle ticket was released while being inspected: ${file}`);
   }
   if (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1n) {
     throw new Error(`Lifecycle ticket path is not a private regular file: ${file}`);
