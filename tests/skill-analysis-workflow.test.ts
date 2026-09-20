@@ -72,12 +72,31 @@ describe("unified ChatGPT-first Skill contract", () => {
   });
   it("retains authorized internal recovery and message-kind HEAD rules", () => {
     expect(skill).toContain("authorizes recovery of C2C state for this task");
-    expect(skill).toMatch(/\| BOOT \| prepare-boot \| Forbidden/);
+    expect(skill).toMatch(/\| BOOT request\/reply \| Forbidden\./);
+    expect(skill).toContain("Positive/continuing reply to review-bearing EXECUTED | Must match the requested head.");
     expect(protocol).toContain("BOOT_REVIEW_HEAD_FORBIDDEN");
     expect(host).toContain("legacy malformed BOOT");
     for (const document of [skill, protocol, host]) expect(document).toContain("review_head_clarification_required");
-    expect(skill).toContain("A wrong nonempty HEAD is an identity mismatch");
-    expect(skill).toContain("EXECUTED must echo the exact HEAD");
+    expect(skill).toContain("A wrong nonempty HEAD is always an identity mismatch");
+    expect(skill).toContain("Positive/continuing reply to review-bearing EXECUTED");
+  });
+  it("separates negative transport receipts from review approval", () => {
+    const docs = [skill, agents, protocol, host, read("README.md"), read("README.zh-CN.md")];
+    for (const document of docs) {
+      expect(document).toMatch(/BLOCKED[\s\S]{0,120}(?:ERROR|ERROR[\s\S]{0,120}BLOCKED)/i);
+      expect(document).toContain("assess_reply");
+      expect(document).toContain("lastReviewHead");
+    }
+    expect(skill).toContain("binding `verificationState=ready`");
+    for (const phrase of ["including legacy pending messages", "If the head is omitted, clear prior `lastReviewHead`", "Do not request a head clarification", "automatically re-PLAN", "same Chat remains reusable"]) expect(skill).toContain(phrase);
+    expect(skill).toContain("A wrong nonempty HEAD is always an identity mismatch");
+    expect(skill).toContain("INIT mem fields remain required");
+    expect(protocol).toContain("even if `REVIEW_HEAD` is omitted");
+    expect(protocol).toContain("`nextAction=resume_bound_chat`");
+    expect(protocol).toContain("`businessGate=assess_reply`");
+    expect(protocol).toContain("after ordinary lease/preflight requirements");
+    expect(host).toContain("without REVIEW_HEAD for every kind, including legacy pending");
+    expect(host).toContain("verificationState=ready");
   });
   it("uses private repeatable BOOT material and workspace confirmation", () => {
     for (const field of ["messageFile", "bodySha256", "sendAllowed", "not-invoked", "0700", "0600", "migration_workspace_confirmation_required", "workspace_info", "confirm-workspace"]) expect(skill).toContain(field);

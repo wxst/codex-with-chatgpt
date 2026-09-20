@@ -37,7 +37,7 @@ Business flow: ready → INIT → PLAN → execution → EXECUTED → PLAN / DON
 - Review-only stays review-only. Respect user restrictions on sharing task content.
 - An unavailable ChatGPT channel preserves the binding and pending state and is reported as an analysis-offload blocker. It does not permit all reasoning to silently move to Codex. Read-only local, mem, and Gitea research is still reasoning, not a blanket exception. Continue only independent, fully specified work the user authorized. Never claim ChatGPT analysis or acceptance without its observed reply.
 
-These exceptions do not waive host preflight, receipt readback, binding ownership, pending responsibility, or the exact REVIEW_HEAD contract. Do not force replanning when the user already supplied a complete plan. A cross-file impact question still needs ChatGPT analysis before execution.
+These exceptions do not waive host preflight, receipt readback, binding ownership, pending responsibility, or the message-specific REVIEW_HEAD rules below. Do not force replanning when the user already supplied a complete plan. A cross-file impact question still needs ChatGPT analysis before execution.
 
 ## Continuation and lease recovery
 
@@ -232,14 +232,16 @@ Read-source order:
 
 CLI-generated task/workspace/message ids and iteration are authoritative. Never hard-code an iteration or reuse an old message id. Keep control messages under 1 KB.
 
-| Kind | Prepare/send | REVIEW_HEAD | Purpose |
-| --- | --- | --- | --- |
-| BOOT | prepare-boot | Forbidden | Verify the route and workspace only. |
-| INIT | prepare-init | Include if the request is review-bearing. | Initialize mem and request analysis. |
-| ANALYSIS | begin-send --kind analysis | Include the same requested HEAD for review or clarification. | Request missing analysis; does not claim execution. |
-| EXECUTED | begin-send --kind executed | Exact required HEAD for review-bearing work. | Report actual execution and evidence. |
+| Message or reply | REVIEW_HEAD | Confirmation and next action |
+| --- | --- | --- |
+| BOOT request/reply | Forbidden. | Match all receipt identities. BOOT DONE verifies connection only; confirm the actual target `workspace_info` before ready. |
+| Positive/continuing reply to review-bearing INIT or ANALYSIS | Must match the requested head. | If identity, STATE, and required INIT mem fields match but the head is omitted, confirm transport only and follow `review_head_clarification_required` with a separate exact-head ANALYSIS. |
+| Positive/continuing reply to review-bearing EXECUTED | Must match the requested head. | Missing or wrong head is rejected; there is no omission exception. |
+| Negative `STATE: BLOCKED` or `STATE: ERROR` for any business kind, including legacy pending messages | Omission is allowed for transport confirmation; a nonempty head must still match. | Only when binding `verificationState=ready`, confirm the matching transport receipt. Task/workspace/iteration/message identity and existing INIT mem fields remain required. If the head is omitted, clear prior `lastReviewHead`; do not infer a head or approval. After normal lease and preflight requirements, `nextAction` returns to `resume_bound_chat` and `businessGate=assess_reply`; the same Chat remains reusable. Honor any ordinary next action first. Do not request a head clarification, automatically re-PLAN, or rotate it. |
 
-For a review-bearing INIT or ANALYSIS, if all identity fields, STATE, and required INIT mem fields match but the actual assistant reply omits REVIEW_HEAD, confirm only that transport receipt. Follow review_head_clarification_required, refresh preflight, and send a new exact-head ANALYSIS clarification. Do not rewrite the reply, resend INIT, or send EXECUTED until an exact matching clarification reply arrives. A wrong nonempty HEAD is an identity mismatch. A review-bearing EXECUTED must echo the exact HEAD; it does not use the omission exception.
+The negative-reply exception applies only to a matching `BLOCKED` or `ERROR` response; it does not approve work, satisfy a review, or alter the normal head requirement for other replies. A wrong nonempty HEAD is always an identity mismatch. Confirm the reply's actual transport receipt before assessing its business meaning.
+
+To recover an already-pending negative reply, reread the exact original assistant body in the bound Chat and refresh `record-readback` if its observation is stale. Then call `confirm-reply` for the same message id and iteration with the actual `BLOCKED`/`ERROR` state and exact observed body. If the body has no head, omit `--observed-review-head`; never copy the requested or previous head into the observation. This internal receipt repair needs no user approval and does not send BOOT, resend the pending request, or rotate the Chat. After confirmation, still follow normal lease and preflight guidance; the negative reply adds no new recovery gate.
 
 For a weak PLAN, confirm its valid reply first, then send a separate `ANALYSIS`. For real execution results, send `EXECUTED` only after the current-generation INIT was confirmed. Use actual task, workspace, iteration, generation, message id, results, and evidence paths. Never copy an earlier message identity. The following scripts are editable templates: replace quoted sample result/evidence text with observed facts, and set `$reviewBearing`/`$reviewHead` only from the actual review request.
 
@@ -413,7 +415,7 @@ On Windows the managed runtime uses CurrentUser DPAPI tunnel-runtime-key.dpapi a
 
 ## Evidence and completion
 
-Confirm a reply only from its exact message id and iteration, task/workspace identity, STATE, required REVIEW_HEAD, and INIT mem fields. Send acceptance is not delivery; delivery is not reply; reply receipt is not useful analysis; useful PLAN is not business completion. Report observed tool evidence separately from executor reports, tests, CI, and deployment.
+Confirm a reply only from its exact message id and iteration, task/workspace identity, STATE, the reply-table REVIEW_HEAD rule, and required INIT mem fields. A matching negative reply confirms transport only and leaves the business blocker for `assess_reply`; it is not review approval or task completion. Send acceptance is not delivery; delivery is not reply; reply receipt is not useful analysis; useful PLAN is not business completion. Report observed tool evidence separately from executor reports, tests, CI, and deployment.
 
 Finish only when this task has no pending message. Check ready binding, released own lease, no pool expansion, and unchanged other task bindings. If blocked, report what was observed, what remains unknown, the pending identity, the last real read time, and the next safe recovery action.
 

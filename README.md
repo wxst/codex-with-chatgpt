@@ -39,8 +39,16 @@ reconcile existing pending work even when sending is unavailable; do not resend,
 rotate the Chat, or let local read-only research replace required ChatGPT analysis.
 Follow `coordinatorAction` and `businessGate`. The CLI does not poll in the
 background. A matching but weak PLAN is confirmed as a receipt, then supplemented
-with `--kind analysis`. A review-bearing INIT/ANALYSIS reply that omits
-`REVIEW_HEAD` follows `review_head_clarification_required`; never fabricate it.
+with `--kind analysis`. Once binding verification is ready, a matching
+`BLOCKED`/`ERROR` may confirm transport without `REVIEW_HEAD` for any business
+kind, including legacy pending; INIT mem and identity checks remain. It is not
+approval: an omitted head clears stale `lastReviewHead` and goes to
+`assess_reply` without automatic re-PLAN or Chat rotation. A wrong nonempty head
+is rejected. Other positive review replies follow the normal exact-head or
+clarification rules in the Skill. For an existing pending negative reply, reread
+the exact original response and confirm the same message id/iteration; missing
+heads are omitted, never synthesized. This receipt repair needs no user approval,
+BOOT, resend, or Chat replacement.
 
 Simple deterministic work may run directly only when no exploration, design, or
 diagnosis is needed. With a complete user plan, request only code mapping or gap

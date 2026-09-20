@@ -328,7 +328,9 @@ export function sessionRecoveryGuidance(
       "matching INIT or ANALYSIS receipt omitted its required REVIEW_HEAD; send one exact-head STATE: ANALYSIS clarification after preflight, never resend the original message"),
       businessGate: "assess_reply" };
   }
-  return { ...action("resume_bound_chat"), businessGate: task.verificationState === "pending" ? "await_boot" : "assess_reply" };
+  return { ...action("resume_bound_chat", task.lastState === "BLOCKED" || task.lastState === "ERROR"
+    ? "negative reply received; reuse this Chat and assess the reported business blocker; this receipt is not review approval"
+    : null), businessGate: task.verificationState === "pending" ? "await_boot" : "assess_reply" };
 }
 
 /** Acquiring a new lease must not fence off an earlier recovery action. */
@@ -3143,10 +3145,16 @@ export async function confirmTaskReply(
     // omits its required review echo. Acknowledge that transport receipt instead
     // of leaving it permanently pending, then fence execution to one new,
     // exact-head ANALYSIS request. A non-empty wrong head remains unsafe.
-    const reviewHeadClarificationRequired = task.verificationState === "ready" &&
+    // A negative business reply proves receipt, never approval of a commit.
+    // Missing HEAD must not strand an already answered request. Keep explicit
+    // mismatches strict and never carry an older approval head into this reply.
+    const negativeBusinessReply = task.verificationState === "ready" &&
+      (normalizedState === "BLOCKED" || normalizedState === "ERROR");
+    const negativeReplyMissingHead = negativeBusinessReply && observedReviewHead === undefined;
+    const reviewHeadClarificationRequired = !negativeBusinessReply && task.verificationState === "ready" &&
       task.pendingReviewHead !== undefined && observedReviewHead === undefined &&
       (task.pendingMessageKind === "init" || task.pendingMessageKind === "analysis");
-    if (task.pendingReviewHead && !legacyMalformedBootstrap && !reviewHeadClarificationRequired && observedReviewHead !== task.pendingReviewHead) {
+    if (task.pendingReviewHead && !legacyMalformedBootstrap && !negativeReplyMissingHead && !reviewHeadClarificationRequired && observedReviewHead !== task.pendingReviewHead) {
       throw new Error("REVIEW_HEAD_MISMATCH");
     }
     if (task.pendingMessageKind !== "init" && observedMemory !== undefined) {
@@ -3164,8 +3172,9 @@ export async function confirmTaskReply(
       lastReplyEvidence: observedReplyDigest ? { sha256: observedReplyDigest, source: read!.source ?? "host",
         sourceUrl: read!.sourceUrl, readAt: read!.readAt, messageId: id, generation: task.generation } : undefined,
       bootReplyGeneration: task.verificationState === "pending" && normalizedState === "DONE" ? task.generation : task.bootReplyGeneration,
-      lastReviewHead: legacyMalformedBootstrap || reviewHeadClarificationRequired ? task.lastReviewHead : task.pendingReviewHead,
-      reviewHeadClarification: reviewHeadClarificationRequired ? {
+      lastReviewHead: negativeBusinessReply ? (task.pendingReviewHead ? observedReviewHead : undefined) :
+        legacyMalformedBootstrap || reviewHeadClarificationRequired ? task.lastReviewHead : task.pendingReviewHead,
+      reviewHeadClarification: negativeBusinessReply ? undefined : reviewHeadClarificationRequired ? {
         generation: task.generation,
         expectedReviewHead: task.pendingReviewHead!,
         sourceMessageId: id,

@@ -41,10 +41,14 @@ pending 必须先对账原消息；read_thread 可用时，即使发送工具缺
 `businessGate` 处理，CLI 不会后台轮询。弱 PLAN 确认回执后用 `--kind analysis` 补充。
 通道阻塞时保留绑定并报告，不默认将全部思考交回 Codex。
 
-带 `REVIEW_HEAD` 的 INIT 或 ANALYSIS 回复若四项回执身份匹配但漏回 HEAD，先确认其实际
-传输回执，再遵循 `review_head_clarification_required`：刷新预检、发送带同一 HEAD 的
-ANALYSIS 补充请求。不得填造 HEAD、重发 INIT 或发送 EXECUTED；只有补充回复精确回显后
-才能继续。
+绑定 `verificationState=ready` 后，身份匹配的 `BLOCKED`/`ERROR` 回复可为所有业务消息
+（包括旧 pending）确认传输，即使漏回 `REVIEW_HEAD`；任务身份和 INIT 的 mem 字段仍必须匹配。
+漏回会清除旧 `lastReviewHead`，不代表批准，并进入 `assess_reply`；不自动追问、重新 PLAN 或轮换
+可用 Chat。错误的非空 HEAD 一律拒绝。
+其他正向审核回复按 Skill 的统一回复表执行：review-bearing INIT/ANALYSIS 漏 HEAD 才走
+`review_head_clarification_required`；审核型 EXECUTED 仍须精确 HEAD。
+已有 pending 时重读原 Chat 回复，并用相同 message id/iteration 确认；缺失 HEAD 不填造。
+这是内部回执修复，不需要用户授权，不发 BOOT、不重发、不换 Chat。
 
 ## 本轮安装试用范围
 

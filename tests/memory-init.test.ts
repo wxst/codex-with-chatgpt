@@ -17,11 +17,15 @@ import {
   sessionLedgerFile,
   sessionRecoveryGuidance,
   switchTaskWorkspace,
+  resumeTaskSession,
+  recordTaskReadback,
 } from "../src/session/state.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
 
+import { Workspace } from "../src/workspace/manager.js";
+
 let root: string;
-const workspace = "mem-workspace";
+const workspace = new Workspace(process.cwd()).id;
 const taskId = "mem-task";
 const chat = "mem-chat";
 const input = {
@@ -212,4 +216,102 @@ it("accepts only UTF-8 JSON through prepare-init and carries the generated recei
   expect(executed.status).not.toBe(0);
   expect(executed.stdout + executed.stderr).toContain("BUSINESS_MESSAGE_KIND_REQUIRED");
   expect(cli("begin-send", "--task-id", cliTask, "--message-id", newMessageId(), "--iteration", "2", "--kind", "executed", "--json").status).toBe(0);
+});
+
+const negativeCases = (["init", "analysis", "executed", undefined] as const)
+  .flatMap(kind => (["BLOCKED", "ERROR"] as const).map(state => ({ kind, state })));
+it.each(negativeCases)("acknowledges $kind $state without a head as a negative receipt, never review approval", async ({ kind, state }) => {
+  const head = "b".repeat(40), oldHead = "a".repeat(40);
+  const memory = { project: input.memoryProject, status: "ready" as const, sources: ["memory_start_task"] };
+  let message: string;
+  if (kind === "init") {
+    const init = await prepareTaskInit(workspace, taskId, input, { reviewHead: head });
+    message = init.messageId;
+    await confirmTaskDelivery(workspace, taskId, message, init.messageDigest);
+  } else {
+    const init = await prepareTaskInit(workspace, taskId, input, { reviewHead: oldHead });
+    await confirmTaskDelivery(workspace, taskId, init.messageId, init.messageDigest);
+    await confirmTaskReply(workspace, taskId, init.messageId, "PLAN", oldHead, memory);
+    message = newMessageId();
+    await beginTaskSend(workspace, taskId, message, 2, { messageKind: kind, reviewHead: head });
+    await confirmTaskDelivery(workspace, taskId, message);
+  }
+  const before = fs.readFileSync(sessionLedgerFile(), "utf8");
+  await expect(confirmTaskReply(workspace, taskId, message, state, "c".repeat(40), kind === "init" ? memory : undefined)).rejects.toThrow("REVIEW_HEAD_MISMATCH");
+  expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
+  const receipt = await confirmTaskReply(workspace, taskId, message, state, undefined, kind === "init" ? memory : undefined);
+  expect(receipt).toMatchObject({ conversationId: chat, generation: 1, channelState: "ready", lastState: state });
+  expect(receipt.pendingMessageId).toBeUndefined();
+  expect(receipt.lastReviewHead).toBeUndefined();
+  expect(receipt.reviewHeadClarification).toBeUndefined();
+  await recordTaskHostControl(workspace, taskId, { result: "probe", tools: ["read_thread", "send_message_to_thread"] });
+  const ready = await recordTaskHostControl(workspace, taskId, { result: "read-ok", conversationId: chat, observedTaskId: taskId, observedWorkspaceId: workspace });
+  expect(sessionRecoveryGuidance("exact", ready)).toMatchObject({ nextAction: "resume_bound_chat", businessGate: "assess_reply" });
+  const followup = await beginTaskSend(workspace, taskId, newMessageId(), receipt.iteration + 1, { messageKind: "analysis", reviewHead: head });
+  expect(followup.conversationId).toBe(chat);
+});
+
+it("CLI confirms an exact blocked EXECUTED body, then releases and reuses the same Chat", async () => {
+  const cli = (...args: string[]) => spawnSync(process.execPath, ["--import", "tsx/esm", "src/cli/index.ts", "session", ...args, "--json"],
+    { encoding: "utf8", windowsHide: true, env: { ...process.env, CODEX_THREAD_ID: taskId, C2C_INTERNAL_STATE_DIR: "test" } });
+  const head = "d".repeat(40);
+  const init = await prepareTaskInit(workspace, taskId, input);
+  await confirmTaskDelivery(workspace, taskId, init.messageId, init.messageDigest);
+  await confirmTaskReply(workspace, taskId, init.messageId, "PLAN", undefined, { project: input.memoryProject, status: "ready", sources: ["memory_start_task"] });
+  const { useId } = await resumeTaskSession(workspace, taskId);
+  const message = newMessageId();
+  await beginTaskSend(workspace, taskId, message, 2, { messageKind: "executed", reviewHead: head, useId });
+  await confirmTaskDelivery(workspace, taskId, message, undefined, useId);
+  const body = `TASK_ID: ${taskId}\nWORKSPACE_ID: ${workspace}\nITERATION: 2\nMESSAGE_ID: ${message}\nSTATE: BLOCKED\nMissing deployment permission.`;
+  const reply = path.join(root, "blocked-reply.txt"); fs.writeFileSync(reply, body);
+  await recordTaskReadback(workspace, taskId, { taskId, workspaceId: workspace, conversationId: chat, generation: 1,
+    assignmentEpoch: 1, messageId: message, iteration: 2, readAt: new Date().toISOString(), result: "reply_visible",
+    source: "browser", sourceUrl: readTaskSession(workspace, taskId)!.url, useId });
+  const args = ["--message-id", message, "--use-id", useId, "--observed-task-id", taskId,
+    "--observed-workspace-id", workspace, "--observed-iteration", "2", "--observed-reply-file", reply];
+  const before = fs.readFileSync(sessionLedgerFile(), "utf8");
+  expect(cli("confirm-reply", ...args, "--state", "DONE").status).not.toBe(0);
+  expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
+  const confirmed = cli("confirm-reply", ...args, "--state", "BLOCKED");
+  expect(confirmed.status, confirmed.stderr).toBe(0);
+  expect(JSON.parse(confirmed.stdout).task).toMatchObject({ lastState: "BLOCKED", channelState: "ready", conversationId: chat });
+  expect(readTaskSession(workspace, taskId)?.lastReplyEvidence?.source).toBe("browser");
+  expect(cli("finish", "--use-id", useId).status).toBe(0);
+  await recordTaskHostControl(workspace, taskId, { result: "probe", tools: ["read_thread", "send_message_to_thread"] });
+  await recordTaskHostControl(workspace, taskId, { result: "read-ok", conversationId: chat, observedTaskId: taskId, observedWorkspaceId: workspace });
+  const resumed = cli("resume", "--recover-own");
+  expect(resumed.status, resumed.stderr).toBe(0);
+  const next = JSON.parse(resumed.stdout);
+  expect(next).toMatchObject({ conversationId: chat, nextAction: "resume_bound_chat", businessGate: "assess_reply" });
+  expect(cli("finish", "--use-id", next.useId).status).toBe(0);
+  const task = readTaskSession(workspace, taskId)!;
+  expect(task.pendingMessageId).toBeUndefined(); expect(task.activeUse).toBeUndefined();
+});
+
+it.each(["PLAN", "DONE"])("keeps positive EXECUTED %s fenced when the review head is missing", async state => {
+  const init = await prepareTaskInit(workspace, taskId, input);
+  await confirmTaskDelivery(workspace, taskId, init.messageId, init.messageDigest);
+  await confirmTaskReply(workspace, taskId, init.messageId, "PLAN", undefined, { project: input.memoryProject, status: "ready", sources: ["memory_start_task"] });
+  const message = newMessageId();
+  await beginTaskSend(workspace, taskId, message, 2, { messageKind: "executed", reviewHead: "e".repeat(40) });
+  await confirmTaskDelivery(workspace, taskId, message);
+  const before = fs.readFileSync(sessionLedgerFile(), "utf8");
+  await expect(confirmTaskReply(workspace, taskId, message, state)).rejects.toThrow("REVIEW_HEAD_MISMATCH");
+  expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(before);
+});
+
+it("ends a HEAD clarification when the exact reply reports a real blocker without inventing approval", async () => {
+  const head = "f".repeat(40);
+  const init = await prepareTaskInit(workspace, taskId, input, { reviewHead: head });
+  await confirmTaskDelivery(workspace, taskId, init.messageId, init.messageDigest);
+  await expect(confirmTaskReply(workspace, taskId, init.messageId, "BLOCKED")).rejects.toThrow("MEMORY_REPLY_OBSERVATION_REQUIRED");
+  await confirmTaskReply(workspace, taskId, init.messageId, "PLAN", undefined, { project: input.memoryProject, status: "ready", sources: ["memory_start_task"] });
+  const followup = newMessageId();
+  await beginTaskSend(workspace, taskId, followup, 2, { messageKind: "analysis", reviewHead: head });
+  await confirmTaskDelivery(workspace, taskId, followup);
+  const blocked = await confirmTaskReply(workspace, taskId, followup, "BLOCKED");
+  expect(blocked.reviewHeadClarification).toBeUndefined();
+  expect(blocked.lastReviewHead).toBeUndefined();
+  expect(blocked.lastState).toBe("BLOCKED");
+  expect(blocked.pendingMessageId).toBeUndefined();
 });

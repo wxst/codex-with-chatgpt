@@ -385,13 +385,27 @@ Use executed only to report actual execution. Business exemptions do not abandon
 already-sent messages or authorize dependent work before the needed reply.
 MEMORY_STATUS READY alone does not prove tools ran; acceptance needs tool evidence.
 
-If a review-bearing generated INIT or ANALYSIS has matching receipt and required
-memory fields but its observed assistant body omits `REVIEW_HEAD`, confirm that
-actual transport receipt without inventing a value. The binding records
-`review_head_clarification_required`; its original head is not promoted as observed
-review evidence. After fresh preflight, send a new exact-head `STATE: ANALYSIS`
-clarification. Do not rewrite the body, resend INIT, or reserve EXECUTED until a
-matching clarification reply echoes the expected head.
+Reply handling uses the single message/reply table in the source Skill. A matching
+`STATE: BLOCKED` or `STATE: ERROR` for INIT, ANALYSIS, or EXECUTED, including a
+legacy pending message, may confirm transport only when binding
+`verificationState` is `ready` and its task/workspace/iteration/message identity
+and existing INIT mem fields match, even if `REVIEW_HEAD` is omitted. An omitted
+head clears the previous `lastReviewHead`; it never supplies review approval or a
+value inferred from the request. A nonempty wrong head remains
+`REVIEW_HEAD_MISMATCH`. The shared decision keeps
+after ordinary lease/preflight requirements, `nextAction=resume_bound_chat`,
+`businessGate=assess_reply`, and `recoveryReason` identifies the negative receipt;
+the same Chat remains reusable. Honor any ordinary next action first. This reply
+adds no head-specific gate, clarification, automatic re-PLAN, or Chat rotation.
+For an existing pending negative response, reread the exact original Chat body,
+refresh its readback observation when stale, and `confirm-reply` the same message
+id/iteration using its actual BLOCKED/ERROR body. Omit `--observed-review-head` if
+the body omits the field; never insert the requested or previous head. This internal
+receipt repair needs no user approval, BOOT, resend, or Chat replacement.
+For positive/continuing review-bearing INIT or ANALYSIS replies, an
+omitted head still records transport only and sets
+`review_head_clarification_required`; positive review-bearing EXECUTED still
+requires the exact head. BOOT and INIT identity/memory requirements are unchanged.
 
 
 BOOT must not carry `REVIEW_HEAD`. `prepare-boot` has no review-head option and

@@ -18,7 +18,7 @@
 - 新 BOOT 只能用 prepare-boot。私有 messageFile 是 JSON；只在内存中读取并发送 body 字段，不输出材料或 token。发送不确定时先对账；只有证明发送工具从未调用且重新预检，才能恢复同一预留。
 - BOOT 回复后必须实际调用 workspace_info 并确认目标 workspace 才可进入 ready。迁移使用同一 Chat 和绑定；源 pending 先对账。已完成 BOOT 后不要重复发送。
 - 每个新业务 INIT、Chat 轮换后及 workspace 迁移后，都用 prepare-init 初始化 ChatGPT mem。ChatGPT 首先调用 memory_start_task；按需 memory_search、codewiki_*、只读 gitea_*；C2C 八个只读工具是当前工作区的最终依据。未经另行授权，不调用记忆或 Gitea 写接口。
-- INIT/ANALYSIS 遗漏 REVIEW_HEAD 的可接受情形只确认真实传输回执，再按 Skill 发送同 HEAD 的 ANALYSIS 澄清；错误非空 HEAD 不可忽略。EXECUTED 审核必须回显精确 HEAD。
+- 按 Skill 的统一回复表处理 REVIEW_HEAD。verificationState=ready 且身份匹配的 BLOCKED/ERROR 可在缺 HEAD 时确认传输回执；INIT 的 mem 字段仍必需。已有 pending 时重读原 Chat 正文，以同一 message/iteration 调 confirm-reply；缺 HEAD 就省略观察参数，不能填入请求或旧 HEAD。此内部修复无需用户授权，不发 BOOT、不重发、不轮换；遗漏不代表审批，清除旧 lastReviewHead 后以 resume_bound_chat / assess_reply 处理。错误非空 HEAD 一律拒绝；其他审核回复及 EXECUTED 仍遵循精确 HEAD 要求。
 - C2C 回执、宿主读回、同任务租约恢复、迁移握手及固定池安全轮换属于本任务的内部恢复。不得修改其他任务的租约/pending，也不因此获得发布、部署、重启、凭据或清理权限。
 - C2C 阻塞不会自动授权本地完整分析；只能交错执行用户已授权、明确独立且不依赖待回回复的步骤。结束时确认本任务无 pending、租约已释放、Chat 池未扩容，并检查其他绑定未被本任务改变。
 
