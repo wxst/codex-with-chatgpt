@@ -44,7 +44,7 @@ function currentWindowsSid(): string {
 }
 
 /** Restrict sensitive material to the current user and SYSTEM. */
-function hardenWindowsAcl(target: string, directory: boolean): void {
+export function hardenWindowsAcl(target: string, directory: boolean): void {
   const sid = currentWindowsSid();
   const inheritance = directory ? "(OI)(CI)F" : "F";
   const result = spawnSync("icacls.exe", [target, "/inheritance:r", "/grant:r",
@@ -53,6 +53,25 @@ function hardenWindowsAcl(target: string, directory: boolean): void {
   if (result.status !== 0) {
     throw new Error(`BOOT_MATERIAL_PERMISSION_FAILED: icacls rejected private material (${(result.stderr || result.stdout).trim().slice(0, 160)})`);
   }
+  const prune = `$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; ` +
+    `$p='${target.replace(/'/g, "''")}'; $acl=if([IO.Directory]::Exists($p)){[IO.Directory]::GetAccessControl($p)}else{[IO.File]::GetAccessControl($p)}; ` +
+    `foreach($rule in @($acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]))){ ` +
+    `if($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -ne $sid -and $rule.IdentityReference.Value -ne 'S-1-5-18'){ & icacls.exe $p /remove:g ('*'+$rule.IdentityReference.Value) | Out-Null; if($LASTEXITCODE -ne 0){exit 1} } }`;
+  try { execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", prune], { windowsHide: true, stdio: "ignore" }); }
+  catch { throw new Error("PRIVATE_MATERIAL_PERMISSION_INVALID"); }
+  assertPrivateWindowsAcl(target);
+}
+
+/** Fail closed if explicit grants survived ACL hardening. Read-only check. */
+export function assertPrivateWindowsAcl(target: string | string[]): void {
+  if (process.platform !== "win32") return;
+  const targets = (Array.isArray(target) ? target : [target]).map(p => `'${p.replace(/'/g, "''")}'`).join(",");
+  const command = `$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; ` +
+    `$ErrorActionPreference='Stop'; foreach($p in @(${targets})){ $acl=if([IO.Directory]::Exists($p)){[IO.Directory]::GetAccessControl($p)}else{[IO.File]::GetAccessControl($p)}; ` +
+    `$bad=@($acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -ne $sid -and $_.IdentityReference.Value -ne 'S-1-5-18' }); ` +
+    `if($bad.Count -gt 0){exit 1} }`;
+  try { execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], { windowsHide: true, stdio: "ignore" }); }
+  catch { throw new Error("PRIVATE_MATERIAL_PERMISSION_INVALID"); }
 }
 
 function ensurePrivateDirectory(): string {

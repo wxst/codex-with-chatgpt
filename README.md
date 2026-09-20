@@ -10,52 +10,44 @@ update path. The ChatGPT-facing MCP surface is read-only.
 
 ## Daily use: delegate reasoning first
 
-Use ChatGPT subscription capacity to reduce Codex quota spent on repository
-exploration, design alternatives, root-cause analysis, test design, and review.
-Codex checks scope and connection readiness, then delegates substantive analysis
-before implementing; it retains execution ownership and necessary judgment.
+Use ChatGPT subscription capacity for repository exploration, planning, root-cause
+analysis, test design, and review. Codex checks scope and connection, then follows
+`ready → INIT → PLAN → execution → EXECUTED → PLAN / DONE / BLOCKED`. BOOT DONE
+proves connection only. A useful PLAN cites source evidence and gives actions,
+tests, and success criteria; Codex executes it and returns results without repeating
+the full exploration. See the [Skill](skill/SKILL.md#daily-reasoning-workflow).
 
-Follow `ready → INIT → PLAN → execution → EXECUTED → PLAN / DONE / BLOCKED`.
-BOOT DONE proves connection readiness only. A useful PLAN gives source evidence,
-actions, tests, and success criteria. Codex executes it and sends concise results
-and evidence locations back for the next analysis or review, without repeating
-the entire investigation locally. The [Skill](skill/SKILL.md#daily-reasoning-workflow)
-contains the INIT and EXECUTED templates and exact delivery procedure.
+Every new business task, pool rotation, or workspace migration requires a generated
+`prepare-init` request. ChatGPT first calls `memory_start_task`, uses
+`memory_search` for specific missing history, then read-only `codewiki_*` and
+`gitea_*` for Gitea facts when relevant. The eight read-only C2C tools are final
+authority for the current workspace, diff, and execution records. READY requires
+actual mem initialization; DEGRADED needs a concrete reason and does not claim
+unavailable analysis occurred.
 
-Every business INIT is generated and reserved through `c2c session prepare-init
---input-file <UTF-8 JSON> --json`; agents send its returned message unchanged.
-It makes ChatGPT call `memory_start_task` first with project memory and rules,
-then `memory_search` for needed history. Gitea tasks may use read-only
-`codewiki_*` and `gitea_*` tools for Wiki and remote facts. The eight read-only
-C2C MCP tools remain final authority for the local workspace, uncommitted diff,
-and execution records. The INIT receipt records `READY` only after mem starts;
-an explained `DEGRADED` result continues from C2C evidence. A new Chat, binding
-generation, or workspace migration always requires a fresh INIT before EXECUTED.
+At each continuation, run `session get` first. `get` never returns a lease id.
+Follow `nextAction`; recover the same task lease with `session resume --recover-own`
+only when required. `leaseStatus=none` does not mean “acquire first”: reconcile an
+old pending receipt or perform unleased host preflight when that is the next action.
+Unknown lease ownership is not evidence of another coordinator.
+When acquisition is permitted and no lease exists, `resume --recover-own` safely
+acquires and persists a new one; with an existing lease it must restore the same
+privately proven lease. It never replaces an unproven active lease.
 
-Simple deterministic work (for example, a trivial typo edit) can run directly only
-when no exploration, design, or diagnosis is needed. A mechanical cross-file rename
-with unresolved impact still needs analysis. For a complete user plan, request only
-necessary code mapping and gap analysis; review-only requests remain review-only.
-Respect restrictions on external sharing. An unavailable channel preserves the
-binding and receipts and is reported as an offload blocker, not implicit permission
-to move all reasoning to Codex. Already specified, independently authorized work
-can continue. Neither a BOOT receipt nor a keyword test proves reasoning delegation
-or a measured quota saving.
+Pending messages stay with the coordinator. If read_thread is available, read and
+reconcile existing pending work even when sending is unavailable; do not resend,
+rotate the Chat, or let local read-only research replace required ChatGPT analysis.
+Follow `coordinatorAction` and `businessGate`. The CLI does not poll in the
+background. A matching but weak PLAN is confirmed as a receipt, then supplemented
+with `--kind analysis`. A review-bearing INIT/ANALYSIS reply that omits
+`REVIEW_HEAD` follows `review_head_clarification_required`; never fabricate it.
 
-Pending receipts remain the coordinator's active responsibility. Follow CLI
-`coordinatorAction` and `readbackDueAt` through read/record/confirm, using
-`resume --use-id` to continue the same lease and `--use-id` on every receipt command.
-`businessGate` distinguishes BOOT, planning and review waits; local read-only
-investigation is not an automatic fallback. Independent specified work must not
-delay due reads. Diagnose persistent observation gaps, record `observation_blocked`
-with concrete evidence, and resume the same request when reading is restored.
-Use `--kind analysis` for follow-up reasoning after a weak PLAN, not a fabricated
-EXECUTED. The CLI provides decisions; it does not poll Chat in the background.
-If a review-bearing INIT or ANALYSIS reply matches its receipt but omits
-`REVIEW_HEAD`, record that transport receipt and follow
-`review_head_clarification_required`: refresh preflight, send an exact-head
-ANALYSIS clarification, and do not fabricate the head, retry INIT, or send
-EXECUTED until the clarification is confirmed.
+Simple deterministic work may run directly only when no exploration, design, or
+diagnosis is needed. With a complete user plan, request only code mapping or gap
+analysis; review-only stays review-only. A blocked channel preserves pending and
+binding state; it is not permission to move all reasoning to Codex. Only
+independent, fully specified, user-authorized work may overlap without delaying a
+due read. Keyword tests do not prove actual reasoning delegation or quota savings.
 
 ## Installation-trial scope
 
@@ -209,31 +201,29 @@ For an old `unavailable` record from the former repeated-read-miss rule, first
 verify the exact Chat through background `read_thread`, then use `session
 restore --confirm` to retain that original conversation.
 
-Every Codex task permanently claims one ordinary Chat from the global
-**Codex-with-ChatGPT** Project. Users prepare stock Chats at non-Pro xhigh and
-send one user message containing exactly `C2C_STANDBY_READY`. ChatGPT's composer
-may preserve it as literal `C2C\_STANDBY\_READY`; both complete spellings are
-recognized. An explicitly Pro task uses a separate `C2C_STANDBY_READY_PRO` Chat.
+Each task has one current Chat binding from the fixed ten-Chat pool. Keep a healthy
+binding. When unassigned stock is empty, inspect all candidates by oldest
+`lastUsedAt` and automatically take the first candidate proven safe. Do not ask
+for additional standby Chats. Standby markers are verified from exact user turns;
+an old owner by itself is not a busy state. Pool assignment and safe rotation are
+locked and retain ownership history.
 
-The Skill synchronizes stock before every pool claim with Codex App background
-`list_threads` and `read_thread`, imports each exact user marker with `session
-pool import --marker-text`, then uses `session pool claim`. Claims are FIFO and
-globally locked; inventory and task ownership are committed in one atomic ledger;
-title guesses, recent conversations, and cross-task reuse are
-excluded. Empty stock returns `POOL_EXHAUSTED` before task content is sent.
+Before every pool claim, run the binding check. For a candidate owner in `notLoaded`
+state, require same-host immediate inactive snapshots before and after exact Chat
+readback, the same completed latest turn, a clean matching receipt, and fresh
+timestamps for every read. A bare `notLoaded` is not proof of inactivity.
+Pending, uncertain, leased, active, or unreadable Chats are never reclaimed.
+Report every actual candidate reason before saying the pool is blocked.
 
 Claim and workspace migration only establish the binding. After host preflight,
-`session prepare-boot --expected-generation <n> --json` creates or resumes one
-recoverable BOOT transaction. Its ordinary JSON is token-free and returns only
-identity, message metadata, digest, next action, and a private body-file path.
-The complete BOOT body contains `C2C_ROUTE_TOKEN` only inside that private file;
-read it in memory solely to send the exact bound Chat. Windows files permit only
-the current user and SYSTEM; Unix uses `0700`/`0600`. Repeated calls preserve the
-same body, capability, message ID, and iteration. A pending or uncertain send is
-read back, never resent. Every one of the eight MCP calls then includes
-`route_token`, resolved only to its bound workspace. Normal Chat control uses
-only `list_threads`, `send_message_to_thread`, and `read_thread`, with readback
-receipts before state advances.
+`session prepare-boot --expected-generation <n>` creates or resumes one private
+BOOT transaction. Its ordinary JSON contains no token or body. The private
+messageFile is a JSON object; read it only in memory, validate its identity and
+digest, and send only its `body` property to the exact bound Chat. Windows files
+permit only the current user and SYSTEM; Unix uses `0700`/`0600`. Repeated calls
+preserve the same preparation and message identity. Pending or uncertain sends
+are read back, never resent. The eight MCP calls require `route_token` resolved
+only to the bound workspace.
 
 If host readback omits a reply already visible on the web, shared guidance returns
 `read_exact_chat_in_browser`. Codex reads only the exact `chatUrl`, records browser

@@ -60,6 +60,9 @@ See the [Skill templates](../skill/SKILL.md#normal-control-loop). Documentation
 tests prove instruction presence; real acceptance requires observed source reads,
 a substantive response, exact same-Chat receipts, and normal lease release.
 
+For the lease recovery counterexamples and test coverage matrix, see
+[lease-recovery-matrix.md](lease-recovery-matrix.md).
+
 Control plane: Codex App background tools `list_threads → read_thread →
 send_message_to_thread`.
 
@@ -289,25 +292,69 @@ and useId remain unknown when absent. Observations must be within 60 seconds,
 match the lock-protected current binding/message/lease and never regress in time.
 No body or route token is stored. Observations never confirm a receipt or resend.
 
-`get`, `resume` and `host-control` share recovery precedence: workspace resolution,
-coordinator lease and missing tools, pending delivery/reply, migration, normal
-continuation. Normal pending actions are delivery_readback_required and
-reply_readback_required; migration action names remain compatible. Outputs include
-waitingMs (null for unknown legacy start), nextReadInMs and diagnosticRequired.
-With no pending, expired or missing preflight returns probe_then_read_bound_chat.
-Send only after reservation exits successfully and returns the matching identity;
-a failed reservation never authorizes a host send. Pass the held use-id to get
-and host-control so lease guidance distinguishes the current coordinator.
-`resume --use-id` idempotently validates the existing lease under lock, including
-pending and expired preflight, without changing its start time or acquiring another.
-Absent/wrong/stale lease IDs cannot advance an owned receipt. All receipt commands
-accept --use-id and check ownership in the same lock as their state transition.
-Unleased historical bindings remain supported. Never recover another coordinator's
-lease by reading it from the ledger; preserve ownership across interruption.
-Temporary read failures retain sending/awaiting_reply. Legacy degraded pending
-records recover their phase from the registered delivery receipt. Continuation
-must reconcile pending before any new send. Only explicit terminal evidence uses
-fail-delivery; inability to observe is a resumable blocker, never resend authority.
+### Lease ownership and recovery
+
+`get`, `resume` and `host-control` use the same recovery decision. `leaseStatus` is
+one of `none`, `own`, `recoverable_own`, `ownership_unproven` or `conflict`.
+`get` never returns `useId`. A blocked command never reveals a lease id.
+`recoverable_own` means the private continuation receipt matches this host task,
+active ledger lease, unique binding, workspace, Chat, generation and assignment
+epoch. `ownership_unproven` means an active ledger lease has no matching proof;
+it does not establish that another coordinator holds it. `conflict` means a
+supplied identity conflicts with current state. Neither permits lease replacement
+or state-changing receipt commands.
+
+For `leaseStatus=none`, follow `nextAction` without assuming lease acquisition is
+the first step. A legacy pending request may be read and confirmed without
+`--use-id`. Probe/read preflight without a lease when guidance requires it. Acquire
+only when the next allowed step is ready continuation or a lease-fenced send or
+preparation. For `recoverable_own`, call
+`session resume --recover-own`; this requires the actual `CODEX_THREAD_ID` and
+returns the existing `useId` only after verifying the private receipt. A known
+current lease may instead use `resume --use-id <known-own-id>`. Explicitly known
+legacy leases can enroll a private receipt only after exact task identity and
+binding validation. Never copy a use id from a ledger or blocked output.
+
+`--recover-own` is the automatic task continuation entry, not a restore-only
+flag. With no active ledger lease it acquires and persists a new lease under the
+existing busy/preflight checks, or finishes a matching prepared transaction.
+After release it may acquire a fresh id; it never resurrects the released id.
+With an active lease it must prove the same private lease and never replace it.
+Plain `resume` remains a compatible acquisition entry.
+
+The private receipt is outside the repository and has restricted permissions.
+It records task, use id, workspace, Chat, generation, assignment epoch, timestamps
+and recovery stage. Acquire/restore/release is serialized with the session ledger;
+interruption reuses the same use id. All state-changing receipt commands accept
+`--use-id` and validate ownership under the same lock. `record-readback --use-id`
+may bind an observation that omits its use id; if both values are present they
+must match.
+
+One explicit `binding_recovered` path may carry the same task's lease across a
+one-hop generation/Chat recovery only when unique assignment history and the
+private continuation prove the source owner and lease. This is not a general
+transfer. Normal `switch-workspace` keeps the same Chat and requires releasing
+the task's lease before migration. Pending/uncertain sends cannot use terminal
+binding recovery.
+
+Recovery order is: resolve task identity and binding; recover or classify the
+lease; restore only the host capability needed for the current action; reconcile
+any pending request; then migrate, prepare BOOT, confirm workspace, or continue
+business. If `send_message_to_thread` is missing but `read_thread` works, the
+coordinator may still read and reconcile pending. Missing send capability blocks
+new sends, not available reads. If reading is unavailable, no receipt can be
+confirmed. Temporary read failures retain sending/awaiting_reply. Legacy
+degraded pending records recover their phase from registered delivery evidence.
+Only explicit terminal evidence uses fail-delivery; observation failure never
+authorizes resend.
+
+`nextAction` names the current phase, `coordinatorAction` selects read/wait/
+confirm/diagnose within it, and `businessGate` marks dependent work that must wait.
+Do not recompute a competing action by combining these fields. With no pending,
+expired preflight returns `probe_then_read_bound_chat`. A send still requires a
+successful reservation with matching identity. Documentation tests prove wording,
+not model behavior; real acceptance requires same-Chat reads, matching receipts,
+and normal lease release.
 
 Matching PLAN receipts and substantive analysis are separate: confirm the receipt,
 then require code evidence/actions/tests/success criteria or request supplementation.
@@ -357,11 +404,14 @@ separate route capabilities.
 
 ## Read-source priority
 
-- GitHub connector: committed code, Issues, PRs, history.
-- mem/OpenDeepWiki: Gitea Wiki, architecture, project structure.
-- C2C MCP: current local files, status, diff, tests, unpushed changes.
-
-Current local C2C data wins on conflicts.
+1. ChatGPT first calls `memory_start_task` for project memory, rules and document
+   context. It uses `memory_search` for a specific missing historical fact.
+2. For Gitea, use read-only `codewiki_*` and `gitea_*` tools for Wiki, repository
+   structure, Issues, commits and current remote facts. Use an available
+   read-only GitHub connector for GitHub-hosted remote facts when applicable.
+3. Use the eight read-only C2C MCP tools for the current local workspace,
+   uncommitted diff and execution records. C2C is final authority for current
+   local state when sources conflict.
 
 ## Workspace migration preflight
 
@@ -391,8 +441,11 @@ or increment generation. A source receipt without `REVIEW_HEAD` is valid when th
 registered receipt omitted it; plain HEAD is never substituted.
 
 Workspace binding resolution wins over migration substate. A command run from the
-old or another workspace returns `switch_workspace` before any migration action
-when no pending exists. A unique source binding with pending first returns
+old or another workspace returns `release_own_lease_before_workspace_switch` when
+a verified own lease exists and no pending remains. Execute the fenced
+`finish --bound-workspace --use-id <verified-own-id>` transition, then get again;
+only with no active lease does it return `switch_workspace`. No new lease may be
+acquired before switching. A unique source binding with pending first returns
 `reconcile_source_pending`; it must complete normal receipts before switching.
 Likewise, `tools_missing` returns `restore_host_tools_then_read_bound_chat`; the
 coordinator restores the exact read/send tools before attempting source readback or

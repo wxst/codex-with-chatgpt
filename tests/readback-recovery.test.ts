@@ -31,6 +31,21 @@ beforeEach(async () => {
 });
 afterEach(() => { vi.useRealTimers(); cleanup(root); });
 
+it("CLI readback uses its verified lease flag and rejects conflicting file credentials without writes", async () => {
+  const { useId } = await resumeTaskSession(workspace, taskId);
+  await beginTaskSend(workspace, taskId, messageId, 0, { bootstrap: true, useId });
+  const file = path.join(root, "readback.json");
+  fs.writeFileSync(file, JSON.stringify(observation()));
+  const accepted = cli("record-readback", "--observation-file", file, "--use-id", useId);
+  expect(accepted.status).toBe(0);
+  expect(JSON.parse(accepted.stdout)).toMatchObject({ ok: true, leaseStatus: "own", nextAction: "delivery_readback_required" });
+  expect(current().readbackObservation?.useId).toBe(useId);
+  fs.writeFileSync(file, JSON.stringify(observation({ useId: "c2c_use_00000000-0000-4000-8000-000000000000" })));
+  const before = disk();
+  expect(cli("record-readback", "--observation-file", file, "--use-id", useId).status).not.toBe(0);
+  expect(disk()).toBe(before);
+});
+
 it("refreshes expired preflight only before a new send, never instead of pending readback", async () => {
   const task = current();
   const later = Date.parse(task.hostControl!.checkedAt) + 60_001;
@@ -112,8 +127,8 @@ it("fences leases, future/expired and reordered reads, but accepts repeated obse
   const after = disk();
   await expect(recordTaskReadback(workspace, taskId, { ...o, readAt: new Date(Date.parse(o.readAt) - 1).toISOString() })).rejects.toThrow("STALE");
   expect(disk()).toBe(after);
-  expect(sessionRecoveryGuidance("exact", current()).nextAction).toBe("wait_for_coordinator_lease");
-  expect(sessionRecoveryGuidance("workspace_switch_required", current()).nextAction).toBe("wait_for_coordinator_lease");
+  expect(sessionRecoveryGuidance("exact", current()).nextAction).toBe("recover_own_lease");
+  expect(sessionRecoveryGuidance("workspace_switch_required", current()).nextAction).toBe("recover_own_lease");
   expect(sessionRecoveryGuidance("workspace_switch_required", current(), leased.useId).nextAction).toBe("reconcile_source_pending");
   expect(sessionRecoveryGuidance("exact", current(), leased.useId).nextAction).toBe("delivery_readback_required");
 });

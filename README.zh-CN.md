@@ -16,35 +16,30 @@ ChatGPT 能看到的 MCP 接口始终只读。
 
 ## 日常使用：先交给 ChatGPT 分析
 
-pending 是协调者必须持续完成的工作，不能汇报“待回读”后转为本地分析。
-按 CLI 的 `coordinatorAction`、`readbackDueAt` 读取、记录和确认，使用
-`resume --use-id` 续用同一租约，所有回执命令携带自己的 `--use-id`。
-`businessGate` 分开 BOOT、规划和复核等待；已明确的独立工作不能拖延到期读回。
-长期观察缺口须诊断并记录有具体原因的 `observation_blocked`，恢复后继续同一消息。
-弱 PLAN 确认后使用 `--kind analysis` 补充分析，不伪造 EXECUTED。CLI 不会后台代为轮询。
-
 利用 ChatGPT 订阅额度承担代码探索、方案比较、根因分析、测试设计和复核，
-减少 Codex 在这些环节的额度消耗。Codex 先检查任务范围与连接状态，再把实质
-分析交给 ChatGPT；Codex 保留执行权和必要判断，不先完成整套分析再请求复核。
+减少 Codex 在这些环节的额度消耗。Codex 检查任务范围和连接后，按
+`ready → INIT → PLAN → execution → EXECUTED → PLAN / DONE / BLOCKED` 工作。
+BOOT DONE 只证明连接；有效 PLAN 必须有源码依据、行动、测试和成功标准。
+Codex 按计划执行并回传证据，不重复整套探索。模板和送达步骤见
+[Skill](skill/SKILL.md#daily-reasoning-workflow)。
 
-流程为 `ready → INIT → PLAN → execution → EXECUTED → PLAN / DONE / BLOCKED`。
-BOOT 的 DONE 仅表示连接就绪。有效 PLAN 应包含源码依据、行动、测试和成功标准；
-Codex 据此执行，再回传简短结果及证据位置，由 ChatGPT 继续分析或复核。
-具体模板与送达步骤见 [Skill](skill/SKILL.md#daily-reasoning-workflow)。
+每个新业务任务、Chat 轮换后及 workspace 迁移后，都必须由
+`session prepare-init --input-file <UTF-8 JSON>` 生成 INIT。ChatGPT 首先调用
+`memory_start_task`，需要历史时用 `memory_search`；Gitea 工作按需用只读
+`codewiki_*`、`gitea_*`。八个只读 C2C MCP 工具是当前工作区、diff 和执行记录的最终依据。
+只有实际 mem 初始化成功才是 READY；DEGRADED 必须说明原因，不能声称缺失分析已完成。
 
-每个业务 INIT 都必须由 `c2c session prepare-init --input-file <UTF-8 JSON>
---json` 生成并原子预留，agent 只能原样发送其返回的 message。它要求 ChatGPT 首先
-调用 `memory_start_task` 获取项目记忆和规则，再按需用 `memory_search` 补充历史。Gitea
-任务可使用只读 `codewiki_*`、`gitea_*` 工具读取 Wiki 和远端事实。八个只读 C2C MCP
-工具仍是当前本地工作区、未提交 diff 和执行记录的最终依据。只有实际启动 mem 才记录
-`READY`；有具体原因的 `DEGRADED` 继续以 C2C 证据工作。Chat、binding generation 或
-workspace 迁移后，必须重新 INIT 才能发送 EXECUTED。
+每次续接先运行 `session get`，然后严格跟随 `nextAction`。`get` 不返回租约 id。
+`leaseStatus=none` 时不一律先领取租约：旧 pending 可无租约读回；缺少预检时先按
+动作完成宿主探测和精确 Chat 读取。允许获取租约且当前无租约时，
+`session resume --recover-own` 安全获取并持久化新租约；`recoverable_own` 时恢复原租约。
+该命令不替换归属未证明的现有租约；`ownership_unproven` 不证明“另一个
+coordinator”占用，保留状态，不从账本复制 useId。
 
-简单确定性操作（如微小错字修改）仅在无需探索、设计或诊断时直接执行；跨文件
-重命名若影响尚未确认，仍须先分析。已有完整用户计划时，只补必要代码定位和缺口分析；
-纯复核任务保持纯复核。用户禁止外发时不发送任务内容。通道不可用时保留绑定和
-回执，报告分析卸载受阻，不默认把全部思考转回 Codex；已明确且独立授权的工作
-可以继续。BOOT 回执或关键词测试均不能证明实际分析分工，也不能证明节省了多少额度。
+pending 必须先对账原消息；read_thread 可用时，即使发送工具缺失也继续读取，不重发、
+不换 Chat、不把本地只读分析当作 ChatGPT 分析。按 `coordinatorAction` 和
+`businessGate` 处理，CLI 不会后台轮询。弱 PLAN 确认回执后用 `--kind analysis` 补充。
+通道阻塞时保留绑定并报告，不默认将全部思考交回 Codex。
 
 带 `REVIEW_HEAD` 的 INIT 或 ANALYSIS 回复若四项回执身份匹配但漏回 HEAD，先确认其实际
 传输回执，再遵循 `review_head_clarification_required`：刷新预检、发送带同一 HEAD 的
@@ -184,25 +179,23 @@ node bin/c2c.js transport -w <workspace> --mode openai --json
 旧版“三次读取缺失”留下的 `unavailable` 记录，先通过后台 `read_thread` 核对原 Chat；
 身份一致时使用 `session restore --confirm` 恢复原会话，避免额外消耗库存。
 
-每个 Codex 任务会从全局 **Codex-with-ChatGPT** Project 领取一个普通 Chat 并永久
-绑定。用户先手工准备库存：选择非 Pro、思考强度“极高”，并发送一条只含
-`C2C_STANDBY_READY` 的用户消息。ChatGPT 编辑器有时会保留成字面文本
-`C2C\_STANDBY\_READY`；两种完整拼写都可识别。当前任务明确要求 Pro 时，
-只领取使用 `C2C_STANDBY_READY_PRO` 的独立库存 Chat。
+每个 Codex 任务复用固定 10 个 Chat 中的一个当前绑定。健康绑定继续使用；库存都已分配时，
+按 `lastUsedAt` 从旧到新逐个核实，自动选择第一个安全候选。不要求用户增加备用 Chat。
+用户准备库存时选择非 Pro、思考强度“极高”，并发送一条只含 `C2C_STANDBY_READY` 的用户消息。
+编辑器可能保留为字面文本 `C2C\_STANDBY\_READY`；两种完整拼写都可识别。明确要求 Pro 时，
+只使用 `C2C_STANDBY_READY_PRO` 的库存 Chat。
 
-Skill 每次领取前都通过 Codex App 后台的 `list_threads` 和 `read_thread` 同步库存，
-使用带原始用户标记的 `session pool import --marker-text` 导入，再执行 `session pool
-claim`。领取按 FIFO 并在全局锁中完成；库存与任务归属写入同一个原子账本；标题猜测、最近会话和跨任务复用均不参与。
-库存为空会返回 `POOL_EXHAUSTED`，任务正文不会发送。
+领取前先解析当前任务绑定。`session pool reclaim-candidates` 提供本地候选及排除原因，
+不代表宿主已证明空闲。`notLoaded` 必须用同宿主前后两次 inactive 快照、同一个已完成轮次、
+精确 Chat 读回、匹配回执和逐项新鲜时间证明。不得强占 pending、未决发送、有效租约或忙碌 Chat；
+逐一核查全部候选并记录真实原因后才能报告阻塞。旧 owner 身份本身不构成排除理由。
 
-领取和工作区迁移只建立绑定。完成宿主预检后，必须运行
-`session prepare-boot --expected-generation <n> --json`，它创建或恢复唯一可续接的
-BOOT 事务。普通 JSON 不含 token，只返回身份、消息元数据、摘要、下一步和私有正文文件路径。
-完整 BOOT 正文中的 `C2C_ROUTE_TOKEN` 只存在该私有文件内；协调者只能在内存中读取并发送到
-精确绑定 Chat。Windows 文件只允许当前用户和 SYSTEM，Unix 使用 `0700`/`0600`。重复调用保留
-同一正文、capability、message ID 和 iteration；已 pending 或发送结果不明时必须读回，不能重发。
-8 个 MCP 工具调用仍需附加 `route_token`，Router 只会将它解析到绑定工作区。日常控制消息只用
-`list_threads`、`send_message_to_thread` 和 `read_thread`，必须先回读送达和回复，才推进状态。
+领取和工作区迁移只建立绑定。完成宿主预检后运行
+`session prepare-boot --expected-generation <n> --use-id <own-id> --json`。
+普通 JSON 不含 token 或正文；私有 messageFile 是 JSON，只在内存中读取并校验后，将 `body` 字段
+发给精确绑定 Chat。Windows 文件只允许当前用户和 SYSTEM，Unix 使用 `0700`/`0600`。
+重复调用保留同一 preparation 和消息身份；已 pending 或发送结果不明时必须读回，不能重发。
+8 个 MCP 工具仍通过 `route_token` 解析到唯一绑定工作区。
 
 同时给出 `CODEX_THREAD_ID` 和 `--task-id` 时，两者必须完全一致；值不同时会先返回
 `TASK_ID_IDENTITY_MISMATCH`，账本保持原样。Boot 回复还要带上 `workspace_info` 实际返回的

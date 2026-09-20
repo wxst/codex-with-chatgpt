@@ -1,169 +1,77 @@
 import fs from "node:fs";
 import { describe, expect, it } from "vitest";
-
-const skill = fs.readFileSync("skill/SKILL.md", "utf8").replace(/\r\n/g, "\n");
-const protocol = fs.readFileSync("docs/protocol.md", "utf8").replace(/\r\n/g, "\n");
-const hostControl = fs.readFileSync("docs/host-control.md", "utf8").replace(/\r\n/g, "\n");
-
-// These are instruction contracts, not evidence of model behavior or quota savings.
-describe("ChatGPT-first Skill instruction contract", () => {
-  it("requires exact read-only browser fallback and source receipts without a second send plane", () => {
-    for (const document of [skill, protocol, hostControl]) {
-      expect(document).toContain("read_exact_chat_in_browser");
-      expect(document).toContain("--bound-workspace");
-      expect(document).toContain("--observed-reply-file");
-    }
-    expect(skill).toContain("Browser access here is **read-only observation**");
-    expect(skill).toContain("omit `hostTurnId` and `hostTurnStatus`");
-    expect(skill).toContain("Neither absence nor elapsed time authorizes clearing");
+const read = (p: string) => fs.readFileSync(p, "utf8").replace(/\r\n/g, "\n");
+const skill = read("skill/SKILL.md"), protocol = read("docs/protocol.md"), host = read("docs/host-control.md"), agents = read("AGENTS.md");
+// Instruction checks supplement real CLI/state tests; they do not prove model behavior.
+describe("unified ChatGPT-first Skill contract", () => {
+  it("puts reasoning before recovery and keeps execution separate", () => {
+    const start = skill.indexOf("## Daily reasoning workflow");
+    expect(start).toBeGreaterThan(0);
+    expect(start).toBeLessThan(skill.indexOf("## Shared recovery decision"));
+    for (const text of ["Do not complete the same deep analysis locally before INIT", "ready → INIT → PLAN → execution → EXECUTED", "SOURCE_EVIDENCE, ACTIONS, TESTS, and SUCCESS_CRITERIA", "no fixed iteration limit"]) expect(skill).toContain(text);
   });
-  it("puts the reasoning workflow before transport setup", () => {
-    expect(skill).toContain("reduce Codex quota consumption");
-    const workflow = skill.indexOf("## Daily reasoning workflow");
-    expect(workflow).toBeGreaterThan(0);
-    expect(workflow).toBeLessThan(skill.indexOf("## Setup and Router gate"));
-    expect(skill).toContain("Do not complete the same deep analysis locally before INIT");
-    const daily = skill.slice(workflow, skill.indexOf("### Routing exceptions"));
-    const steps = ["1. Codex checks", "2. Send the generated", "3. Wait for", "4. Codex checks", "5. Send EXECUTED", "6. Continue"];
-    const positions = steps.map(step => daily.indexOf(step));
-    expect(positions.every(position => position >= 0)).toBe(true);
-    expect(positions).toEqual([...positions].sort((a, b) => a - b));
-    expect(daily).toContain("do not edit until this PLAN is received");
-  });
-
-  it("requires a generated mem INIT and provides an evidence-bearing EXECUTED message", () => {
-    const templates = [...skill.matchAll(/```text\n(\[C2C\][\s\S]*?)\n```/g)].map(m => m[1]);
-    const executed = templates.find(t => /^STATE: EXECUTED$/m.test(t));
-    expect(executed).toBeDefined();
-    for (const field of ["TASK_ID:", "WORKSPACE_ID:", "ITERATION:", "MESSAGE_ID:"]) {
-      expect(executed!).toContain(field);
-    }
-    expect(Buffer.byteLength(executed!, "utf8")).toBeLessThan(1024);
-    expect(executed!).toContain("RESULTS:");
-    expect(executed!).toContain("EVIDENCE:");
-    expect(skill).toContain("session prepare-init");
-    expect(skill).toContain("Do not handwrite an INIT");
-    expect(skill).toContain("memory_start_task");
-    expect(skill).toContain("--observed-message-file");
-    expect(skill).toContain("--memory-status READY");
-    expect(skill).toContain("--kind executed");
-    expect(skill).toContain("SOURCE_EVIDENCE, ACTIONS, TESTS, and SUCCESS_CRITERIA");
-    expect(skill).toContain("BOOT DONE confirms connectivity only");
-  });
-
-  it("keeps the mem initialization and read-only source-order contract aligned", () => {
-    const agents = fs.readFileSync("AGENTS.md", "utf8");
-    const readme = fs.readFileSync("README.md", "utf8");
-    const readmeZh = fs.readFileSync("README.zh-CN.md", "utf8");
-    for (const document of [skill, protocol, agents, readme, readmeZh]) {
-      expect(document).toContain("memory_start_task");
-      expect(document).toContain("memory_search");
-    }
-    expect(protocol).toContain("DEGRADED");
-    expect(protocol).toContain("begin-send --kind executed");
-    expect(agents).toContain("旧 Chat 残留的 mem 上下文不代表当前 generation 已初始化");
-    expect(skill).toContain("memory_write_summary");
-    expect(skill).toContain("codewiki_*");
-    expect(skill).toContain("gitea_*");
-  });
-
   it.each([
     ["unfamiliar code", "repository exploration"],
-    ["debugging", "root-cause analysis"],
-    ["supplied plan", "Do not force replanning"],
-    ["trivial edit", "Simple deterministic operations"],
-    ["review only", "Review-only requests"],
-    ["unavailable channel", "not permission to silently perform all reasoning locally"],
-  ])("retains the routing rule for %s", (_scenario, rule) => {
-    expect(skill).toContain(rule);
+    ["complete user plan", "Do not force replanning"],
+    ["deterministic change", "Simple deterministic work"],
+    ["review only", "Review-only stays review-only"],
+    ["own continuation", "resume --recover-own"],
+    ["unavailable channel", "does not permit all reasoning to silently move to Codex"],
+  ])("retains instruction routing for %s", (_scenario, rule) => expect(skill).toContain(rule));
+  it("requires lease proof and separates decisions from business permission", () => {
+    for (const document of [skill, protocol, host]) for (const field of ["leaseStatus", "recoverable_own", "ownership_unproven", "conflict", "nextAction"]) expect(document).toContain(field);
+    for (const document of [skill, protocol]) for (const field of ["coordinatorAction", "businessGate"]) expect(document).toContain(field);
+    for (const text of ["Never retrieve activeUse.useId from the ledger", "Read-only local, mem, and Gitea research is still reasoning", "does not prove another coordinator exists", "without acquiring a lease for pending readback or host preflight"]) expect(skill).toContain(text);
+    expect(skill).toContain("With no active lease this mode may safely acquire a new lease");
+    expect(skill).not.toContain("Use --recover-own only when");
   });
-
-  it("keeps business reasoning separate from delivery and permission contracts", () => {
-    expect(skill).toContain("No fixed business-iteration limit");
-    expect(skill).toContain("C2C MCP remains eight read-only tools");
-    expect(skill).toContain("confirm-delivery");
-    expect(skill).toContain("session finish --use-id");
-    expect(skill).toContain("reclaim-observations-file");
-    expect(skill).toContain("__C2C_CHECKOUT__");
-    expect(skill).toContain("These exceptions do not waive host preflight");
-    expect(skill).toContain("only when no repository exploration, design, or diagnosis is needed");
-    expect(skill).toContain("impact still needs ChatGPT analysis before execution");
+  it("keeps exact source receipts and read-only browser fallback", () => {
+    for (const document of [skill, protocol]) for (const field of ["read_exact_chat_in_browser", "--bound-workspace", "--observed-reply-file"]) expect(document).toContain(field);
+    for (const text of ["Browser is read-only", "source=browser", "omit host turn fields", "Never resend, rotate Chat, or default to local full analysis"]) expect(skill).toContain(text);
   });
-
-  it("documents the corroborated notLoaded reclaim path without treating it as idle", () => {
-    for (const document of [skill, protocol, hostControl]) {
-      expect(document).toContain("notLoaded");
-      expect(document).toContain("inactiveStatus");
-    }
-    expect(skill).toContain("A bare `notLoaded` result is not idle proof");
-    expect(skill).toContain("same completed latest turn id");
-    expect(skill).toContain("Every individual read must be no more than 60");
-    expect(hostControl).toContain("changed receipt");
+  it("keeps per-task mem initialization and read-only source authority", () => {
+    for (const document of [skill, protocol, agents, read("README.md"), read("README.zh-CN.md")]) for (const field of ["memory_start_task", "memory_search", "prepare-init"]) expect(document).toContain(field);
+    for (const field of ["memoryProject", "includeProjectContext=true", "MEMORY_PROJECT", "MEMORY_STATUS", "MEMORY_SOURCES", "MEMORY_REASON", "DEGRADED", "memory_write_summary", "codewiki_*", "gitea_*"]) expect(skill).toContain(field);
+    expect(skill).toContain("Older Chat context never counts as current-generation mem initialization");
+    expect(skill).toContain("C2C wins on conflict");
   });
-
-  it("makes fixed-pool automatic recovery a project and installed workflow rule", () => {
-    const agents = fs.readFileSync("AGENTS.md", "utf8");
+  it("provides a bounded EXECUTED template distinct from generated INIT", () => {
+    const templates = [...skill.matchAll(/\$\w+Body = @"\n(\[C2C\][\s\S]*?)\n"@/g)].map(m => m[1]);
+    const executed = templates.find(t => /^STATE: EXECUTED$/m.test(t));
+    expect(executed).toBeDefined();
+    for (const field of ["TASK_ID:", "WORKSPACE_ID:", "ITERATION:", "MESSAGE_ID:", "RESULTS:", "EVIDENCE:"]) expect(executed).toContain(field);
+    expect(Buffer.byteLength(executed!, "utf8")).toBeLessThan(1024);
+    for (const text of ["Do not handwrite INIT", "--memory-status $memoryStatus", "BOOT DONE verifies connection only"]) expect(skill).toContain(text);
+  });
+  it("retains fixed-pool eligibility and never forces a takeover", () => {
     expect(agents).toContain("固定复用现有 10 个 Chat");
-    expect(agents).toContain("lastUsedAt");
-    expect(agents).toContain("不能以“已有绑定”为由停止");
-    expect(skill).toContain("--recover-bound-file");
-    expect(skill).toContain("omitting `hostId`");
-    expect(skill).toContain("never asks for more Chats");
-    expect(protocol).toContain("no unresolved send");
+    for (const field of ["lastUsedAt", "--reclaim-observations-file", "notLoaded", "inactiveStatus", "recheckReadAt", "receiptMessageId", "assignmentEpoch"]) expect(skill).toContain(field);
+    for (const text of ["Never age out a long-lived lease", "Every individual read is within 60 seconds", "no rollout found", "Never clear another task's pending state or lease"]) expect(skill).toContain(text);
   });
-
-  it("automatically reconciles malformed BOOT without requesting user authorization", () => {
-    const agents = fs.readFileSync("AGENTS.md", "utf8");
-    expect(skill).toContain("C2C recovery is already authorized");
-    expect(skill).toContain("do not ask for authorization or send another BOOT");
-    expect(skill).toContain("`session prepare-boot` has no review-head input");
-    expect(skill).toContain("does not require another user decision");
+  it("retains authorized internal recovery and message-kind HEAD rules", () => {
+    expect(skill).toContain("authorizes recovery of C2C state for this task");
+    expect(skill).toMatch(/\| BOOT \| prepare-boot \| Forbidden/);
     expect(protocol).toContain("BOOT_REVIEW_HEAD_FORBIDDEN");
-    expect(protocol).toContain("does not become `lastReviewHead`");
-    expect(hostControl).toContain("Do not resend it or ask");
-    expect(agents).toContain("错误 BOOT 修复");
-    expect(agents).toContain("不再向用户索取单独授权");
+    expect(host).toContain("legacy malformed BOOT");
+    for (const document of [skill, protocol, host]) expect(document).toContain("review_head_clarification_required");
+    expect(skill).toContain("A wrong nonempty HEAD is an identity mismatch");
+    expect(skill).toContain("EXECUTED must echo the exact HEAD");
   });
-
-  it("documents recovery when a real review-bearing reply omits REVIEW_HEAD", () => {
-    const agents = fs.readFileSync("AGENTS.md", "utf8");
-    const readme = fs.readFileSync("README.md", "utf8");
-    const readmeZh = fs.readFileSync("README.zh-CN.md", "utf8");
-    for (const document of [skill, protocol, hostControl, agents, readme, readmeZh]) {
-      expect(document).toContain("review_head_clarification_required");
-    }
-    expect(skill).toContain("Do not rewrite the observed reply, resend INIT, or send\nEXECUTED");
-    expect(protocol).toContain("not promoted as observed\nreview evidence");
-    expect(agents).toContain("不得填造 HEAD、重发 INIT 或发送 EXECUTED");
-  });
-
-  it("requires private, recoverable BOOT preparation instead of one-time token output", () => {
-    const agents = fs.readFileSync("AGENTS.md", "utf8");
-    const readme = fs.readFileSync("README.md", "utf8");
-    const readmeZh = fs.readFileSync("README.zh-CN.md", "utf8");
-    for (const document of [skill, protocol, agents, readme, readmeZh]) {
-      expect(document).toContain("prepare-boot");
-    }
-    expect(skill).toContain("sendAllowed");
-    expect(skill).toContain("messageFile");
-    expect(skill).toContain("same private preparation");
-    expect(skill).toContain("not-invoked");
-    expect(protocol).toContain("token-free preparation record");
-    expect(agents).toContain("Windows 只允许当前用户和 SYSTEM");
-    expect(agents).toContain("已接受、送达、等待回复或已完成的 BOOT 绝不换 token");
-  });
-
-  it("requires the post-BOOT migration confirmation instead of revisiting an old source receipt", () => {
-    const agents = fs.readFileSync("AGENTS.md", "utf8");
-    for (const document of [skill, protocol, agents]) {
-      expect(document).toContain("migration_workspace_confirmation_required");
-      expect(document).toContain("workspace_info");
-    }
+  it("uses private repeatable BOOT material and workspace confirmation", () => {
+    for (const field of ["messageFile", "bodySha256", "sendAllowed", "not-invoked", "0700", "0600", "migration_workspace_confirmation_required", "workspace_info", "confirm-workspace"]) expect(skill).toContain(field);
+    expect(skill).toContain("Repeated prepare-boot resumes the same preparation");
     expect(skill).toContain("Do not reread the source receipt");
-    expect(protocol).toContain("does not reopen source-receipt preflight");
-    for (const document of [skill, protocol, agents]) {
-      expect(document).toContain("switch_workspace");
-      expect(document).toContain("restore_host_tools_then_read_bound_chat");
+    expect(skill).not.toContain("--observed-iteration 0");
+    expect(skill).not.toMatch(/(?:claim|switch-workspace) returns? (?:a |the )?(?:route )?token/i);
+    expect(skill).toContain("only the unchanged body string");
+  });
+  it("starts migration preflight unleased and acquires a fresh destination lease before BOOT", () => {
+    const section = skill.split("## Workspace migration handshake")[1].split("## ")[0];
+    expect(section).toContain("clear `$ownUseId`");
+    expect(section).toContain("acquire fresh destination lease after migration preflight");
+    for (const line of section.split("\n").filter(l => l.trimStart().startsWith("node ") && l.includes("session host-control"))) {
+      expect(line).not.toContain("--use-id");
     }
+    expect(section).toContain("--use-id <new-destination-use-id>");
   });
 });

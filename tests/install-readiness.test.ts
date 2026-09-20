@@ -142,12 +142,12 @@ describe("installation documentation contract", () => {
   it("checks an existing managed runtime before requesting tunnel credentials", () => {
     const skill = read("skill/SKILL.md");
     const statusCheck = skill.indexOf("runtime diagnose -w <workspace> --json");
-    const credentialCheck = skill.indexOf("credentialSource: managed_dpapi");
+    const credentialCheck = skill.indexOf("CurrentUser DPAPI");
 
     expect(statusCheck).toBeGreaterThan(-1);
     expect(credentialCheck).toBeGreaterThan(statusCheck);
     expect(skill).toContain("tunnel-runtime-key.dpapi");
-    expect(skill).toContain("outside the C2C");
+    expect(skill).toContain("Do not rotate credentials");
 
     for (const file of ["README.md", "README.zh-CN.md"]) {
       const instructions = read(file);
@@ -206,16 +206,14 @@ describe("installation documentation contract", () => {
     const sessionState = read("src/session/state.ts");
     const verifier = read("scripts/verify-codex-app-host.mjs");
 
-    expect(skill).toContain("C2C_STANDBY_READY");
-    expect(skill).toContain("C2C\\_STANDBY\\_READY");
+    expect(skill).toContain("standby marker");
     expect(skill).toContain("session pool claim");
     expect(skill).toContain("before every pool claim");
-    expect(skill).toContain("--marker-text <raw-user-marker-text>");
-    expect(skill).toContain("C2C_ROUTE_TOKEN");
+    expect(skill).toContain("private JSON material object");
     expect(skill).toContain("route_token");
     expect(skill).toContain("send_message_to_thread");
     expect(skill).toContain("read_thread");
-    expect(skill).toContain("Do not use `wait_threads` for ChatGPT Chats");
+    expect(skill).toContain("Do not use wait_threads for ChatGPT Chats");
     expect(cli).toContain('.command("router")');
     expect(cli).toContain('.command("runtime")');
     expect(cli).toContain('session.command("pool")');
@@ -233,25 +231,23 @@ describe("installation documentation contract", () => {
     expect(verifier).toContain('"send_message_to_thread"');
     expect(verifier).not.toContain("create_chatgpt_conversation");
     expect(skill).toContain("runtime diagnose -w <workspace> --json");
-    expect(skill).toContain("managed_dpapi");
+    expect(skill).toContain("CurrentUser DPAPI");
     expect(skill).toContain("tunnel-runtime-key.dpapi");
     expect(skill).not.toContain("invalid_runtime_api_key");
-    expect(skill).toContain("runtime repair-profile");
+    expect(skill).toContain("Do not rotate credentials");
     expect(cli).toContain("probeManagedRuntime({ runtimeAlias })");
   });
 
-  it("keeps maximum ChatGPT reasoning offload with repository-aware sources and one writer", () => {
+  it("keeps ChatGPT reasoning offload with repository-aware sources and one writer", () => {
     const skill = read("skill/SKILL.md");
     expect(skill).toContain("memory_start_task");
     expect(skill).toContain("memory_search");
     expect(skill).toContain("codewiki_*");
     expect(skill).toContain("gitea_*");
-    expect(skill).toContain("C2C MCP reads the actual current workspace");
-    expect(skill).toContain("Only the main coordinating agent");
+    expect(skill).toContain("Use C2C read-only tools for the actual current workspace");
+    expect(skill).toContain("One primary Codex coordinator");
     expect(skill).toContain("Subagents return findings");
-    expect(skill).toContain("one in-flight request");
-    expect(skill).toContain("xhigh");
-    expect(skill).toContain("Pro");
+    expect(skill).toContain("Pending means reconcile the original request first");
   });
   it("documents the two-view Windows legacy cleanup command", () => {
     const cli = read("src/cli/index.ts");

@@ -151,7 +151,8 @@ it("CLI refuses missing preflight and reports actual unaccepted failures", async
   expect(started.status).toBe(0);
   id = JSON.parse(started.stdout).messageId;
   const resumedPending = cli("resume", "--task-id", "cli-task", "--brief", "--json");
-  expect(JSON.parse(resumedPending.stdout)).toMatchObject({ ok: true, useId: null, nextAction: "delivery_readback_required" });
+  expect(JSON.parse(resumedPending.stdout)).toMatchObject({ ok: true, leaseStatus: "none", nextAction: "delivery_readback_required" });
+  expect(JSON.parse(resumedPending.stdout)).not.toHaveProperty("useId");
   const failed = cli("fail-delivery", "--task-id", "cli-task", "--message-id", id, "--kind", "host_rejected", "--reason", "explicit rejection", "--json");
   expect(JSON.parse(failed.stdout).accepted).toBe(false);
 

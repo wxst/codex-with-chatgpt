@@ -1,162 +1,96 @@
-# Host control availability
+# Host control and continuation
 
-C2C issue #4 separates the Codex coordinator's control tools from the read-only
-Router/Tunnel data plane. The coordinator records observed callable names with
-`session host-control --result probe --tools <comma-separated names|none>`.
-This command records an observation; it does not discover or call host tools.
-The standalone `verify:codex-app-host` checks the proxy inventory only and is
-not proof of model-visible tools or ChatGPT delivery.
+C2C Router/data plane and Codex App host-control tools are separate. The coordinator records its actual callable tools with host-control; it does not make those tools available:
 
-| Observation | Status | Action |
+    node "__C2C_CHECKOUT__/bin/c2c.js" session host-control -w <workspace> --task-id <task-id> --use-id <own-use-id> --result probe --tools read_thread,send_message_to_thread --json
+
+Use --tools none when neither tool is exposed, or name only the tool that is present. A tools/list proxy or healthy Tunnel does not prove the current task can call host tools.
+
+| Observation | State | Action |
 | --- | --- | --- |
-| read and/or send not exposed | tools_missing | Restore host capabilities, preserve binding |
-| both exposed | readback_required | Read exact saved Chat and verify identity |
-| exact readback after probe | ready | Resume receipt checks, or use `prepare-boot` if BOOT is required |
-| host invocation timeout | call_timeout | Keep uncertain send; read before any retry |
-| other temporary call failure | call_failed | Same conservative recovery |
-| proven send never invoked | not_invoked | Release matching unaccepted reservation only |
-| explicit Chat deletion | existing conversation_gone | Retire via terminal handling |
-| mismatching Chat identity | existing identity_mismatch | Quarantine via terminal handling |
-| unhealthy Tunnel | runtime diagnosis | Diagnose data plane independently |
+| read_thread missing | tools_missing | Restore host observation; preserve receipts and binding. |
+| read_thread present, send_message_to_thread missing | tools_missing | Read and reconcile an existing pending request; do not reserve/send a new message. |
+| Both present | readback_required | Read the exact bound Chat; then record read-ok with actual identity. |
+| Host timeout or temporary error | call_timeout / call_failed | Keep any uncertain send and reconcile the same Chat. |
+| Send tool provably never invoked | not_invoked | Re-reserve only the same unsent preparation after fresh preflight. |
+| Explicit deletion or identity mismatch | conversation_gone / identity_mismatch | Use matching terminal recovery after the current request is resolved. |
+| Tunnel unhealthy | runtime diagnosis | Diagnose the data plane separately; no automatic restart. |
 
-All failure observations preserve the current pool owner. Temporary host
-failures set `channelState: degraded` without removing pending receipt fields.
-Recovery derives `sending` versus `awaiting_reply` from those fields; it never
-infers delivery from restored capability. Uncertain invocation is sticky across
-probes. Lack of `sendAcceptedAt` alone never proves a call was not made.
-An explicit `host_rejected` result conflicting with an existing acceptance or
-delivery receipt is rejected; preserve the reservation and read the original
-Chat. Failure JSON retains observed acceptance/delivery facts. A successful
-readback after an uncertain send may therefore have `accepted: false` and
-`delivered: true` (no host acknowledgement was recorded).
+## Lease ownership
 
-The CLI requires a preflight no older than 60 seconds. Existing library callers
-without a host observation remain compatible; once present, a non-ready host
-observation blocks `beginTaskSend`, including `--probe` recovery attempts.
-The coordinator must repeat preflight after continuation and before each send;
-persisted readiness alone is not evidence of the current executor inventory.
+get, resume, and host-control use one recovery decision. Run the read-only status command first:
 
-See the [Skill](../skill/SKILL.md#host-control-preflight-and-recovery) for commands
-and HEAD-specific review rules. Report missing tools to Codex feedback/support
-with host version, timestamp, task id and tool names. Never include credentials,
-route tokens, or private message bodies. C2C cannot fix host tool injection.
+    node "__C2C_CHECKOUT__/bin/c2c.js" session get -w <workspace> --brief --json
 
-An unbound task reports its actual tool inventory without creating an owner or
-claiming a Chat just to save a host observation. Another task's existing
-owner cannot be imported. A completed host turn with no readable messages is
-an observation gap; neither completion metadata nor another task's available
-tools proves consumer recovery.
+get never returns useId. leaseStatus values mean:
 
-## Continuation and fixed-pool reuse
+- none: no active lease; follow nextAction without assuming that lease acquisition is the first step.
+- own: the supplied known use id matches this task.
+- recoverable_own: a private continuation record proves this task's active lease.
+- ownership_unproven: the ledger has an active lease but the caller has no matching private proof.
+- conflict: a supplied use id or private record conflicts with current task/binding identity.
 
-Begin a normal continuation with `session resume --brief --json`, not a Router
-diagnosis or pool scan. The resolver first finds the current task's exact
-binding. A unique binding in another workspace returns
-`workspace_switch_required`; after a fresh exact Chat readback, use
-`session switch-workspace` to move that same binding. Do not move a worktree,
-change the task id, or claim another Chat to work around the path change.
+A missing proof is not evidence that another coordinator exists. A blocked get/resume/host-control response never returns a lease id. For leaseStatus=none, follow nextAction: an old pending request can be read and confirmed without --use-id; missing preflight is probed and the exact Chat is read before obtaining a lease. Acquire only when the next authorized action needs one (ready continuation or a lease-fenced preparation/send), using `resume --recover-own` to acquire and persist a new lease (plain `resume` remains compatible). For `recoverable_own`, recover the existing lease with `resume --recover-own`; this mode requires the host-provided `CODEX_THREAD_ID`. A caller with a verified known own id may use `resume --use-id <known-own-id>`:
 
-If that source binding has pending, the shared decision is instead
-`reconcile_source_pending`. The source receipt commands support `--bound-workspace`
-from the current checkout, retaining the exact task and old workspace identities.
-After normal confirmation, release only your own source lease with the same flag
-on finish, then migrate. No send command accepts this override.
+    node "__C2C_CHECKOUT__/bin/c2c.js" session resume -w <workspace> --recover-own --json
 
-Fresh idle/terminal host reads that omit a phase receipt trigger
-`read_exact_chat_in_browser`. Read only the get/resume `chatUrl` in a supported
-browser and record source=browser, the final exact URL, and the actual read time.
-Do not copy host turn metadata into browser observations. If visible, validate the
-assistant body with normal confirm-reply --observed-reply-file; INIT delivery still
-requires the exact user body digest. The browser is a second observer, not another
-send surface. No private APIs, regeneration, edits, clearing pending or Chat replacement.
-If no browser page can be observed, record the concrete observer blocker without
-inventing a URL; pending remains intact.
+On success, resume returns this task's useId. A caller that already knows its own current id can use resume --use-id <known-own-use-id>. Never copy a useId from the ledger, another task, or blocked output. Preserve ownership_unproven and conflict; do not force-takeover or clear by age.
 
-The ten live pool entries are reusable only when a candidate is locally ready,
-has no pending/accepted/uncertain delivery and no active coordinator lease, and
-has a fresh 60-second host observation proving an idle owner task or a fully
-corroborated `notLoaded` owner task, plus an idle exact Chat and clean readback.
-A bare `notLoaded` result is insufficient. The CLI accepts that structured
-observation; it does not pretend to call Codex App tools itself. Use `session pool
-reclaim-candidates --json` when unclaimed stock is empty. It returns local
-candidates in least-recently-used order, receipt identities, and exclusion reasons
-without exposing route tokens. `POOL_OBSERVATION_REQUIRED` means a local candidate
-still needs host proof; `POOL_BUSY` means local candidates are blocked. Neither
-means that all owner tasks were observed busy by the host.
+Every state-changing receipt command, including host-control and record-readback, receives this task's verified --use-id when it holds a lease. An observation may omit useId if the command supplies it; if both have a value, they must match. When the ledger has no active lease, omit --use-id. If a one-hop binding_recovered history proves this task's prior binding and its private continuation proves the same lease, the explicit terminal-rejection recovery can carry that lease to the recovered Chat/generation. This is not a general transfer. Ordinary workspace migration keeps the Chat and requires releasing this task's lease first.
 
-For each local candidate, read the exact owner task and exact Chat. When the task
-reads `notLoaded`, take a same-host immediate `wait_threads(timeoutMs: 0)`
-snapshot and require `inactiveStatus` with a completed latest turn; then, after the
-Chat receipt check, take one more same-host snapshot with the same completed turn.
-Record each read timestamp, host id, turn id/status, and the receipt fields shown
-by the Chat. Immediately pass the complete `ReclaimObservation` array through
-`session pool claim --reclaim-observations-file <UTF-8 JSON path>`. The legacy
-inline option remains supported; the two inputs are mutually exclusive. The locked
-claim rejects stale ownership, epoch, leases, pending states, changed receipt, or
-any individual read older than 60 seconds. If a candidate changes, inspect
-remaining candidates instead of forcing takeover; refresh only expired evidence
-once. Missing or failed host reads are not idle proof. Exhaustion of this pass must
-report every actual exclusion/readback reason.
+## Readback and direct Chat routing
 
-See the installed Skill's **Mandatory rotation when unclaimed stock is empty**
-for the complete host sequence and JSON example. After rotation, the new owner
-must complete BOOT and workspace verification before task content is sent.
-`session finish` releases the active lease but keeps the same task binding.
+If read_thread is present, a missing send_message_to_thread does not block reads of an existing pending message. Read and record that request; confirm it only through the normal identity-checked receipt command. Do not reserve or send a new message until both tools and fresh preflight are available. If read_thread is missing, restore it before receipt confirmation. The supported browser is a read-only alternate observer only when shared guidance returns read_exact_chat_in_browser.
 
-BOOT carries no `REVIEW_HEAD`; the CLI rejects that combination. If an older
-client already left a delivered BOOT with an erroneous pending review head, read
-the exact existing request and reply and run the normal receipt commands. Matching
-BOOT identity automatically reconciles the reply and discards the erroneous head,
-after which actual `workspace_info` is still required. Do not resend it or ask
-the user to authorize C2C-internal recovery.
+ChatGPT conversation operations use the exact conversation id and omit Codex hostId. hostId is only for reading or snapshotting the Codex owner task. A no rollout found error is a routing clue, not proof the Chat was deleted. Do not use wait_threads for ChatGPT Chats.
 
-For a generated review-bearing INIT or ANALYSIS, a matching assistant receipt that
-omits `REVIEW_HEAD` is a transport fact, not a completed review. Confirm the actual
-body, preserve it, and follow `review_head_clarification_required`: repeat current
-preflight and send one fresh exact-head ANALYSIS clarification. Never fill the
-missing value from the request, resend INIT, or mark EXECUTED before the matching
-clarification receipt is observed.
+After restoring tools, probe the current inventory and read the existing Chat before any new send. Preflight is fresh for at most 60 seconds before sending. If a pending user request exists, locate its exact user turn and matching reply, including older pages. Empty/truncated reads, completed host turns, and idle Chats do not prove the request was not sent or answered.
 
-New BOOTs use only `session prepare-boot --expected-generation <n>`. Its normal
-JSON is token-free and names a private material file; the coordinator reads that
-file only in memory for the exact Chat send. `pool claim` and `switch-workspace`
-do not output a route token. A repeated preparation returns the same material and
-message identity. If its send outcome is unknown, it returns a readback action,
-not resend permission. A proven `not-invoked` result plus fresh preflight can
-re-reserve the same BOOT; accepted, delivered, awaiting-reply and uncertain sends
-must remain on their original readback path. Confirmation removes private material
-without changing the completed binding if cleanup needs a retry.
+Record confirm-send-accepted only after the send tool returns; this means host acceptance, not delivery. Confirm delivery only after the exact user turn appears; confirm reply only after the matching assistant response appears. Delivery and reply have separate schedules: every 5 seconds during the first minute, every 15 seconds afterward, and every 30 seconds after 5 minutes. Wait no more than 60 seconds at a time. At 15 minutes diagnose host health and pagination, then keep waiting while observation is possible.
 
-The coordinator automatically checks every LRU candidate before reporting pool
-exhaustion; it never asks the user for additional standby Chats. A prior owner's
-binding alone is not a busy condition. ChatGPT sends/readbacks use the exact
-conversation id without `hostId`; only Codex owner reads use host routing.
-After `no rollout found`, check this distinction before classifying the Chat.
-If a correctly routed send is explicitly rejected and the current Chat is idle
-with no unresolved receipt, use `pool claim --recover-bound-file` together with
-the first safe candidate's observations. See the Skill for the exact JSON and
-commands. This retains the fixed inventory and archives old receipts; it does not
-authorize taking busy Chats or replacing a binding after an uncertain send.
+For every actual read, use session record-readback --observation-file <UTF-8 JSON> and include --use-id <own-use-id> only when this task holds a lease. readAt is the actual UTC read time. Task, workspace, Chat, generation, assignment epoch, message id and iteration must match the current pending receipt. Preserve unknown host fields as unknown. An empty page, timeout, or read failure updates only the observation; it cannot clear pending or reverse confirmed delivery.
 
-`status` and `runtime diagnose` report `workspaceRegistration` independently of
-the global anchor's health. Unregistered/revoked workspaces return
-`workspace_not_registered`/`workspace_revoked`; they do not cause the CLI to
-invent a per-workspace runtime alias. `runtimeAliasSource: explicit` identifies
-an explicitly selected alias. Runtime lookup failures preserve any successful
-managed credential validation. Register only the actual execution workspace
-when intended; diagnose does not register, and runtime repair commands reject
-unregistered/revoked workspaces before modifying anchor configuration.
-Malformed, unreadable or duplicate Router registrations stop diagnostics and
-repair with `router_state_invalid` or `router_state_unavailable`; they cannot
-select legacy mode. `runtime diagnose` top-level `ok` also requires the selected
-runtime to be available, running, healthy, ready, non-stale and free of errors.
+If guidance returns read_exact_chat_in_browser, open only the exact chatUrl from get/resume. Verify HTTPS, project, conversation, request and assistant body. Record source=browser, actual sourceUrl and read time; omit host-turn fields. Save the exact assistant text as UTF-8 and confirm with confirm-reply --observed-reply-file. Browser visibility alone is not a receipt. Never send, edit, regenerate, delete, read unrelated Chats, or call private Chat APIs from the browser.
 
-### Migrated workspace
+When observation is impossible after checking available tools and pagination, record observation_blocked, errorCategory=unavailable and a sanitized reason. Preserve pending and report its identity and missing observation capability. Resume the same message when reading returns. This does not authorize resend, Chat rotation, or local substitution for required ChatGPT analysis.
 
-An old-workspace receipt is valid historical evidence, not proof of the new
-workspace. Use `migration-read-ok --observation-file` after tool probe and exact
-Chat read. `migration_boot_ready` is limited to new BOOT, is consumed by
-`prepare-boot`, and requires current expected generation. Finish normal delivery/reply readback
-and actual workspace_info confirmation before business messages. Never report an
-expected new workspace ID as observed in an old message. Preserve unresolved
-sends; migration does not waive receipt or lease protection.
+## Fixed pool and safe reuse
+
+Reuse the configured ten-Chat pool; do not ask the user for more standby Chats. session pool reclaim-candidates --json lists locally eligible candidates in least-recently-used order with owner, workspace, generation, assignment epoch, receipt, and exclusion reasons. It is not host idle proof. Prior ownership by itself is not a reason to exclude a candidate.
+
+Check every local candidate from oldest lastUsedAt onward:
+1. Read the exact owner task. Explicit idle is acceptable. notLoaded requires a same-host immediate wait_threads(timeoutMs: 0) snapshot with inactiveStatus and a completed latest turn.
+2. Read the exact conversation id without Codex hostId. Require idle Chat and a clean latest user request/reply matching ledger task, workspace, iteration, last delivered message, state, and review head when present. Follow pagination.
+3. For notLoaded, take a second same-host immediate snapshot. Require inactiveStatus and the same completed latest-turn id. Preserve all raw states, host/task identities, receipt fields, and actual read times. Every read must be within 60 seconds at claim time.
+4. Pass actual observations as UTF-8 JSON to session pool claim --reclaim-observations-file <file>. The locked claim rechecks ownership, generation, epoch, verification, lease, pending and receipt. Candidate change means move to the next candidate; stale evidence permits one refresh.
+
+A bare notLoaded, unavailable read, identity mismatch, pending message, active lease, or active Chat is not safe reclaim evidence. Never clear another task's pending or lease. POOL_OBSERVATION_REQUIRED means host evidence is still needed; POOL_BUSY means local candidates are blocked. Report every candidate's actual reason before reporting exhaustion.
+
+After a successful rotation, obtain this task's lease when nextAction permits it, run fresh host preflight, use prepare-boot, confirm delivery and reply, call workspace_info, then confirm-workspace before business INIT.
+
+A bound Chat can be replaced only after a correctly routed explicit terminal rejection, exact Chat readback showing idle with no unresolved send, and safe LRU candidate evidence. binding_recovered additionally requires unique one-hop ledger history and this task's private continuation. no rollout found, timeout, missing reads, and uncertain sends are not terminal proof. The locked ledger recheck narrows the host race but cannot eliminate later activity.
+
+## Migration and BOOT confirmation
+
+Migration evidence keeps the source workspace identity. Use migration-read-ok --observation-file <file> only after fresh host preflight, exact Chat read, and a clean matching source receipt. The CLI verifies lineage, unique owner, generation, epoch, pending state, lease and read freshness under lock. If the registered source receipt has no REVIEW_HEAD, omit it.
+
+migration_boot_ready allows only CLI-generated BOOT. Release the source lease before switch-workspace and discard that use id. The new destination generation begins without a lease: probe and migration-read-ok omit --use-id and the observation omits useId. After preflight, get must return prepare_boot_required or resume_boot_preparation; resume --recover-own obtains the fresh destination lease. Only that new verified id is passed to prepare-boot and subsequent receipts/workspace confirmation. On interrupted destination recovery, restore its existing private lease instead. Read private messageFile JSON in memory, validate it and send only its body. pool claim and switch-workspace do not issue or return route tokens. Send only after prepare-boot succeeds with sendAllowed=true.
+
+If preparation or output was interrupted, prepare-boot resumes the same private material and identity. If send may have been invoked, read the same Chat. Only proof the send tool was never called, followed by fresh preflight, allows re-reservation of that same BOOT. Accepted, delivered, waiting, and uncertain messages stay on readback.
+
+When BOOT has a matching delivered DONE and no pending request, immediately call target workspace_info then confirm-workspace using its actual workspaceId, routeTaskId, workspaceName and git.branch. Do not reread the source receipt, resend, change generation, or replace Chat. Only this actual confirmation makes the binding ready.
+
+BOOT cannot carry REVIEW_HEAD. A legacy malformed BOOT can be reconciled only from exact existing readback; do not resend. For review-bearing INIT or ANALYSIS, an otherwise matching reply that omits REVIEW_HEAD confirms transport only; follow review_head_clarification_required and send fresh exact-head ANALYSIS. A wrong nonempty head is an identity mismatch. Review-bearing EXECUTED requires its exact head.
+
+## Router and runtime diagnosis
+
+The Router exposes exactly eight read-only C2C tools; it has no shell, Git mutation, write, delete, or secret-read capability. Each tool requires a task-bound route_token. Mem, OpenDeepWiki, and Gitea are external read sources, not Router implementations.
+
+Run diagnostics against the actual workspace:
+
+    node "__C2C_CHECKOUT__/bin/c2c.js" router ensure -w <workspace> --json
+    node "__C2C_CHECKOUT__/bin/c2c.js" transport -w <workspace> --json
+    node "__C2C_CHECKOUT__/bin/c2c.js" status -w <workspace> --json
+    node "__C2C_CHECKOUT__/bin/c2c.js" runtime diagnose -w <workspace> --json
+
+workspace_not_registered and workspace_revoked are workspace conditions. Corrupt Router registration stops diagnosis and repair. An explicit runtime alias describes that alias, not necessarily the anchor. On Windows the managed runtime uses CurrentUser DPAPI tunnel-runtime-key.dpapi and tunnel-runtime-id.dpapi under %USERPROFILE%/.config/codex-with-chatgpt. credentialState=verified means the managed key reached the exact Tunnel; invalid means the corresponding explicit 401; missing means restore the DPAPI source. Lookup failure is not proof the Tunnel stopped. Runtime/credential changes and restarts are not default recovery; do them only when the current authorized scope includes them.

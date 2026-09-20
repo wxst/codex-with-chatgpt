@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { withWorkspaceLifecycleLock } from "../process/workspace-lock.js";
 import { bootMaterialFile, removeBootMaterial } from "./boot-material.js";
+import { readContinuation, writeContinuation, type ContinuationReceipt } from "./continuation.js";
 
 export type VerificationState = "pending" | "ready";
 export type SettingsSource = "pending" | "user_confirmed";
@@ -219,6 +220,7 @@ export interface ReadbackObservation {
 }
 
 export interface SessionRecoveryGuidance {
+  leaseStatus: "none" | "own" | "recoverable_own" | "ownership_unproven" | "conflict";
   nextAction: string;
   recoveryReason: string | null;
   waitingMs: number | null;
@@ -235,23 +237,31 @@ export function sessionRecoveryGuidance(
   resolution: TaskBindingResolution, task: SavedTaskSession | null,
   useId?: string, nowMs = Date.now(),
 ): SessionRecoveryGuidance {
-  const base = { waitingMs: null, nextReadInMs: null, diagnosticRequired: false,
+  const leaseStatus = classifyTaskLease(task, useId);
+  const base = { leaseStatus, waitingMs: null, nextReadInMs: null, diagnosticRequired: false,
     coordinatorAction: "follow_next_action" as const, businessGate: "connection_required" as const,
     readbackDueAt: null, observationAgeMs: null };
   const action = (nextAction: string, recoveryReason: string | null = null): SessionRecoveryGuidance =>
     ({ ...base, nextAction, recoveryReason });
+  if (resolution === "ambiguous") return action("stop_manual_resolution", "ambiguous task binding");
+  if (leaseStatus === "recoverable_own") return action("recover_own_lease", "resume --recover-own restores the private task continuation");
+  if (leaseStatus === "ownership_unproven") return action("lease_ownership_unproven", "current caller has not proven possession of this lease; preserve it");
+  if (leaseStatus === "conflict") return action("lease_conflict", "provided continuation conflicts with the current lease; preserve it");
   if (resolution === "workspace_switch_required" && task?.pendingMessageId) {
     const source = sessionRecoveryGuidance("exact", task, useId, nowMs);
-    if (source.nextAction === "wait_for_coordinator_lease" || source.nextAction === "restore_host_tools_then_read_bound_chat") return source;
+    if (source.nextAction === "restore_host_tools_then_read_bound_chat") return source;
     return { ...source, nextAction: "reconcile_source_pending",
       recoveryReason: `reconcile the exact source Chat before migration; use record-readback/confirm-delivery/confirm-reply --bound-workspace from the current workspace; ${source.recoveryReason}` };
   }
+  if (resolution === "workspace_switch_required" && leaseStatus === "own") {
+    return action("release_own_lease_before_workspace_switch",
+      "finish --bound-workspace --use-id <verified-own-id>, then get again before switch-workspace; never release while pending");
+  }
   if (resolution !== "exact") return action(resolution === "workspace_switch_required" ? "switch_workspace" :
-    resolution === "ambiguous" ? "stop_manual_resolution" : "claim_pool_chat");
+    "claim_pool_chat");
   if (!task) return action("stop_manual_resolution", "exact binding is missing");
-  if (task.activeUse && task.activeUse.useId !== useId) return action("wait_for_coordinator_lease", "another coordinator holds this binding");
   if (task.bindingState !== "bound") return action("read_bound_chat", "binding requires terminal recovery verification");
-  if (task.hostControl?.status === "tools_missing") return action("restore_host_tools_then_read_bound_chat",
+  if (task.hostControl?.status === "tools_missing" && (!task.pendingMessageId || task.hostControl.missingTools.includes("read_thread"))) return action("restore_host_tools_then_read_bound_chat",
     migrationRecoveryGuidance(task)?.recoveryReason ?? "host read/send tools are unavailable");
   if (task.pendingMessageId) {
     const delivered = task.lastDeliveredMessageId === task.pendingMessageId;
@@ -275,6 +285,7 @@ export function sessionRecoveryGuidance(
       (blocked || (o?.chatStatus !== "active" && (o?.chatStatus === "idle" || ["completed", "failed", "interrupted"].includes(o?.hostTurnStatus ?? ""))));
     const diagnosticRequired = !confirmVisible && (blocked || waitingMs === null || waitingMs >= 900_000);
     return {
+      leaseStatus,
       nextAction: migrationBoot ? "migration_boot_readback_required" : delivered ? "reply_readback_required" : "delivery_readback_required",
       recoveryReason: browserReadRequired ? "host readback can omit a completed reply; inspect the exact bound Chat in a supported browser, record source=browser and its URL, then confirm actual matching receipts; never resend" :
         blocked ? `observation blocked: ${o!.blockedReason}; preserve pending and restore observation, never resend` : delivered ? "request delivered; read the matching reply, including late or paginated results; never resend" :
@@ -318,6 +329,12 @@ export function sessionRecoveryGuidance(
       businessGate: "assess_reply" };
   }
   return { ...action("resume_bound_chat"), businessGate: task.verificationState === "pending" ? "await_boot" : "assess_reply" };
+}
+
+/** Acquiring a new lease must not fence off an earlier recovery action. */
+export function canAcquireContinuationLease(guidance: SessionRecoveryGuidance): boolean {
+  return guidance.leaseStatus === "none" && ["resume_bound_chat", "prepare_boot_required",
+    "resume_boot_preparation", "review_head_clarification_required"].includes(guidance.nextAction);
 }
 
 export interface BootstrapProvision {
@@ -1567,7 +1584,7 @@ function assertBoundRecovery(task: SavedTaskSession | undefined, workspaceId: st
     task.lastDeliveryCheckedAt !== observation.failureCheckedAt) throw new Error("RECOVERY_BINDING_CHANGED: reread the current binding and terminal failure");
   if (task.pendingMessageId || task.pendingIteration !== undefined || task.pendingDispatchUncertain || task.sendAcceptedAt ||
     task.deliveryPendingSince || task.activeUse?.useId !== observation.useId) {
-    throw new Error("TASK_CHAT_BUSY: resolve the original receipt or other coordinator lease before recovery");
+    throw new Error("TASK_CHAT_BUSY: resolve the original receipt or prove lease ownership before recovery");
   }
   if (task.channelState !== "degraded" || !task.lastDeliveryError?.startsWith("host_rejected:")) {
     throw new Error("RECOVERY_NOT_REQUIRED: reuse the healthy binding; uncertain sends and read failures cannot authorize rotation");
@@ -1768,6 +1785,17 @@ export async function claimStandbyConversation(
           assignmentEpoch: claimed.assignmentEpoch }] : [])],
       savedAt: now,
     });
+    if (input.recoveryObservation && existing?.activeUse && task.activeUse) {
+      // Ledger commit is authoritative. Refresh only an already proven private
+      // continuation; a crash here is recovered through the committed lineage.
+      try {
+        const receipt = readContinuation(taskId);
+        if (receipt && receipt.stage !== "released" && continuationMatches(receipt, existing, workspaceId, ledger)) {
+          writeContinuation({ ...receipt, boundWorkspaceId: workspaceId, conversationId: task.conversationId,
+            generation: task.generation, assignmentEpoch: claimed.assignmentEpoch ?? 1, stage: "active", updatedAt: now });
+        }
+      } catch { /* preserve committed binding; resume validates the durable history */ }
+    }
     return { task, entry: claimed, reused: false };
   });
 }
@@ -2180,22 +2208,83 @@ export async function switchTaskWorkspace(input: SwitchTaskWorkspaceOptions): Pr
   });
 }
 
-/** Obtain the single coordinator lease used to prevent automatic pool reclamation. */
-export async function resumeTaskSession(workspaceIdInput: string, taskIdInput: string, existingUseId?: string): Promise<SavedTaskSession & { useId: string }> {
-  const useId = existingUseId ?? `c2c_use_${randomUUID()}`;
-  const task = await updateTaskChannel(workspaceIdInput, taskIdInput, current => {
-    if (existingUseId !== undefined) {
-      assertTaskUse(current, existingUseId);
-      if (current.bindingState !== "bound") throw new Error("TASK_CHAT_BUSY");
-      return current;
+function continuationMatches(r: ContinuationReceipt, task: SavedTaskSession, workspaceId: string, ledger: SessionLedger): boolean {
+  const epoch = ledger.pool.entries.find(e => e.id === task.poolEntryId)?.assignmentEpoch ?? 1;
+  if (r.taskId !== task.taskId || r.useId !== task.activeUse?.useId) return false;
+  if (r.boundWorkspaceId === workspaceId && r.conversationId === task.conversationId && r.generation === task.generation && r.assignmentEpoch === epoch) return true;
+  // Only a unique committed binding-recovery transition may carry this same
+  // lease to a new Chat. History proves lineage, never independent authority.
+  return (ledger.assignmentHistory ?? []).filter(h => h.reason === "binding_recovered" &&
+    h.taskId === r.taskId && h.fromWorkspaceId === r.boundWorkspaceId && h.conversationId === r.conversationId &&
+    h.generation === r.generation && task.generation === r.generation + 1 &&
+    h.toTaskId === task.taskId && h.toWorkspaceId === workspaceId && h.toConversationId === task.conversationId &&
+    h.assignmentEpoch === epoch && h.snapshot?.taskId === r.taskId && h.snapshot.conversationId === r.conversationId &&
+    h.snapshot.generation === r.generation && h.snapshot.activeUse?.useId === r.useId &&
+    ledger.pool.entries.some(e => e.id === h.snapshot?.poolEntryId && e.status === "quarantined" &&
+      e.assignmentEpoch === r.assignmentEpoch + 1 && e.reason === "binding_recovered: host rejected the correctly routed send")).length === 1;
+}
+
+export function classifyTaskLease(task: SavedTaskSession | null, useId?: string): SessionRecoveryGuidance["leaseStatus"] {
+  if (!task?.activeUse) return useId ? "conflict" : "none";
+  if (useId !== undefined) return task.activeUse.useId === useId ? "own" : "conflict";
+  try {
+    const r = readContinuation(task.taskId);
+    if (!r || r.stage === "released") return "ownership_unproven";
+    const binding = resolveTaskBinding(r.boundWorkspaceId, task.taskId);
+    return binding.boundWorkspaceId && binding.resolution !== "ambiguous" && continuationMatches(r, task, binding.boundWorkspaceId, readSessionLedger())
+      ? "recoverable_own" : "conflict";
+  } catch { return "ownership_unproven"; }
+}
+
+/** Recoverable write-ahead lease acquisition under the session lock. */
+export async function resumeTaskSession(workspaceIdInput: string, taskIdInput: string, existingUseId?: string, recoverOwn = false,
+  faultAt?: "after_record" | "after_ledger" | "before_output"): Promise<SavedTaskSession & { useId: string }> {
+  if (faultAt && process.env.VITEST !== "true") throw new Error("LEASE_FAULT_INJECTION_TEST_ONLY");
+  return withWorkspaceLifecycleLock(SESSION_REGISTRY_LOCK_ID, async () => {
+    const workspaceId = validateWorkspaceId(workspaceIdInput), taskId = validateTaskId(taskIdInput);
+    const ledger = readSessionLedger();
+    const owners = ledger.registries.flatMap(r => r.tasks.filter(t => t.taskId === taskId && t.bindingState === "bound").map(task => ({ registry: r, task })));
+    if (owners.length !== 1 || owners[0].registry.workspaceId !== workspaceId) throw new Error("TASK_BINDING_AMBIGUOUS");
+    const { registry, task: current } = owners[0];
+    const epoch = ledger.pool.entries.find(e => e.id === current.poolEntryId)?.assignmentEpoch ?? 1;
+    const receipt = readContinuation(taskId);
+    const matches = (r: ContinuationReceipt) => r.taskId === taskId && r.boundWorkspaceId === workspaceId &&
+      r.conversationId === current.conversationId && r.generation === current.generation && r.assignmentEpoch === epoch;
+    let useId = existingUseId;
+    if (useId !== undefined) {
+      assertTaskUse(current, useId);
+      if (receipt && (receipt.stage === "released" || !continuationMatches(receipt, current, workspaceId, ledger))) throw new Error("LEASE_CONFLICT");
     }
-    if (current.bindingState !== "bound" || (taskIsBusy(current) && !canAcquireBootRecoveryLease(current))) {
-      throw new Error("TASK_CHAT_BUSY");
+    else if (current.activeUse) {
+      if (!recoverOwn) throw new Error("LEASE_OWNERSHIP_UNPROVEN: use resume --recover-own with a private continuation");
+      if (!receipt || receipt.stage === "released") throw new Error("LEASE_OWNERSHIP_UNPROVEN");
+      if (!continuationMatches(receipt, current, workspaceId, ledger)) throw new Error("LEASE_CONFLICT");
+      useId = receipt.useId;
+    } else {
+      if (recoverOwn && !canAcquireContinuationLease(sessionRecoveryGuidance("exact", current))) {
+        throw new Error("LEASE_ACQUISITION_PHASE_BLOCKED");
+      }
+      if (taskIsBusy(current) && !canAcquireBootRecoveryLease(current)) throw new Error("TASK_CHAT_BUSY");
+      if (receipt?.stage === "prepared" && !matches(receipt)) throw new Error("LEASE_CONFLICT");
+      useId = receipt?.stage === "prepared" ? receipt.useId : `c2c_use_${randomUUID()}`;
     }
     const now = new Date().toISOString();
-    return { ...current, activeUse: { useId, startedAt: now }, savedAt: now };
+    if (current.activeUse && receipt?.stage === "active" && matches(receipt) && receipt.useId === useId) return { ...current, useId };
+    const record: ContinuationReceipt = { version: 1, taskId, useId, boundWorkspaceId: workspaceId,
+      conversationId: current.conversationId, generation: current.generation, assignmentEpoch: epoch,
+      createdAt: receipt?.useId === useId ? receipt.createdAt : now, updatedAt: now, stage: "prepared" };
+    writeContinuation(record);
+    if (faultAt === "after_record") throw new Error("LEASE_TEST_INTERRUPTION");
+    const task = current.activeUse ? current : { ...current, activeUse: { useId, startedAt: now }, savedAt: now };
+    if (task !== current) writeSessionLedger({ ...ledger,
+      registries: ledger.registries.map(r => r === registry ? { ...r, tasks: r.tasks.map(t => t.taskId === taskId ? task : t), savedAt: now } : r),
+      pool: { ...ledger.pool, entries: ledger.pool.entries.map(e => e.id === task.poolEntryId ? { ...e, lastUsedAt: now } : e) },
+    });
+    if (faultAt === "after_ledger") throw new Error("LEASE_TEST_INTERRUPTION");
+    writeContinuation({ ...record, stage: "active" });
+    if (faultAt === "before_output") throw new Error("LEASE_TEST_INTERRUPTION");
+    return { ...task, useId };
   });
-  return { ...task, useId };
 }
 
 function assertTaskUse(task: SavedTaskSession, useId?: string): void {
@@ -2299,6 +2388,14 @@ async function updateTaskChannel(
       nextLedger = quarantineClaimedStandbyEntryInLedger(nextLedger, task, task.replacementReason ?? "quarantined");
     }
     writeSessionLedger(nextLedger);
+    // Receipt cleanup follows the authoritative commit. A cleanup failure cannot
+    // restore an ended lease; the next acquisition safely replaces active metadata.
+    if (current.activeUse && !task.activeUse) {
+      try {
+        const receipt = readContinuation(id);
+        if (receipt?.useId === current.activeUse.useId) writeContinuation({ ...receipt, stage: "released", updatedAt: now });
+      } catch { /* authoritative ledger remains released; retry on next resume */ }
+    }
     return task;
   });
 }

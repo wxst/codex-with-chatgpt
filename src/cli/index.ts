@@ -79,6 +79,7 @@ import {
   deliveryReadbackPhase,
   migrationRecoveryGuidance,
   sessionRecoveryGuidance,
+  canAcquireContinuationLease,
   recordTaskReadback,
   claimStandbyConversation,
   failTaskDelivery,
@@ -1312,7 +1313,7 @@ session.command("get", { isDefault: true })
       pendingMessageId: task?.pendingMessageId ?? null,
       ...guidance, assignmentEpoch: result.assignmentEpoch, migration: result.migration,
       migrationLeaseActive: result.migrationLeaseActive,
-    } : result));
+    } : result, (key, value) => key === "useId" ? undefined : value));
     else {
       say(`工作区：${workspace.id}`);
       say(`任务：${resolved.taskId}${resolved.generated ? "（新生成，请在本任务内复用）" : ""}`);
@@ -1334,12 +1335,40 @@ session.command("resume")
   .description("Acquire one continuation lease after resolving the current task binding")
   .option("-w, --workspace <path>").option("--task-id <id>").option("--brief", "emit only continuation decision", false)
   .option("--use-id <id>", "resume the same coordinator lease without acquiring a new one")
+  .option("--recover-own", "recover the private continuation of the actual host task", false)
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; taskId?: string; useId?: string; brief: boolean; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; useId?: string; recoverOwn: boolean; brief: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const binding = resolveTaskBinding(workspace.id, resolved.taskId);
+    if (opts.recoverOwn) {
+      if (resolved.source !== "CODEX_THREAD_ID") throw new Error("LEASE_HOST_TASK_ID_REQUIRED");
+      if (opts.useId) throw new Error("LEASE_RECOVERY_OPTIONS_CONFLICT");
+      if (!binding.task || !binding.boundWorkspaceId || binding.resolution === "ambiguous") throw new Error("LEASE_BINDING_REQUIRED");
+      const before = sessionRecoveryGuidance(binding.resolution, binding.task);
+      if (["ownership_unproven", "conflict"].includes(before.leaseStatus)) {
+        say(JSON.stringify({ ok: false, taskId: resolved.taskId, ...before }));
+        process.exitCode = 1;
+        return;
+      }
+      if (before.leaseStatus === "none" && !canAcquireContinuationLease(before)) {
+        say(JSON.stringify({ ok: false, taskId: resolved.taskId, ...before }));
+        process.exitCode = 1;
+        return;
+      }
+      const task = await resumeTaskSession(binding.boundWorkspaceId, resolved.taskId, undefined, true);
+      say(JSON.stringify({ ok: true, taskId: task.taskId, requestedWorkspaceId: workspace.id,
+        boundWorkspaceId: binding.boundWorkspaceId, conversationId: task.conversationId, useId: task.useId,
+        ...sessionRecoveryGuidance(binding.resolution, task, task.useId) }));
+      return;
+    }
     let currentUseId = opts.useId;
+    const leaseGuidance = sessionRecoveryGuidance(binding.resolution, binding.task, opts.useId);
+    if (["conflict", "ownership_unproven", "recoverable_own"].includes(leaseGuidance.leaseStatus)) {
+      say(JSON.stringify({ ok: false, taskId: resolved.taskId, ...leaseGuidance }));
+      if (leaseGuidance.leaseStatus === "conflict") process.exitCode = 1;
+      return;
+    }
     let current = opts.useId !== undefined && binding.resolution === "exact"
       ? await resumeTaskSession(workspace.id, resolved.taskId, opts.useId) : binding.task;
     let guidance = sessionRecoveryGuidance(binding.resolution, current, opts.useId);
@@ -1358,7 +1387,7 @@ session.command("resume")
       const payload = { ok: true, taskId: resolved.taskId, requestedWorkspaceId: workspace.id,
         boundWorkspaceId: binding.boundWorkspaceId, workspaceId: workspace.id, resolution: binding.resolution,
         conversationId: current?.conversationId ?? null, chatUrl: current?.url ?? null, generation: current?.generation ?? null,
-        useId: binding.resolution === "exact" ? current?.activeUse?.useId ?? currentUseId ?? null : null, ...guidance,
+        ...(guidance.leaseStatus === "own" && currentUseId ? { useId: currentUseId } : {}), ...guidance,
         migration: m && !m.completedAt ? { fromWorkspaceId: m.fromWorkspaceId, toWorkspaceId: m.toWorkspaceId,
           assignmentEpoch: m.assignmentEpoch, bootMessageId: m.bootMessageId ?? null } : null,
         migrationLeaseActive: Boolean(current?.activeUse),
@@ -1638,7 +1667,7 @@ session.command("host-control")
     const sourceId = receiptWorkspaceId(workspace.id, resolved.taskId, opts.boundWorkspace);
     const binding = resolveTaskBinding(sourceId, resolved.taskId);
     const before = sessionRecoveryGuidance(binding.resolution, binding.task, opts.useId);
-    if (binding.resolution !== "exact" || before.nextAction === "wait_for_coordinator_lease") {
+    if (binding.resolution !== "exact" || ["recoverable_own", "ownership_unproven", "conflict"].includes(before.leaseStatus)) {
       say(JSON.stringify({ ok: false, taskId: resolved.taskId, ...before }));
       return;
     }
@@ -1672,14 +1701,17 @@ session.command("record-readback")
   .description("Record exact pending-message visibility without confirming or resending")
   .option("-w, --workspace <path>").option("--task-id <id>")
   .requiredOption("--observation-file <path>", "UTF-8 host observation JSON")
+  .option("--use-id <id>", "current task continuation lease")
   .option("--bound-workspace", "record this task's source receipt without switching the binding", false)
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; taskId?: string; observationFile: string; boundWorkspace: boolean; json: boolean }) => {
+  .action(async (opts: { workspace?: string; taskId?: string; observationFile: string; useId?: string; boundWorkspace: boolean; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const resolved = resolvedSessionTaskId(opts.taskId);
     const sourceId = receiptWorkspaceId(workspace.id, resolved.taskId, opts.boundWorkspace);
-    const task = await recordTaskReadback(sourceId, resolved.taskId,
-      readUtf8JsonInputFile(opts.observationFile, "READBACK_OBSERVATION_INVALID"));
+    const observation = readUtf8JsonInputFile(opts.observationFile, "READBACK_OBSERVATION_INVALID") as Record<string, unknown>;
+    if (!observation || typeof observation !== "object" || Array.isArray(observation)) throw new Error("READBACK_OBSERVATION_INVALID");
+    if (opts.useId && observation.useId !== undefined && observation.useId !== opts.useId) throw new Error("TASK_USE_STALE");
+    const task = await recordTaskReadback(sourceId, resolved.taskId, opts.useId ? { ...observation, useId: opts.useId } : observation);
     const guidance = sessionRecoveryGuidance("exact", task, task.readbackObservation?.useId);
     const result = { ok: true, taskId: task.taskId, workspaceId: sourceId, conversationId: task.conversationId,
       generation: task.generation, pendingMessageId: task.pendingMessageId, ...guidance };

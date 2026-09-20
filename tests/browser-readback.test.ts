@@ -113,8 +113,9 @@ it("reconciles source pending from current workspace, releases own lease, then m
   const before = disk(); expect(cli("confirm-reply", ...flags).status).not.toBe(0); expect(disk()).toBe(before);
   const confirmed = cli("confirm-reply", "--bound-workspace", ...flags);
   expect(confirmed.status, confirmed.stderr).toBe(0);
-  expect(JSON.parse(cli("get", "--brief", "--use-id", useId).stdout).nextAction).toBe("switch_workspace");
+  expect(JSON.parse(cli("get", "--brief", "--use-id", useId).stdout).nextAction).toBe("release_own_lease_before_workspace_switch");
   expect(cli("finish", "--bound-workspace", "--use-id", useId).status).toBe(0);
+  expect(JSON.parse(cli("get", "--brief").stdout).nextAction).toBe("switch_workspace");
   const moved = cli("switch-workspace", "--from-workspace-id", source, "--expected-generation", "1",
     "--observed-conversation-id", chat, "--observed-task-id", taskId, "--observed-workspace-id", source,
     "--observed-at", new Date().toISOString());

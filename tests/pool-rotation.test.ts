@@ -8,6 +8,7 @@ import { attachTaskRouteCapability, beginTaskSend, claimStandbyConversation, con
   digestBusinessMessage, prepareTaskInit, type BoundRecoveryObservation, type NotLoadedReclaimObservation,
   type ReclaimObservation } from "../src/session/state.js";
 import { createWorkspaceRouter, issueRouteCapability, resolveRouteCapability } from "../src/router/state.js";
+import { readContinuation, writeContinuation } from "../src/session/continuation.js";
 import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir } from "./helpers.js";
 
 let state: string, workspace: string, workspaceId: string;
@@ -320,11 +321,27 @@ it("rotates the oldest safe Chat in ten existing entries, skips busy owners, and
   const current = readTaskSession(workspaceId, "requester")!;
   evidence.useId = current.activeUse!.useId;
   const observed = notLoadedObservationsFor().reverse();
+  const priorContinuation = readContinuation("requester")!;
   const before = JSON.parse(fs.readFileSync(sessionLedgerFile(), "utf8"));
   const result = await recover(evidence, observed);
   const after = JSON.parse(fs.readFileSync(sessionLedgerFile(), "utf8"));
   expect(result.task.conversationId).toBe("extra-0");
   expect(result.task.activeUse).toEqual(current.activeUse);
+  expect(readContinuation("requester")).toMatchObject({ conversationId: result.task.conversationId,
+    generation: result.task.generation, useId: current.activeUse!.useId });
+  // Simulate exit after the authoritative ledger commit, before sidecar refresh.
+  writeContinuation(priorContinuation);
+  const committed = fs.readFileSync(sessionLedgerFile(), "utf8");
+  const withoutProof = JSON.parse(committed);
+  withoutProof.assignmentHistory = withoutProof.assignmentHistory.filter((h: { reason: string }) => h.reason !== "binding_recovered");
+  fs.writeFileSync(sessionLedgerFile(), JSON.stringify(withoutProof));
+  const unproven = fs.readFileSync(sessionLedgerFile(), "utf8");
+  await expect(resumeTaskSession(workspaceId, "requester", undefined, true)).rejects.toThrow("LEASE_CONFLICT");
+  expect(fs.readFileSync(sessionLedgerFile(), "utf8")).toBe(unproven);
+  fs.writeFileSync(sessionLedgerFile(), committed);
+  const continuation = await resumeTaskSession(workspaceId, "requester", undefined, true);
+  expect(continuation.useId).toBe(current.activeUse!.useId);
+  expect(continuation.generation).toBe(result.task.generation);
   expect(after.pool.entries).toHaveLength(10);
   expect(after.pool.entries.map((entry: {id: string}) => entry.id)).toEqual(before.pool.entries.map((entry: {id: string}) => entry.id));
   for (const original of before.registries[0].tasks.filter((task: {taskId: string}) => !["requester", "owner-0"].includes(task.taskId))) {
